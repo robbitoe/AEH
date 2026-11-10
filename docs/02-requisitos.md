@@ -28,7 +28,7 @@ Cada ejecución debe poder asociarse a un worktree o sandbox y registrar su base
 
 ### RF-07 — Verificación
 
-La verificación debe poder ejecutarse como etapa independiente y producir pass/fail/needs-review con evidencia.
+La verificación debe poder ejecutarse como etapa independiente y producir un dictamen `pass`, `fail` o `needs_review` con evidencia. El coordinador aplica la transición de ejecución según el dictamen y la política.
 
 ### RF-08 — Observabilidad
 
