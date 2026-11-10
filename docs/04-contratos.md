@@ -37,7 +37,7 @@ model_policy:
   on_unknown: block
 auth_mode: subscription_session
 workspace:
-  isolation: git_worktree
+  checkout: git_worktree
   base_ref: main
 permissions: [read_repo, write_worktree, run_tests]
 limits:
@@ -48,6 +48,8 @@ verification:
   independent: true
   required_status: pass
 ```
+
+El campo `workspace.checkout` identifica cómo se separan los cambios de Git. Para procesos o contenido no confiable se requiere aislamiento de seguridad adicional validado según la propuesta de la [ADR-0005](adr/0005-local-baseline.md).
 
 ## Estados de ejecución
 

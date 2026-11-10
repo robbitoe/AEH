@@ -13,9 +13,13 @@ Los roles son propuestos. Cada comprobación futura debe conservar el resultado 
 | H-07 | Una estimación aporta valor operativo. | MVP-3, operador | Comparar estimaciones con datos de referencia si existen. Sin referencia verificable, mantener la estimación fuera de decisiones automáticas. |
 | H-08 | Los modelos locales tienen un caso de uso viable. | Diferida, responsable de producto | Reabrir con un caso concreto y evidencia sobre hardware, licencia y aislamiento. |
 
-## Recorridos documentales para la revisión
+## Resultados de los recorridos documentales
 
-1. **Éxito.** El coordinador fija contratos y ejecuta el simulador. El verificador comprueba el artefacto y emite `pass`. Solo se cierra con todos los criterios satisfechos.
-2. **Capacidad desconocida.** Sin regla explícita, el coordinador registra `unknown` y bloquea antes de invocar. La traza conserva la medición y la decisión por separado.
-3. **Efecto incierto.** Tras un timeout, se conserva el intento. El operador revisa el checkpoint y el coordinador revalida antes de autorizar otro intento.
-4. **Evidencia ausente.** El verificador emite `needs_review` aunque el adaptador haya completado su invocación.
+El responsable del proyecto confirmó los cuatro resultados esperados mediante una revisión sobre el papel. La tabla registra esa revisión. Las pruebas del simulador corresponden a MVP-1.
+
+| Caso | Entrada o situación revisada | Resultado confirmado |
+|---|---|---|
+| 1. Éxito verificado | El único criterio exige un `report.json` con los campos `id` y `status`. | Con ambos campos, el verificador separado registra `pass` y el coordinador cierra la ejecución como `succeeded`. Si el archivo existe y falta `status`, el verificador registra `fail` y el coordinador aplica la política de recuperación. |
+| 2. Capacidad desconocida | Una fase requiere más del 10 % de cuota. Falta una medición fiable y el contrato carece de una regla para ese caso. | El coordinador registra `unknown` como capacidad y `blocked` como decisión de política. La traza deja constancia de que el proveedor no fue invocado. |
+| 3. Timeout con efectos inciertos | Un intento supera el límite de tiempo y deja un `report.json` parcial en el worktree. | Tras confirmar la detención, el coordinador registra el `timeout`, conserva el intento y la evidencia parcial, y pausa. El operador revisa los efectos. El coordinador autoriza otro intento solo si el checkpoint permite repetir sin duplicarlos y quedan intentos. Si persiste la incertidumbre, la ejecución sigue pausada. |
+| 4. Evidencia ausente | El adaptador termina con código `0`, pero falta `report.json` en la ubicación acordada. | El verificador registra qué esperaba y dónde lo buscó, y emite el dictamen `needs_review`. El coordinador deja la ejecución en `needs_review` y el outcome queda pendiente. |

@@ -2,7 +2,7 @@
 
 ## Condiciones de cierre
 
-- [ ] Revisar los recorridos de la [matriz de validación](11-validacion.md) y registrar resultado por caso.
+- [x] Revisar los cuatro recorridos de la [matriz de validación](11-validacion.md) y registrar el resultado de cada caso.
 - [ ] Resolver las propuestas [ADR-0005](adr/0005-local-baseline.md) y [ADR-0006](adr/0006-execution-record.md), incluida la elección o postergación explícita del motor de almacenamiento.
 - [ ] Registrar la aprobación de salida de MVP-0. Las hipótesis de fases posteriores conservan su estado y condición de validación.
 
