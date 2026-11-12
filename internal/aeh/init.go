@@ -17,6 +17,10 @@ commands:
   test: "echo set commands.test && exit 1"   # e.g. "dotnet test" or "npm test"
   timeout_minutes: 20
 
+# Agents and build/test commands inherit only OS and tool-discovery variables
+# (PATH, HOME, TEMP...). List any other variable names they need, e.g. JAVA_HOME.
+pass_env: []
+
 # Paths no agent may modify. aeh/ and each outcome's acceptance tests are always protected.
 protected: []
 
@@ -27,8 +31,8 @@ limits:
 # retries once with feedback, then tries the next profile, then blocks.
 ladder: [medio, fuerte]
 
-# Profile that reviews diffs of level-2 outcomes. Leave empty to skip review.
-reviewer: ""
+# Level 2 requires a separate reviewer profile with plain-text final output.
+reviewer: codex-review
 
 notify:
   webhook: ""          # POST {event, outcome, title, message} when an outcome blocks or is accepted
@@ -38,8 +42,14 @@ notify:
 # Check the flags against the CLI version you have installed.
 profiles:
   medio:
-    command: ["codex", "exec", "--sandbox", "workspace-write", "--json", "{{prompt}}"]
+    command: ["codex", "exec", "--sandbox", "workspace-write", "--json", "-"]
+    stdin: true
     timeout_minutes: 30
+    # quota_exit_codes: []  # Set only when the CLI documents a distinct quota exit code.
+  codex-review:
+    command: ["codex", "exec", "--sandbox", "read-only", "-"]
+    stdin: true
+    timeout_minutes: 15
   fuerte:
     command: ["claude", "-p", "{{prompt}}", "--permission-mode", "acceptEdits", "--output-format", "json"]
     timeout_minutes: 30

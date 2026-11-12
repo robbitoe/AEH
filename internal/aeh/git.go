@@ -10,10 +10,12 @@ import (
 	"strings"
 )
 
-// git runs a git command in dir and returns trimmed stdout.
+// git runs a git command in dir and returns trimmed stdout. It disables fsmonitor, which a
+// worktree's config could point at an agent-written program, and filters the environment.
 func git(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
+	cmd := exec.Command("git", append([]string{"-c", "core.fsmonitor=false"}, args...)...)
 	cmd.Dir = dir
+	cmd.Env = commandEnv(nil)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
@@ -63,45 +65,87 @@ func dirtyPaths(root string, paths []string) (string, error) {
 // fileChange is one entry of `git diff --cached --numstat`.
 type fileChange struct {
 	Path  string
-	Lines int
+	Lines int // -1 means Git could not measure the change in lines.
 }
 
-// stageAll stages everything in the worktree and returns what changed against HEAD.
-func stageAll(wt string) ([]fileChange, error) {
-	if _, err := git(wt, "add", "-A"); err != nil {
-		return nil, err
+// candidateCommit freezes the proposed tree as a single commit on the pinned base.
+func candidateCommit(wt, base, msg string) (string, error) {
+	head, err := headCommit(wt)
+	if err != nil {
+		return "", err
 	}
-	out, err := git(wt, "diff", "--cached", "--numstat", "--no-renames")
+	if head != base {
+		return "", fmt.Errorf("agent moved the attempt HEAD from %s to %s", base, head)
+	}
+	if _, err := git(wt, "add", "-A"); err != nil {
+		return "", err
+	}
+	tree, err := git(wt, "write-tree")
+	if err != nil {
+		return "", err
+	}
+	return git(wt, "-c", "user.name=aeh", "-c", "user.email=aeh@localhost", "-c", "commit.gpgsign=false", "commit-tree", tree, "-p", base, "-m", msg)
+}
+
+func candidateChanges(wt, base, commit string) ([]fileChange, error) {
+	out, err := git(wt, "diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", base, commit)
 	if err != nil {
 		return nil, err
 	}
 	var changes []fileChange
-	for _, line := range strings.Split(out, "\n") {
-		parts := strings.SplitN(line, "\t", 3)
-		if len(parts) != 3 {
+	for _, line := range strings.Split(strings.TrimSuffix(out, "\x00"), "\x00") {
+		if line == "" {
 			continue
 		}
-		added, _ := strconv.Atoi(parts[0]) // "-" for binary files counts as 0
-		removed, _ := strconv.Atoi(parts[1])
-		changes = append(changes, fileChange{Path: parts[2], Lines: added + removed})
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) != 3 {
+			return nil, fmt.Errorf("invalid Git numstat record %q", line)
+		}
+		added, aerr := strconv.Atoi(parts[0])
+		removed, rerr := strconv.Atoi(parts[1])
+		lines := added + removed
+		if aerr != nil || rerr != nil {
+			lines = -1
+		}
+		changes = append(changes, fileChange{Path: parts[2], Lines: lines})
 	}
 	return changes, nil
 }
 
-func stagedDiff(wt string) (string, error) {
-	return git(wt, "diff", "--cached", "--no-renames")
+func candidateDiff(wt, base, commit string) (string, error) {
+	return git(wt, "diff", "--no-renames", "--no-ext-diff", "--no-textconv", base, commit)
 }
 
-// commitStaged commits the staged changes as the harness, without touching the user's git identity.
-func commitStaged(wt, msg string) (string, error) {
-	if _, err := git(wt, "-c", "user.name=aeh", "-c", "user.email=aeh@localhost", "commit", "--no-verify", "-q", "-m", msg); err != nil {
-		return "", err
+func verifyCheckout(wt, commit string) error {
+	head, err := headCommit(wt)
+	if err != nil {
+		return err
 	}
-	return headCommit(wt)
+	if head != commit {
+		return fmt.Errorf("verification HEAD changed from %s to %s", commit, head)
+	}
+	status, err := git(wt, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
+	if err != nil {
+		return err
+	}
+	if status != "" {
+		return fmt.Errorf("verification changed the checkout:\n%s", status)
+	}
+	return nil
 }
 
-// moveBranch points branch at commit. Valid only when the branch is not checked out anywhere.
-func moveBranch(root, branch, commit string) error {
-	_, err := git(root, "branch", "-f", branch, commit)
+// moveBranch advances an unchecked-out integration branch only from the verified base.
+func moveBranch(root, branch, base, commit string) error {
+	ref := "refs/heads/" + branch
+	worktrees, err := git(root, "worktree", "list", "--porcelain")
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(worktrees, "\n") {
+		if line == "branch "+ref {
+			return fmt.Errorf("branch %s is checked out", branch)
+		}
+	}
+	_, err = git(root, "update-ref", ref, commit, base)
 	return err
 }

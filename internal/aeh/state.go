@@ -3,6 +3,7 @@ package aeh
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -27,6 +28,7 @@ type Attempt struct {
 	FailedGate string    `json:"failed_gate,omitempty"`
 	RunDir     string    `json:"run_dir"`
 	Commit     string    `json:"commit,omitempty"`
+	Worktree   string    `json:"retained_worktree,omitempty"`
 	StartedAt  time.Time `json:"started_at"`
 	Seconds    float64   `json:"seconds"`
 }
@@ -44,6 +46,9 @@ type State struct {
 	Title     string      `json:"title"`
 	Status    string      `json:"status"`
 	Base      string      `json:"base"`
+	Head      string      `json:"verified_head"`
+	Contract  string      `json:"contract_sha256"`
+	FinalRun  string      `json:"final_run,omitempty"`
 	Branch    string      `json:"branch"`
 	Tasks     []TaskState `json:"tasks"`
 	Question  string      `json:"question,omitempty"`
@@ -63,6 +68,9 @@ func (s *State) task(id string) *TaskState {
 
 func loadState(r Repo, id string) (State, error) {
 	var s State
+	if !validID(id) {
+		return s, fmt.Errorf("invalid outcome ID %q", id)
+	}
 	b, err := os.ReadFile(r.StatePath(id))
 	if errors.Is(err, os.ErrNotExist) {
 		return State{ID: id, Status: StatusPending}, nil
@@ -70,12 +78,36 @@ func loadState(r Repo, id string) (State, error) {
 	if err != nil {
 		return s, err
 	}
-	return s, json.Unmarshal(b, &s)
+	if err := json.Unmarshal(b, &s); err != nil {
+		return s, err
+	}
+	if s.ID != id {
+		return s, fmt.Errorf("state for %q has ID %q", id, s.ID)
+	}
+	return s, nil
+}
+
+// lockOutcome serializes state and branch updates for one outcome in this checkout.
+func lockOutcome(r Repo, id string) (func(), error) {
+	if !validID(id) {
+		return nil, fmt.Errorf("invalid outcome ID %q", id)
+	}
+	if err := os.MkdirAll(r.StateDir(), 0o700); err != nil {
+		return nil, err
+	}
+	lock := filepath.Join(r.StateDir(), id+".lock")
+	if err := os.Mkdir(lock, 0o700); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("outcome %s is locked; if a run crashed, verify it stopped before removing %s", id, lock)
+		}
+		return nil, err
+	}
+	return func() { _ = os.Remove(lock) }, nil
 }
 
 func saveState(r Repo, s *State) error {
 	s.UpdatedAt = time.Now().UTC()
-	return writeJSON(r.StatePath(s.ID), s)
+	return writePrivateJSON(r.StatePath(s.ID), s)
 }
 
 // ListStates returns every recorded outcome, most recently updated first.
@@ -104,6 +136,11 @@ func ListStates(r Repo) ([]State, error) {
 
 // Answer records the owner's reply to a blocked outcome and makes it runnable again.
 func Answer(r Repo, id, text string) error {
+	unlock, err := lockOutcome(r, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	s, err := loadState(r, id)
 	if err != nil {
 		return err
@@ -124,16 +161,30 @@ func Answer(r Repo, id, text string) error {
 
 // writeJSON writes v atomically: a crash never leaves half a file.
 func writeJSON(path string, v any) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	return writeJSONMode(path, v, 0o755, 0o644)
+}
+
+func writePrivateJSON(path string, v any) error {
+	return writeJSONMode(path, v, 0o700, 0o600)
+}
+
+func writeJSONMode(path string, v any, dirMode, fileMode os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return err
 	}
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0o644); err != nil {
+	tmp, err := os.CreateTemp(dir, ".aeh-json-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	defer os.Remove(tmp.Name())
+	_, writeErr := tmp.Write(append(b, '\n'))
+	if err := errors.Join(writeErr, tmp.Chmod(fileMode), tmp.Close()); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }

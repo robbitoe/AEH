@@ -14,10 +14,11 @@ import (
 
 // GateResult is the outcome of one deterministic check. Gates never call a model.
 type GateResult struct {
-	Name    string  `json:"name"`
-	Passed  bool    `json:"passed"`
-	Output  string  `json:"output,omitempty"`
-	Seconds float64 `json:"seconds"`
+	Name      string  `json:"name"`
+	Passed    bool    `json:"passed"`
+	Output    string  `json:"output,omitempty"`
+	Seconds   float64 `json:"seconds"`
+	Uncertain bool    `json:"uncertain,omitempty"`
 }
 
 const maxGateOutput = 6000
@@ -47,8 +48,14 @@ func gateScope(changes []fileChange, protected, allowed []string, maxLines int) 
 	var problems []string
 	total := 0
 	for _, c := range changes {
-		total += c.Lines
-		if matchAny(c.Path, protected) {
+		if c.Lines < 0 {
+			problems = append(problems, "cannot enforce the diff limit for: "+c.Path)
+		} else {
+			total += c.Lines
+		}
+		if agentInstructionFile(c.Path) {
+			problems = append(problems, "agent instruction file modified: "+c.Path)
+		} else if matchAny(c.Path, protected) {
 			problems = append(problems, "protected path modified: "+c.Path)
 		} else if len(allowed) > 0 && !matchAny(c.Path, allowed) {
 			problems = append(problems, "outside the task's paths: "+c.Path)
@@ -66,10 +73,33 @@ func gateScope(changes []fileChange, protected, allowed []string, maxLines int) 
 	return g
 }
 
+// agentInstructionFile reports files that agent CLIs load as instructions or settings.
+// A candidate could otherwise plant one to steer the reviewer, so none may change anywhere.
+func agentInstructionFile(file string) bool {
+	parts := strings.Split(strings.ReplaceAll(file, "\\", "/"), "/")
+	for i, part := range parts {
+		p := strings.ToLower(part)
+		if p == ".claude" || p == ".codex" {
+			return true
+		}
+		if i == len(parts)-1 && (p == "agents.md" || p == "claude.md" || p == "claude.local.md") {
+			return true
+		}
+	}
+	return false
+}
+
 // matchAny reports whether file is covered by any pattern.
 // "src/Fees/", "src/Fees" and "src/Fees/**" cover the whole directory; other patterns use path.Match.
 func matchAny(file string, patterns []string) bool {
+	fold := runtime.GOOS == "windows" || runtime.GOOS == "darwin" // case-insensitive filesystems by default
+	if fold {
+		file = strings.ToLower(file)
+	}
 	for _, p := range patterns {
+		if fold {
+			p = strings.ToLower(p)
+		}
 		p = strings.TrimPrefix(strings.ReplaceAll(p, "\\", "/"), "./")
 		base := strings.TrimSuffix(strings.TrimSuffix(p, "**"), "/")
 		if base == "" {
@@ -86,7 +116,7 @@ func matchAny(file string, patterns []string) bool {
 }
 
 // gateCommand runs a configured shell command (build or test) in the worktree.
-func gateCommand(ctx context.Context, name, wt, command string, timeout time.Duration) GateResult {
+func gateCommand(ctx context.Context, name, wt, command string, timeout time.Duration, passEnv []string) GateResult {
 	g := GateResult{Name: name}
 	if strings.TrimSpace(command) == "" {
 		g.Passed = true
@@ -94,27 +124,33 @@ func gateCommand(ctx context.Context, name, wt, command string, timeout time.Dur
 		return g
 	}
 	start := time.Now()
-	out, err := runShell(ctx, wt, command, timeout)
+	out, err := runShell(ctx, wt, command, timeout, passEnv)
 	g.Seconds = time.Since(start).Seconds()
 	g.Output = tail(out, maxGateOutput)
 	g.Passed = err == nil
-	if err != nil && errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.DeadlineExceeded) {
 		g.Output = fmt.Sprintf("timed out after %s\n%s", timeout, g.Output)
+	}
+	g.Uncertain = uncertainExit(err)
+	if err != nil && strings.TrimSpace(g.Output) == "" {
+		g.Output = err.Error()
 	}
 	return g
 }
 
 // runShell runs a command line through the platform shell and returns combined output.
-func runShell(ctx context.Context, dir, command string, timeout time.Duration) (string, error) {
+func runShell(ctx context.Context, dir, command string, timeout time.Duration, passEnv []string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, "cmd", "/C", command)
+		cmd = exec.CommandContext(ctx, "cmd", "/D", "/C", command)
 	} else {
 		cmd = exec.CommandContext(ctx, "sh", "-c", command)
 	}
 	cmd.Dir = dir
+	cmd.Env = commandEnv(passEnv)
+	cmd.WaitDelay = 2 * time.Second
 	var buf bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &buf, &buf
 	err := cmd.Run()
@@ -122,6 +158,10 @@ func runShell(ctx context.Context, dir, command string, timeout time.Duration) (
 		err = ctx.Err()
 	}
 	return buf.String(), err
+}
+
+func uncertainExit(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || errors.Is(err, exec.ErrWaitDelay)
 }
 
 func tail(s string, n int) string {
