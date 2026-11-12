@@ -100,9 +100,11 @@ Make sure your project's `.gitignore` covers build output (`bin/`, `obj/`, `node
 
 ## Development
 
-See [AGENTS.md](AGENTS.md). Before any change:
+Go standard library only, plus `gopkg.in/yaml.v3`. One file per responsibility in `internal/aeh`. Before any change:
 
 ```sh
 go vet ./...
 go test ./...
 ```
+
+Agent instruction files (`AGENTS.md`, `CLAUDE.md`, `.claude/`, `.codex/`) are git-ignored: keep your own locally.
