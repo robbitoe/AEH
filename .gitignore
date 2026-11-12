@@ -6,3 +6,10 @@
 # local go workspace
 go.work
 go.work.sum
+
+# agent instructions and tool settings are local to each machine, never committed
+AGENTS.md
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+.codex/
