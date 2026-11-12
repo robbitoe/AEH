@@ -1,0 +1,86 @@
+package aeh
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// writeReport writes .aeh/reports/<id>.md: criteria, sealed tests, every attempt and its gates.
+// It returns the report path relative to the repository.
+func (ru *runner) writeReport() string {
+	o, st, r := ru.outcome, ru.state, ru.repo
+	var b strings.Builder
+	fmt.Fprintf(&b, "# %s: %s\n\n", o.ID, o.Title)
+	fmt.Fprintf(&b, "Status: **%s** · Branch: `%s` · Base: `%s`\n\n", st.Status, st.Branch, short(st.Base))
+	if st.Question != "" {
+		fmt.Fprintf(&b, "## Open question\n\n%s\n\n", st.Question)
+	}
+	if len(o.Criteria) > 0 {
+		b.WriteString("## Criteria\n\n")
+		for _, c := range o.Criteria {
+			fmt.Fprintf(&b, "- Given %s, when %s, then %s\n", c.Given, c.When, c.Then)
+		}
+		b.WriteString("\n")
+	}
+	if ru.seal != nil {
+		fmt.Fprintf(&b, "## Sealed acceptance tests\n\nApproved %s · hash `%s`\n\n", ru.seal.ApprovedAt.Format("2006-01-02 15:04 UTC"), short(ru.seal.Hash))
+		for _, f := range ru.seal.Files {
+			fmt.Fprintf(&b, "- `%s`\n", f.Path)
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("## Attempts\n\n| Task | # | Profile | Result | Gates | Seconds |\n| --- | --- | --- | --- | --- | --- |\n")
+	for _, t := range st.Tasks {
+		for _, a := range t.Attempts {
+			result := "accepted " + short(a.Commit)
+			if !a.Passed {
+				result = "failed at " + a.FailedGate
+			}
+			fmt.Fprintf(&b, "| %s | %d | %s | %s | %s | %.0f |\n", t.ID, a.N, a.Profile, result, gateSummary(r.Root, a.RunDir), a.Seconds)
+		}
+	}
+	if final := gateSummary(r.Root, rel(r.Root, r.RunDir(o.ID, "final"))); final != "" {
+		fmt.Fprintf(&b, "\n## Final check on the integrated branch\n\n%s\n", final)
+	}
+	if len(st.Answers) > 0 {
+		b.WriteString("\n## Answers from the owner\n\n")
+		for _, a := range st.Answers {
+			fmt.Fprintf(&b, "- %s\n", a)
+		}
+	}
+	path := r.ReportPath(o.ID)
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	_ = os.WriteFile(path, []byte(b.String()), 0o644)
+	return rel(r.Root, path)
+}
+
+// gateSummary renders "hash ok, scope ok, build FAIL" from a run directory's gates.json.
+func gateSummary(root, runDir string) string {
+	data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(runDir), "gates.json"))
+	if err != nil {
+		return ""
+	}
+	var gates []GateResult
+	if json.Unmarshal(data, &gates) != nil {
+		return ""
+	}
+	parts := make([]string, len(gates))
+	for i, g := range gates {
+		status := "ok"
+		if !g.Passed {
+			status = "FAIL"
+		}
+		parts[i] = g.Name + " " + status
+	}
+	return strings.Join(parts, ", ")
+}
+
+func short(s string) string {
+	if len(s) > 10 {
+		return s[:10]
+	}
+	return s
+}

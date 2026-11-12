@@ -1,0 +1,8 @@
+# build output
+/bin/
+/dist/
+*.exe
+
+# local go workspace
+go.work
+go.work.sum
