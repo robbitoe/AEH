@@ -143,3 +143,16 @@ func write(t *testing.T, dir, name, content string) {
 		t.Fatal(err)
 	}
 }
+
+func TestGateStatusTellsSkippedApart(t *testing.T) {
+	cases := map[string]GateResult{
+		"ok":            {Name: "build", Passed: true},
+		"skipped":       {Name: "drift", Passed: true, Skipped: true},
+		"FAIL: no good": {Name: "test", Output: "no good\nmore"},
+	}
+	for want, g := range cases {
+		if got := gateStatus(g); got != want {
+			t.Errorf("%s: got %q, want %q", g.Name, got, want)
+		}
+	}
+}
