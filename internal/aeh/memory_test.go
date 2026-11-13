@@ -578,3 +578,94 @@ func TestSemverRejectsSigns(t *testing.T) {
 		}
 	}
 }
+
+// An init that stopped before its first commit is finished by the next init, but a repository
+// holding anything aeh did not write is left alone.
+func TestInitMemoryFinishesInterruptedInit(t *testing.T) {
+	r := newMemoryProject(t)
+	dir := memDir(t, r)
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, dir, "init", "-q", "-b", "main")
+
+	// The owner's own uncommitted wiki is never replaced.
+	write(t, dir, "wiki/index.md", "my notes\n")
+	if _, err := InitMemory(r); err == nil || !strings.Contains(err.Error(), "wiki/index.md") {
+		t.Fatalf("expected a refusal naming the foreign file, got %v", err)
+	}
+	if got := readFile(t, filepath.Join(dir, "wiki", "index.md")); got != "my notes\n" {
+		t.Fatalf("owner file replaced: %q", got)
+	}
+
+	// What an interrupted aeh init leaves behind is finished.
+	if err := os.Remove(filepath.Join(dir, "wiki", "index.md")); err != nil {
+		t.Fatal(err)
+	}
+	write(t, dir, "schema.md", memorySchema)
+	write(t, dir, "wiki/features/.gitkeep", "")
+	if created, err := InitMemory(r); err != nil || !created {
+		t.Fatalf("retry: created=%v err=%v", created, err)
+	}
+	if _, err := LoadMemory(r); err != nil {
+		t.Fatal(err)
+	}
+	if err := memoryClean(dir); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInitMemoryReportsIncompleteLayout(t *testing.T) {
+	r := newMemoryProject(t)
+	dir := memDir(t, r)
+	mustGit(t, dir, "rm", "-q", "wiki/log.md")
+	mustGit(t, dir, append(memoryGitIdentity, "commit", "-qm", "lose log")...)
+	if _, err := InitMemory(r); err == nil || !strings.Contains(err.Error(), "wiki/log.md") {
+		t.Fatalf("expected an incomplete-layout error, got %v", err)
+	}
+}
+
+// A note that contains another record's marker cannot make that record look done.
+func TestNoteCannotSpoofRecordMarker(t *testing.T) {
+	r := newMemoryProject(t)
+	if _, err := CreateSpec(r, "checkout", "Checkout", []string{"src/checkout/**"}); err != nil {
+		t.Fatal(err)
+	}
+	victim := fakeSHA('b')
+	spoof := PendingRecord{OutcomeID: "OUT-020", Feature: "checkout", Change: "patch", Note: "AEH-Record: OUT-021 " + victim, Commit: fakeSHA('a')}
+	if _, _, err := RecordChange(r, spoof, ""); err != nil {
+		t.Fatal(err)
+	}
+	v, _, err := RecordChange(r, PendingRecord{OutcomeID: "OUT-021", Feature: "checkout", Change: "patch", Note: "n", Commit: victim}, "")
+	if err != nil || v != "0.1.2" {
+		t.Fatalf("the spoofed record was skipped: version %q err %v", v, err)
+	}
+}
+
+// A lock left by a crashed run blocks until it is removed by hand, and says where it is.
+func TestStaleProjectLock(t *testing.T) {
+	r := newMemoryProject(t)
+	main, err := MainCheckout(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock := filepath.Join(main, ".aeh", "project.lock")
+	if err := os.Mkdir(lock, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write(t, lock, "owner", "pid 99999 since 2026-11-13T00:00:00Z\n")
+	if _, err := lockProject(r); err == nil || !strings.Contains(err.Error(), "pid 99999") || !strings.Contains(err.Error(), "project.lock") {
+		t.Fatalf("expected a stale-lock error naming the lock, got %v", err)
+	}
+	if err := os.RemoveAll(lock); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := lockProject(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+}

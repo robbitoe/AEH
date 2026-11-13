@@ -150,7 +150,18 @@ func InitMemory(r Repo) (bool, error) {
 		if err := rejectLinksInside(dir); err != nil {
 			return false, err
 		}
-		return false, verifyMemoryRepo(dir)
+		if err := verifyMemoryRepo(dir); err != nil {
+			return false, err
+		}
+		if _, err := git(dir, "rev-parse", "--verify", "--quiet", "HEAD"); err != nil {
+			// Finish an init that stopped before its first commit, but only when nothing in
+			// the directory could be someone else's work.
+			if err := checkUnfinishedInit(dir); err != nil {
+				return false, err
+			}
+			return true, seedMemory(dir)
+		}
+		return false, checkMemoryLayout(dir)
 	}
 	if entries, err := os.ReadDir(dir); err == nil && len(entries) > 0 {
 		return false, fmt.Errorf("memory init: %s exists and is not a memory repository; move it away first", dir)
@@ -167,22 +178,101 @@ func InitMemory(r Repo) (bool, error) {
 	if err := verifyMemoryRepo(dir); err != nil {
 		return false, err
 	}
+	return true, seedMemory(dir)
+}
+
+// memoryLayout lists the files every initialized memory has.
+var memoryLayout = []string{"schema.md", "wiki/features/.gitkeep", "wiki/index.md", "wiki/log.md"}
+
+// seedMemory writes the initial files and makes the first commit.
+func seedMemory(dir string) error {
 	today := memoryNow().UTC().Format("2006-01-02")
 	files := map[string]string{
 		"schema.md":              memorySchema,
 		"wiki/index.md":          renderIndex(nil),
-		"wiki/log.md":            "# Log\n\nAppend-only. One entry per memory change.\n\n## [" + today + "] init | memory created\n",
+		"wiki/log.md":            "# Log" + nl + nl + "Append-only. One entry per memory change." + nl + nl + "## [" + today + "] init | memory created" + nl,
 		"wiki/features/.gitkeep": "",
 	}
-	for name, content := range files {
-		if err := writeFileAtomic(filepath.Join(dir, filepath.FromSlash(name)), []byte(content)); err != nil {
-			return false, fmt.Errorf("memory init: %w", err)
+	for _, name := range memoryLayout {
+		if err := writeFileAtomic(filepath.Join(dir, filepath.FromSlash(name)), []byte(files[name])); err != nil {
+			return fmt.Errorf("memory init: %w", err)
 		}
 	}
-	if err := commitMemory(dir, []string{"."}, "aeh: initialize memory"); err != nil {
-		return false, err
+	return commitMemory(dir, memoryLayout, "aeh: initialize memory")
+}
+
+const nl = "\n"
+
+// checkUnfinishedInit accepts a repository only when HEAD is unborn, nothing is staged, and
+// every file present is one aeh's init writes, with the content aeh writes. Anything else may
+// be the owner's work, so init refuses instead of replacing it.
+func checkUnfinishedInit(dir string) error {
+	if _, err := git(dir, "symbolic-ref", "-q", "HEAD"); err != nil {
+		return fmt.Errorf("memory init: %s has no readable HEAD; inspect it or move it away", dir)
 	}
-	return true, nil
+	if staged, _ := git(dir, "ls-files"); staged != "" {
+		return fmt.Errorf("memory init: %s has staged files and no commit; it is not an unfinished aeh init, move it away", dir)
+	}
+	expected := map[string]bool{}
+	for _, name := range memoryLayout {
+		expected[name] = true
+	}
+	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if p == filepath.Join(dir, ".git") {
+			return filepath.SkipDir
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		if !expected[rel] || !isSeedContent(rel, b) {
+			return fmt.Errorf("memory init: %s has no commit and contains %s, which aeh did not write; move the directory away first", dir, rel)
+		}
+		return nil
+	})
+}
+
+// isSeedContent reports whether b is what seedMemory writes for name (the log's date may differ).
+func isSeedContent(name string, b []byte) bool {
+	switch name {
+	case "schema.md":
+		return string(b) == memorySchema
+	case "wiki/index.md":
+		return string(b) == renderIndex(nil)
+	case "wiki/features/.gitkeep":
+		return len(b) == 0
+	case "wiki/log.md":
+		head := "# Log" + nl + nl + "Append-only. One entry per memory change." + nl + nl + "## ["
+		tail := "] init | memory created" + nl
+		s := string(b)
+		return strings.HasPrefix(s, head) && strings.HasSuffix(s, tail) && len(s) == len(head)+len("2006-01-02")+len(tail)
+	}
+	return false
+}
+
+// checkMemoryLayout reports files an initialized memory is missing from its last commit.
+func checkMemoryLayout(dir string) error {
+	var missing []string
+	for _, name := range memoryLayout {
+		if _, err := git(dir, "cat-file", "-e", "HEAD:"+name); err != nil {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("memory init: %s is incomplete (missing from its last commit: %s); restore them from its history or move the directory away", dir, strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 // LoadMemory reads every spec. A missing memory is not an error; a corrupt one is.
@@ -258,6 +348,35 @@ func fingerprint(m MemorySnapshot) string {
 	}{Present: m.Present}
 	for _, s := range m.Specs {
 		v.Specs = append(v.Specs, entry{s.Feature, s.Version, s.Paths})
+	}
+	b, _ := json.Marshal(v)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// ContractFingerprint is what a run's contract depends on: which code every feature owns, and
+// the declared feature's title, version and text (everything the prompt shows of it). Other features' versions are left out, so recording
+// another outcome does not stop a blocked outcome from resuming.
+func (m MemorySnapshot) ContractFingerprint(declared string) string {
+	type owner struct {
+		Feature string
+		Paths   []string
+	}
+	v := struct {
+		Present         bool
+		Owners          []owner
+		Declared        string
+		DeclaredTitle   string
+		DeclaredVersion string
+		DeclaredBody    string
+	}{Present: m.Present, Declared: declared}
+	for _, s := range m.Specs {
+		v.Owners = append(v.Owners, owner{s.Feature, s.Paths})
+		if s.Feature == declared {
+			v.DeclaredTitle, v.DeclaredVersion = s.Title, s.Version
+			sum := sha256.Sum256([]byte(s.Body))
+			v.DeclaredBody = hex.EncodeToString(sum[:])
+		}
 	}
 	b, _ := json.Marshal(v)
 	sum := sha256.Sum256(b)
