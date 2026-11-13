@@ -31,15 +31,24 @@ func TestMatchAny(t *testing.T) {
 
 func TestGateScope(t *testing.T) {
 	protected := []string{"aeh/", "tests/acceptance/"}
-	ok := gateScope([]fileChange{{"src/a.go", 10}}, protected, []string{"src/"}, 100)
+	ok := gateScope([]fileChange{{Path: "src/a.go", Lines: 10}}, protected, []string{"src/"}, 100)
 	if !ok.Passed {
 		t.Fatalf("expected pass, got %s", ok.Output)
 	}
 	for name, changes := range map[string][]fileChange{
 		"empty":     nil,
-		"protected": {{"tests/acceptance/check.sh", 1}},
-		"outside":   {{"lib/b.go", 1}},
-		"too large": {{"src/a.go", 101}},
+		"protected": {{Path: "tests/acceptance/check.sh", Lines: 1}},
+		"outside":   {{Path: "lib/b.go", Lines: 1}},
+		"too large": {{Path: "src/a.go", Lines: 101}},
+		"binary":    {{Path: "src/data.bin", Lines: -1}},
+		"agents.md": {{Path: "src/AGENTS.md", Lines: 1}},
+		"claude.md": {{Path: "src/sub/Claude.md", Lines: 1}},
+		"settings":  {{Path: "src/.claude/settings.json", Lines: 1}},
+		"codex":     {{Path: "src/.codex/config.toml", Lines: 1}},
+		"attrs":     {{Path: "src/.gitattributes", Lines: 1}},
+		"root attr": {{Path: ".GitAttributes", Lines: 1}},
+		"modules":   {{Path: ".gitmodules", Lines: 1}},
+		"lfs":       {{Path: "src/.lfsconfig", Lines: 1}},
 	} {
 		if g := gateScope(changes, protected, []string{"src/"}, 100); g.Passed {
 			t.Errorf("%s: expected failure", name)
@@ -66,19 +75,48 @@ func TestHashPathsDetectsChanges(t *testing.T) {
 	if _, _, err := hashPaths(dir, []string{"missing/"}); err == nil {
 		t.Fatal("expected error for a missing path")
 	}
+	if _, _, err := hashPaths(dir, []string{"../outside"}); err == nil {
+		t.Fatal("expected error for a path outside the worktree")
+	}
 }
 
 func TestParseVerdict(t *testing.T) {
 	cases := map[string]string{
 		"looks fine\nVERDICT: APPROVE":                         "APPROVE",
 		"VERDICT: APPROVE or VERDICT: REJECT\nVERDICT: REJECT": "REJECT",
-		`{"result":"ok\nVERDICT: APPROVE"}`:                    "APPROVE",
+		`{"result":"ok\nVERDICT: APPROVE"}`:                    "",
+		"Quoted VERDICT: APPROVE":                              "",
+		"VERDICT: APPROVE\nprocess still running":              "",
+		"VERDICT: REJECT\nVERDICT: APPROVE":                    "",
+		"looks fine\r\nVERDICT: APPROVE\r\n":                   "APPROVE",
 		"no verdict here":                                      "",
 	}
 	for in, want := range cases {
 		if got := parseVerdict(in); got != want {
 			t.Errorf("parseVerdict(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestCommandEnvironmentDropsUnlistedSecrets(t *testing.T) {
+	t.Setenv("AEH_TEST_SECRET", "test-only")
+	t.Setenv("LANG", "C")
+	t.Setenv("AEH_TEST_PASSED", "listed")
+	found, passed := false, false
+	for _, entry := range commandEnv([]string{"AEH_TEST_PASSED"}) {
+		if entry == "AEH_TEST_PASSED=listed" {
+			passed = true
+		}
+		if entry == "AEH_TEST_SECRET=test-only" {
+			t.Fatal("inherited an unlisted variable")
+		}
+		found = found || entry == "LANG=C"
+	}
+	if !found {
+		t.Fatal("dropped allowed environment variable")
+	}
+	if !passed {
+		t.Fatal("dropped a variable listed in pass_env")
 	}
 }
 

@@ -15,6 +15,7 @@ func (ru *runner) writeReport() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# %s: %s\n\n", o.ID, o.Title)
 	fmt.Fprintf(&b, "Status: **%s** · Branch: `%s` · Base: `%s`\n\n", st.Status, st.Branch, short(st.Base))
+	fmt.Fprintf(&b, "Recorded branch head: `%s` · Contract SHA-256: `%s`\n\n", st.Head, st.Contract)
 	if st.Question != "" {
 		fmt.Fprintf(&b, "## Open question\n\n%s\n\n", st.Question)
 	}
@@ -42,8 +43,15 @@ func (ru *runner) writeReport() string {
 			fmt.Fprintf(&b, "| %s | %d | %s | %s | %s | %.0f |\n", t.ID, a.N, a.Profile, result, gateSummary(r.Root, a.RunDir), a.Seconds)
 		}
 	}
-	if final := gateSummary(r.Root, rel(r.Root, r.RunDir(o.ID, "final"))); final != "" {
-		fmt.Fprintf(&b, "\n## Final check on the integrated branch\n\n%s\n", final)
+	if st.FinalRun != "" {
+		fmt.Fprintf(&b, "\n## Final check on the integrated branch\n\n%s · `%s`\n", gateSummary(r.Root, st.FinalRun), st.FinalRun)
+	}
+	for _, task := range st.Tasks {
+		for _, attempt := range task.Attempts {
+			if attempt.Worktree != "" {
+				fmt.Fprintf(&b, "\nRetained worktree for %s attempt %d: `%s`\n", task.ID, attempt.N, attempt.Worktree)
+			}
+		}
 	}
 	if len(st.Answers) > 0 {
 		b.WriteString("\n## Answers from the owner\n\n")
@@ -52,8 +60,14 @@ func (ru *runner) writeReport() string {
 		}
 	}
 	path := r.ReportPath(o.ID)
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
-	_ = os.WriteFile(path, []byte(b.String()), 0o644)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		ru.logf("warning: create report directory: %v", err)
+		return ""
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+		ru.logf("warning: write report: %v", err)
+		return ""
+	}
 	return rel(r.Root, path)
 }
 

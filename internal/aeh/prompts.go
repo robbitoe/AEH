@@ -3,6 +3,7 @@ package aeh
 import (
 	"bytes"
 	"embed"
+	"errors"
 	"os"
 	"strings"
 	"text/template"
@@ -26,16 +27,17 @@ type promptData struct {
 	Diff       string
 }
 
-// renderPrompt uses aeh/prompts/<name> when the project overrides it, otherwise the embedded default.
-func renderPrompt(r Repo, name string, data promptData) (string, error) {
+// loadPrompt uses the project override when present, otherwise the embedded default.
+func loadPrompt(r Repo, name string) (string, error) {
 	text, err := os.ReadFile(r.PromptOverride(name))
-	if err != nil {
+	if errors.Is(err, os.ErrNotExist) {
 		text, err = defaultPrompts.ReadFile("prompts/" + name)
-		if err != nil {
-			return "", err
-		}
 	}
-	tmpl, err := template.New(name).Funcs(template.FuncMap{"join": strings.Join}).Parse(string(text))
+	return string(text), err
+}
+
+func renderPrompt(name, text string, data promptData) (string, error) {
+	tmpl, err := template.New(name).Funcs(template.FuncMap{"join": strings.Join}).Parse(text)
 	if err != nil {
 		return "", err
 	}

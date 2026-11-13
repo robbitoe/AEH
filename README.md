@@ -4,7 +4,7 @@ AEH turns an approved outcome into verified code on its own branch. You decide w
 
 The runner decides; models only propose.
 
-> **Status: MVP-1.** Agents run with your user's permissions. There is no container sandbox yet, so run AEH only on repositories and machines you trust, and keep secrets out of the project directory.
+> **Status: MVP-1.** Worktrees separate Git changes. Agent CLIs and build/test commands run with your user's permissions, subject to any sandbox configured on the CLI itself. Use trusted repositories, profiles, and commands until AEH has a process sandbox.
 
 ## Install
 
@@ -39,15 +39,17 @@ aeh do "fix the null check in FeeService.Calculate" --paths src/Fees/
 
 1. A fresh worktree is created from `aeh/<ID>`.
 2. The profile's CLI receives the prompt: outcome, criteria, task, rules, and the previous failure if there was one.
-3. Gates run in order and stop at the first failure. None of them calls a model:
+3. AEH creates a candidate commit on the pinned base and checks it out in a clean verification worktree. Gates run in order and stop at the first failure. None of them calls a model:
    - **hash**: the sealed acceptance tests are unchanged;
-   - **scope**: no protected path touched, only the task's paths, within the diff limit;
+   - **scope**: compare the candidate with its pinned base and enforce protected paths, task paths and the diff limit. Agent instruction files (`AGENTS.md`, `CLAUDE.md`, `.claude/`, `.codex/`) and Git control files (`.gitattributes`, `.gitmodules`, `.lfsconfig`) and submodule pointers may not change in any directory. Binary changes fail when Git cannot count their lines;
    - **build**: your build command (put lint here);
    - **test**: your test command.
-4. Level-2 outcomes are then reviewed by the `reviewer` profile, which must answer `VERDICT: APPROVE`.
-5. If everything passes, the change is committed and `aeh/<ID>` advances.
+4. Level-2 outcomes require a separate `reviewer` profile that exits successfully and writes one verdict on the final nonempty line of plain stdout. Use `VERDICT: APPROVE` or `VERDICT: REJECT`. Configure a plain-text reviewer rather than a JSON/JSONL stream.
+5. If everything passes and the verification checkout remains clean, `aeh/<ID>` advances to the candidate commit. The runner checks that the branch still points to the expected base before advancing.
 
 On failure the attempt is discarded. The ladder is: retry with the same profile and the failure as feedback, then try the next profile, then block with a question. Answer it with `aeh answer <ID> "..."` and run again.
+
+Timeouts and interruptions block immediately and retain the affected worktree. Confirm the processes have stopped and inspect possible effects before answering. When you have finished inspecting the retained worktree, remove it with Git. Resume requires the same contract and recorded branch head. The contract covers the outcome, sealed tests, prompts, build and test commands, `pass_env`, protected paths and limits; profiles, task start profiles, ladder, reviewer, notify and timeouts may change between runs. Use a new outcome ID when intentionally changing the contract or when old state lacks those records.
 
 After the last task, build and tests run once more on the integrated branch. Accepted means proven there.
 
@@ -71,11 +73,13 @@ aeh/                      committed
   prompts/*.md            optional overrides of the built-in prompts
 .aeh/                     local, git-ignored
   state/                  progress per outcome
-  runs/<ID>/<task>-a<n>/  prompt, agent output, diff, gate results
+  runs/<ID>/<task>-a<n>/  prompt, agent output, candidate SHA, diff, gate results
   reports/<ID>.md         evidence report
 ```
 
-Attempt worktrees are created in your user cache directory, outside the repository, and removed after each attempt. Keeping them outside stops agent CLIs from loading instruction files from the parent project and stops build tools from globbing them.
+Attempt and verification worktrees are created in your user cache directory. Ordinary completed attempts are removed. Keeping them outside the repository avoids inheriting instructions from the parent project and prevents build tools from globbing the temporary worktrees.
+
+Agent and gate processes inherit a limited set of OS and tool-discovery variables. List any other variable names they need (for example `JAVA_HOME` or a proxy) in `pass_env`. Use the profile's `env` mapping for explicit agent variables, with references to existing environment variables for credentials. Keep values out of tracked config. Home directories remain accessible with the user's permissions. Git variables such as `GIT_CONFIG_GLOBAL` are not inherited either; set `safe.directory` and similar options in your global or system Git config. Provider quota stays unknown unless a profile supplies a distinct, documented `quota_exit_codes` signal. That signal is recorded as an agent failure and follows the configured ladder.
 
 Make sure your project's `.gitignore` covers build output (`bin/`, `obj/`, `node_modules/`). Otherwise the scope gate sees it as part of the change.
 
@@ -108,3 +112,7 @@ go test ./...
 ```
 
 Agent instruction files (`AGENTS.md`, `CLAUDE.md`, `.claude/`, `.codex/`) are git-ignored: keep your own locally.
+
+## License
+
+[MIT](LICENSE).

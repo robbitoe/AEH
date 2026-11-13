@@ -6,9 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // These tests drive the real runner against a throwaway git repository.
@@ -38,8 +38,8 @@ type fixture struct {
 
 func newFixture(t *testing.T, profiles map[string]string, ladder []string, reviewer string) *fixture {
 	t.Helper()
-	if runtime.GOOS == "windows" {
-		t.Skip("end-to-end tests use sh")
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("end-to-end tests require sh (Git for Windows provides it)")
 	}
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
@@ -47,9 +47,15 @@ func newFixture(t *testing.T, profiles map[string]string, ladder []string, revie
 	dir := t.TempDir()
 	tmp := t.TempDir()
 	mustGit(t, dir, "init", "-q", "-b", "main")
+	mustGit(t, dir, "config", "core.autocrlf", "false")
+
+	if reviewer == "" {
+		reviewer = "qa-default"
+		profiles[reviewer] = reviewOK
+	}
 
 	var cfg strings.Builder
-	cfg.WriteString("project: test\ncommands:\n  build: \"true\"\n  test: \"sh tests/acceptance/check.sh\"\n  timeout_minutes: 1\n")
+	cfg.WriteString("project: test\ncommands:\n  build: \"git --version\"\n  test: \"sh tests/acceptance/check.sh\"\n  timeout_minutes: 1\n")
 	cfg.WriteString("limits:\n  max_diff_lines: 50\n")
 	fmt.Fprintf(&cfg, "ladder: [%s]\n", strings.Join(ladder, ", "))
 	fmt.Fprintf(&cfg, "reviewer: %q\n", reviewer)
@@ -60,7 +66,7 @@ func newFixture(t *testing.T, profiles map[string]string, ladder []string, revie
 			t.Fatal(err)
 		}
 		fmt.Fprintf(&cfg, "  %s:\n    command: [\"sh\", %q, \"{{prompt}}\"]\n    env:\n      AEH_COUNTER: %q\n",
-			name, path, filepath.Join(tmp, name+".count"))
+			name, filepath.ToSlash(path), filepath.ToSlash(filepath.Join(tmp, name+".count")))
 	}
 	write(t, dir, "aeh/config.yaml", cfg.String())
 	write(t, dir, "aeh/outcomes/OUT-001.yaml", `id: OUT-001
@@ -247,7 +253,7 @@ func TestDoRunsLevelOne(t *testing.T) {
 
 func TestMissingCLIFailsFast(t *testing.T) {
 	f := newFixture(t, map[string]string{"medio": agentGood}, []string{"medio"}, "")
-	cfg := strings.Replace(readFile(t, f.repo.ConfigPath()), `["sh",`, `["definitely-not-installed",`, 1)
+	cfg := strings.ReplaceAll(readFile(t, f.repo.ConfigPath()), `["sh",`, `["definitely-not-installed",`)
 	write(t, f.dir, "aeh/config.yaml", cfg)
 	_, err := RunOutcome(context.Background(), f.repo, "OUT-001", nil)
 	if err == nil || !strings.Contains(err.Error(), "not installed") {
@@ -255,6 +261,153 @@ func TestMissingCLIFailsFast(t *testing.T) {
 	}
 	if _, ok := branchCommit(f.dir, IntegrationBranch("OUT-001")); ok {
 		t.Fatal("preflight must fail before creating branches")
+	}
+}
+
+func TestLevelTwoRequiresSeparateReviewer(t *testing.T) {
+	for _, reviewer := range []string{"", "medio"} {
+		t.Run("reviewer="+reviewer, func(t *testing.T) {
+			f := newFixture(t, map[string]string{"medio": agentGood}, []string{"medio"}, "")
+			cfg := strings.Replace(readFile(t, f.repo.ConfigPath()), `reviewer: "qa-default"`, fmt.Sprintf("reviewer: %q", reviewer), 1)
+			write(t, f.dir, "aeh/config.yaml", cfg)
+			_, err := RunOutcome(context.Background(), f.repo, "OUT-001", nil)
+			if err == nil || !strings.Contains(err.Error(), "reviewer profile") {
+				t.Fatalf("expected reviewer configuration error, got %v", err)
+			}
+			if _, ok := branchCommit(f.dir, IntegrationBranch("OUT-001")); ok {
+				t.Fatal("invalid configuration created an integration branch")
+			}
+		})
+	}
+}
+
+func TestRunnerRejectsUncheckedCandidateChanges(t *testing.T) {
+	cases := []struct{ name, agent, reviewer, build, gate string }{
+		{"agent commit", "git -c user.name=t -c user.email=t@t commit --allow-empty -qm unexpected; " + agentGood, reviewOK, "", "scope"},
+		{"quoted protected path", agentGood + `; mkdir -p aeh; echo hidden > aeh/café`, reviewOK, "", "scope"},
+		{"build restages", agentGood, reviewOK, `sh -c "echo tampered > src/fees.txt; git add -A"`, "build"},
+		{"reviewer restages", agentGood, "echo tampered > src/fees.txt; git add -A; " + reviewOK, "", "review"},
+		{"failed reviewer approves", agentGood, reviewOK + "; exit 7", "", "review"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t, map[string]string{"medio": c.agent, "qa": c.reviewer}, []string{"medio"}, "qa")
+			if c.build != "" {
+				cfg := strings.Replace(readFile(t, f.repo.ConfigPath()), `build: "git --version"`, fmt.Sprintf("build: %q", c.build), 1)
+				write(t, f.dir, "aeh/config.yaml", cfg)
+			}
+			base := mustGit(t, f.dir, "rev-parse", "HEAD")
+			st, _ := f.run()
+			if st.Status != StatusBlocked || st.Tasks[0].Attempts[0].FailedGate != c.gate {
+				t.Fatalf("expected rejection at %s, got %+v", c.gate, st)
+			}
+			if got := mustGit(t, f.dir, "rev-parse", IntegrationBranch("OUT-001")); got != base {
+				t.Fatalf("integration branch advanced from %s to %s", base, got)
+			}
+		})
+	}
+}
+
+func TestResumeRejectsContractAndBranchDrift(t *testing.T) {
+	for _, change := range []string{"contract", "branch"} {
+		t.Run(change, func(t *testing.T) {
+			f := newFixture(t, map[string]string{"medio": agentScope}, []string{"medio"}, "")
+			st, _ := f.run()
+			if st.Status != StatusBlocked {
+				t.Fatalf("status %s", st.Status)
+			}
+			if err := Answer(f.repo, st.ID, "retry"); err != nil {
+				t.Fatal(err)
+			}
+			if change == "contract" {
+				cfg := strings.Replace(readFile(t, f.repo.ConfigPath()), "max_diff_lines: 50", "max_diff_lines: 51", 1)
+				write(t, f.dir, "aeh/config.yaml", cfg)
+			} else {
+				mustGit(t, f.dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-qm", "move")
+				mustGit(t, f.dir, "branch", "-f", st.Branch, "HEAD")
+			}
+			_, err := RunOutcome(context.Background(), f.repo, st.ID, nil)
+			if err == nil || !strings.Contains(err.Error(), "differs from recorded state") {
+				t.Fatalf("expected resume to reject drift, got %v", err)
+			}
+		})
+	}
+}
+
+func TestResumeAllowsProfileChanges(t *testing.T) {
+	f := newFixture(t, map[string]string{"medio": agentScope}, []string{"medio"}, "")
+	st, _ := f.run()
+	if st.Status != StatusBlocked {
+		t.Fatalf("status %s", st.Status)
+	}
+	if err := Answer(f.repo, st.ID, "retry"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := strings.Replace(readFile(t, f.repo.ConfigPath()), "  timeout_minutes: 1\n", "  timeout_minutes: 2\n", 1)
+	outcome := strings.Replace(readFile(t, f.repo.OutcomePath(st.ID)), "    paths: [src/]", "    paths: [src/]\n    start: medio", 1)
+	write(t, f.dir, "aeh/outcomes/OUT-001.yaml", outcome)
+	cfg += "    timeout_minutes: 5\nnotify:\n  webhook: \"\"\n"
+	write(t, f.dir, "aeh/config.yaml", cfg)
+	st, err := RunOutcome(context.Background(), f.repo, st.ID, nil)
+	if err != nil {
+		t.Fatalf("resume after a profile change: %v", err)
+	}
+	if st.Status != StatusBlocked {
+		t.Fatalf("status %s", st.Status)
+	}
+}
+
+func TestInterruptedAgentRetainsWorktreeWithoutRetry(t *testing.T) {
+	// Some Windows sh launchers leave their child alive when the launcher is killed.
+	// Keep the simulated agent bounded and let cleanup wait for its log handle.
+	f := newFixture(t, map[string]string{"medio": agentGood + "; sleep 2"}, []string{"medio"}, "")
+	wt := f.repo.WorktreePath("OUT-001-T1-a1")
+	t.Cleanup(func() {
+		logPath := filepath.Join(f.repo.RunDir("OUT-001", "T1-a1"), "agent.err")
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			err := os.Remove(logPath)
+			if err == nil || os.IsNotExist(err) {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("release interrupted agent log: %v", err)
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		removeWorktree(f.dir, wt)
+		deleteBranch(f.dir, AttemptBranch("OUT-001", "T1", 1))
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	go func() {
+		tick := time.NewTicker(10 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				if _, err := os.Stat(filepath.Join(wt, "src", "fees.txt")); err == nil {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	st, err := RunOutcome(ctx, f.repo, "OUT-001", nil)
+	if err != nil || st.Status != StatusBlocked || len(st.Tasks[0].Attempts) != 1 {
+		t.Fatalf("expected one blocked attempt, got %+v, %v", st, err)
+	}
+	if got := st.Tasks[0].Attempts[0].Worktree; got != wt {
+		t.Fatalf("retained worktree = %q, want %q", got, wt)
+	}
+	if _, err := os.Stat(filepath.Join(wt, "src", "fees.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if st.Head != st.Base {
+		t.Fatal("interrupted attempt advanced the integration branch")
 	}
 }
 

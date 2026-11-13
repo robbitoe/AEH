@@ -17,6 +17,7 @@ type Profile struct {
 	Env            map[string]string `yaml:"env"`
 	Stdin          bool              `yaml:"stdin"`
 	TimeoutMinutes int               `yaml:"timeout_minutes"`
+	QuotaExitCodes []int             `yaml:"quota_exit_codes"`
 }
 
 // Config is the project's constitution: commands, limits, protected paths and agent profiles.
@@ -27,6 +28,7 @@ type Config struct {
 		Test           string `yaml:"test"`
 		TimeoutMinutes int    `yaml:"timeout_minutes"`
 	} `yaml:"commands"`
+	PassEnv   []string `yaml:"pass_env"`
 	Protected []string `yaml:"protected"`
 	Limits    struct {
 		MaxDiffLines int `yaml:"max_diff_lines"`
@@ -114,8 +116,13 @@ func (c Config) checkProfile(name string) error {
 	if !ok {
 		return fmt.Errorf("config: profile %q is used but not defined", name)
 	}
-	if len(p.Command) == 0 {
+	if len(p.Command) == 0 || strings.TrimSpace(p.Command[0]) == "" {
 		return fmt.Errorf("config: profile %q has no command", name)
+	}
+	for _, code := range p.QuotaExitCodes {
+		if code <= 0 || code > 255 {
+			return fmt.Errorf("config: profile %q has invalid quota exit code %d", name, code)
+		}
 	}
 	return nil
 }
@@ -134,6 +141,9 @@ func (c Config) escalate(name string) string {
 // LoadOutcome reads and validates aeh/outcomes/<id>.yaml.
 func (r Repo) LoadOutcome(id string) (Outcome, error) {
 	var o Outcome
+	if !validID(id) {
+		return o, fmt.Errorf("invalid outcome ID %q", id)
+	}
 	b, err := os.ReadFile(r.OutcomePath(id))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -179,6 +189,9 @@ func (o *Outcome) normalize() error {
 		if t.ID == "" {
 			t.ID = fmt.Sprintf("T%d", i+1)
 		}
+		if !validID(t.ID) {
+			return fmt.Errorf("outcome %s: invalid task ID %q", o.ID, t.ID)
+		}
 		if seen[t.ID] {
 			return fmt.Errorf("outcome %s: duplicate task id %s", o.ID, t.ID)
 		}
@@ -188,6 +201,18 @@ func (o *Outcome) normalize() error {
 		}
 	}
 	return nil
+}
+
+func validID(id string) bool {
+	if id == "" || id[0] == '-' || id[0] == '_' {
+		return false
+	}
+	for _, c := range id {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
 }
 
 func rel(root, p string) string {

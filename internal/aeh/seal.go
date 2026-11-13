@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -31,13 +32,30 @@ type Seal struct {
 func hashPaths(dir string, paths []string) (string, []SealFile, error) {
 	var files []SealFile
 	for _, p := range paths {
-		full := filepath.Join(dir, filepath.FromSlash(p))
+		clean := filepath.Clean(filepath.FromSlash(p))
+		if clean == "." || !filepath.IsLocal(clean) {
+			return "", nil, fmt.Errorf("acceptance path must be inside the worktree: %q", p)
+		}
+		full := dir
+		for _, part := range strings.Split(clean, string(filepath.Separator)) {
+			full = filepath.Join(full, part)
+			info, err := os.Lstat(full)
+			if err != nil {
+				return "", nil, fmt.Errorf("inspect acceptance path %q: %w", p, err)
+			}
+			if !info.IsDir() && !info.Mode().IsRegular() {
+				return "", nil, fmt.Errorf("acceptance path is not a regular file or directory: %q", p)
+			}
+		}
 		err := filepath.WalkDir(full, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
 			if d.IsDir() {
 				return nil
+			}
+			if !d.Type().IsRegular() {
+				return fmt.Errorf("acceptance entry is not a regular file: %s", rel(dir, path))
 			}
 			b, err := os.ReadFile(path)
 			if err != nil {
