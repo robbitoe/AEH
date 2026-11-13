@@ -151,3 +151,38 @@ func TestAttributesFileInRepoIsProtected(t *testing.T) {
 		t.Fatal("scope accepted a change to the configured attributes file")
 	}
 }
+
+func TestSealedTreeSeesPointerChangeHiddenByIgnoreAll(t *testing.T) {
+	dir, first := newRepo(t)
+	write(t, dir, "src/a.txt", "two\n")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "two")
+	second, _ := headCommit(dir)
+	write(t, dir, ".gitmodules", "[submodule \"mod\"]\n\tpath = tests/acceptance/mod\n\turl = ./mod\n\tignore = all\n")
+	mustGit(t, dir, "add", ".gitmodules")
+	mustGit(t, dir, "update-index", "--add", "--cacheinfo", "160000,"+first+",tests/acceptance/mod")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "sealed submodule")
+	base, _ := headCommit(dir)
+	mustGit(t, dir, "config", "diff.ignoreSubmodules", "all")
+	mustGit(t, dir, "update-index", "--cacheinfo", "160000,"+second+",tests/acceptance/mod")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "move sealed pointer")
+	commit, _ := headCommit(dir)
+	if g := gateSealedTree(dir, base, commit, []string{"tests/acceptance/"}); g.Passed {
+		t.Fatal("hash gate missed a sealed submodule pointer change hidden by ignore=all")
+	}
+}
+
+func TestCandidateDiffHasNoColor(t *testing.T) {
+	dir, base := newRepo(t)
+	mustGit(t, dir, "config", "color.ui", "always")
+	mustGit(t, dir, "config", "color.diff", "always")
+	write(t, dir, "src/a.txt", "changed\n")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "change")
+	commit, _ := headCommit(dir)
+	diff, err := candidateDiff(dir, base, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(diff, "\x1b[") || !strings.Contains(diff, "+changed") {
+		t.Fatalf("review diff must be plain text:\n%q", diff)
+	}
+}

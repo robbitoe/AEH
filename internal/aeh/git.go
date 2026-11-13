@@ -147,7 +147,7 @@ func markGitlinks(wt, base, commit string, changes []fileChange) ([]fileChange, 
 }
 
 func candidateDiff(wt, base, commit string) (string, error) {
-	return git(wt, "diff", "--no-renames", "--ignore-submodules=none", "--no-ext-diff", "--no-textconv", base, commit)
+	return git(wt, "diff", "--no-color", "--no-renames", "--ignore-submodules=none", "--no-ext-diff", "--no-textconv", base, commit)
 }
 
 func verifyCheckout(wt, commit string) error {
