@@ -31,7 +31,17 @@ Execution
   aeh do "<change>" [flags]         level 1: one agent, gates only, no sealed tests
         --paths a/,b/               restrict the change to these paths
         --profile <name>            start with this profile
+        --feature <f> --change patch|minor|major --note "..."
+                                    the feature this change modifies (drift gate pending)
   aeh answer <ID> "<text>"          answer a blocked outcome so it can run again
+
+Memory (local, private: .aeh/memory/ of the main checkout, never published by aeh)
+  aeh memory init                   create the memory repository
+  aeh memory new <feature> --title "..." --paths a/**,b/**
+                                    add a feature spec at version 0.1.0
+  aeh memory status                 features, versions and pending records
+  aeh memory lint                   check memory and its privacy settings
+  aeh memory record <ID>            retry a pending memory record of an accepted outcome
 
 Tracking
   aeh status                        progress of every outcome
@@ -106,12 +116,19 @@ func dispatch(ctx context.Context, args []string) (int, error) {
 		fs := flag.NewFlagSet("do", flag.ContinueOnError)
 		paths := fs.String("paths", "", "comma-separated paths the change may touch")
 		profile := fs.String("profile", "", "profile to start with")
+		feature := fs.String("feature", "", "feature this change modifies")
+		change := fs.String("change", "", "patch, minor or major")
+		note := fs.String("note", "", "changelog line")
 		if err := fs.Parse(reorder(args[1:])); err != nil {
 			return 2, err
 		}
 		text := strings.Join(fs.Args(), " ")
-		st, err := aeh.Do(ctx, repo, text, splitList(*paths), *profile, os.Stdout)
+		link := aeh.MemoryLink{Feature: *feature, Change: *change, Note: *note}
+		st, err := aeh.Do(ctx, repo, text, splitList(*paths), *profile, link, os.Stdout)
 		return exitCode(st), err
+
+	case "memory":
+		return memoryCommand(repo, args[1:])
 
 	case "answer":
 		if len(args) < 3 {
@@ -137,6 +154,101 @@ func dispatch(ctx context.Context, args []string) (int, error) {
 		return 0, nil
 	}
 	return 2, fmt.Errorf("unknown command %q; run `aeh help`", args[0])
+}
+
+func memoryCommand(repo aeh.Repo, args []string) (int, error) {
+	if len(args) == 0 {
+		return 2, errors.New("usage: aeh memory init|new|status|lint|record")
+	}
+	switch args[0] {
+	case "init":
+		created, err := aeh.InitMemory(repo)
+		if err != nil {
+			return 1, err
+		}
+		dir, _ := aeh.MemoryDir(repo)
+		if created {
+			fmt.Println("created memory in", dir)
+		} else {
+			fmt.Println("memory already exists in", dir)
+		}
+		return 0, nil
+
+	case "new":
+		fs := flag.NewFlagSet("memory new", flag.ContinueOnError)
+		title := fs.String("title", "", "feature title")
+		paths := fs.String("paths", "", "comma-separated paths the feature owns")
+		if err := fs.Parse(reorder(args[1:])); err != nil {
+			return 2, err
+		}
+		if fs.NArg() != 1 {
+			return 2, errors.New(`usage: aeh memory new <feature> --title "..." --paths a/**,b/**`)
+		}
+		s, err := aeh.CreateSpec(repo, fs.Arg(0), *title, splitList(*paths))
+		if err != nil {
+			return 1, err
+		}
+		fmt.Printf("created %s %s; describe it in wiki/features/%s/spec.md and commit it in the memory repository\n", s.Feature, s.Version, s.Feature)
+		return 0, nil
+
+	case "status":
+		st, err := aeh.ReadMemoryStatus(repo)
+		if err != nil {
+			return 1, err
+		}
+		if !st.Present {
+			fmt.Println("no memory yet; create it with: aeh memory init")
+			return 0, nil
+		}
+		fmt.Println("memory:", st.Dir)
+		if st.Dirty != "" {
+			fmt.Println("uncommitted changes (aeh will not record until they are committed):")
+			fmt.Println("  " + strings.ReplaceAll(st.Dirty, "\n", "\n  "))
+		}
+		if len(st.Specs) == 0 {
+			fmt.Println("no features yet")
+		}
+		for _, s := range st.Specs {
+			last := aeh.LastAccepted(s)
+			if last == "" {
+				last = "not implemented yet"
+			}
+			fmt.Printf("%-24s %-9s %s\n", s.Feature, s.Version, last)
+		}
+		for _, p := range st.Pending {
+			fmt.Printf("pending record: %s -> %s (%s); retry with: aeh memory record %s\n", p.OutcomeID, p.Feature, p.Change, p.OutcomeID)
+		}
+		return 0, nil
+
+	case "lint":
+		errs, warnings, err := aeh.LintMemory(repo)
+		if err != nil {
+			return 1, err
+		}
+		for _, w := range warnings {
+			fmt.Println("warning:", w)
+		}
+		for _, e := range errs {
+			fmt.Println("error:", e)
+		}
+		if len(errs) > 0 {
+			return 1, fmt.Errorf("memory has %d error(s)", len(errs))
+		}
+		fmt.Println("memory ok")
+		return 0, nil
+
+	case "record":
+		if len(args) != 2 {
+			return 2, errors.New("usage: aeh memory record <ID>")
+		}
+		v, c, err := aeh.RecordPending(repo, args[1])
+		if err != nil {
+			return 1, err
+		}
+		fmt.Printf("recorded %s as version %s (memory commit %s)\n", args[1], v, c[:12])
+		return 0, nil
+	}
+	return 2, fmt.Errorf("unknown memory command %q; run `aeh help`", args[0])
 }
 
 func printStatus(repo aeh.Repo) error {

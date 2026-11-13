@@ -158,6 +158,6 @@ func ensureIgnored(path, entry string) (bool, error) {
 		return false, err
 	}
 	defer f.Close()
-	_, err = fmt.Fprintf(f, "%s\n# AEH local state: runs, worktrees, reports\n%s\n", prefix, entry)
+	_, err = fmt.Fprintf(f, "%s\n# AEH local and private: state, runs, reports, product memory\n%s\n", prefix, entry)
 	return err == nil, err
 }

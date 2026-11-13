@@ -10,7 +10,7 @@ You start with a vague idea or an explicit brief. AEH refines it with you into a
 
 - **Models propose, the runner decides.** Agents write specs, code and reviews. Acceptance comes from checks that do not depend on trusting a model.
 - **Effort proportional to the change.** Changing a label does not need a spec cycle. A new feature with a database does.
-- **Memory is part of the product, and it is private.** A change is not finished until the documentation that describes it is updated and versioned. The memory stays on the owner's machine and is never published.
+- **Memory is part of the product, and it is private.** A change is not finished until the documentation that describes it is updated and versioned. The memory is stored locally and is not published by default.
 - **The human decides at fixed points:** the idea, answers to questions, feature approval, pauses when the engine is stuck, and the merge.
 - **Evidence over claims.** "Done" means the acceptance tests and the reviewers passed, with a report that shows it.
 
@@ -97,7 +97,7 @@ The memory follows the [LLM Wiki](https://gist.github.com/karpathy/442a6bf555914
   schema.md         conventions the engine follows when it writes the wiki
 ```
 
-The memory is private. It lives in `.aeh/memory/` in the project's main checkout, which `aeh init` adds to `.gitignore` and the scope gate will protect, so the memory directory never enters a commit. It is its own local Git repository: every spec version is a commit there that records the code commit that implemented it. Branches and worktrees are cleaned up after a merge; the memory is never touched by cleanup. Agents propose updates; only the runner writes the memory. Discovery and approval record drafts and approved specs before any code exists; an implementation is recorded after its gates and reviews pass. That does not stop private text from being copied into tracked files. Agents receive only the spec of the feature they work on, inside their prompt, and that text goes to the configured agent provider. Until the process sandbox exists, agents run with the user's permissions and could copy memory content into an allowed file, so review covers that risk. Backing it up to a private remote is the owner's choice, not a default.
+The memory is private. It lives in `.aeh/memory/` in the project's main checkout, which `aeh init` adds to `.gitignore` and the scope gate will protect, so the memory directory never enters a commit. It is its own local Git repository: every spec version is a commit there. A version that was implemented records the verified code commit; drafts and approved specs that are not built yet have none. Branches and worktrees are cleaned up after a merge; the memory is never touched by cleanup. Agents propose updates; only the runner writes the memory. Discovery and approval record drafts and approved specs before any code exists; an implementation is recorded after its gates and reviews pass. That does not stop private text from being copied into tracked files. Agents receive only the spec of the feature they work on, inside their prompt, and that text goes to the configured agent provider. Until the process sandbox exists, agents run with the user's permissions and could copy memory content into an allowed file, so review covers that risk. Backing it up to a private remote is the owner's choice, not a default.
 
 - **Ingest:** new input in `raw/` updates the pages it touches.
 - **Read:** every stage starts by reading `index.md` and the relevant pages, so agents work with the real context.

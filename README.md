@@ -91,6 +91,8 @@ aeh/                      committed
   state/                  progress per outcome
   runs/<ID>/<task>-a<n>/  prompt, agent output, candidate SHA, diff, gate results
   reports/<ID>.md         evidence report
+  pending/<ID>.json       accepted changes still to be written to memory
+  memory/                 product memory: its own local Git repository, no remote
 ```
 
 Attempt and verification worktrees are created in your user cache directory. Ordinary completed attempts are removed. Keeping them outside the repository avoids inheriting instructions from the parent project and prevents build tools from globbing the temporary worktrees.
@@ -110,6 +112,15 @@ Make sure your project's `.gitignore` covers build output (`bin/`, `obj/`, `node
 | `aeh answer <ID> "<text>"` | Answers a blocked outcome; the answer goes into the next prompt. |
 | `aeh status` | Status, tasks and attempts of every outcome. |
 | `aeh notify test` | Sends a test event to the webhook. |
+| `aeh memory init` | Creates the product memory in `.aeh/memory/` of the main checkout. |
+| `aeh memory new <feature> --title "..." --paths a/**` | Adds a feature spec at version 0.1.0. |
+| `aeh memory status` | Features, versions, last accepted change and pending records. |
+| `aeh memory lint` | Checks the memory and its privacy settings. |
+| `aeh memory record <ID>` | Retries a memory record that failed after an outcome was accepted. |
+
+### Product memory (in progress)
+
+The memory is a local wiki in `.aeh/memory/` of the project's main checkout, also when you run from a linked worktree. It is its own Git repository with no remote, and the project ignores `.aeh/`, so aeh does not publish it. Each feature has a spec with a version and the paths it owns; `index.md` and `log.md` are maintained by aeh. Only aeh commands write it, one at a time per project. You can edit spec text by hand and commit it inside the memory repository; aeh refuses to record on top of uncommitted changes. Linking an outcome to a feature (`--feature`) and the drift gate arrive in the next step of stage 1.
 
 ## Roadmap
 
