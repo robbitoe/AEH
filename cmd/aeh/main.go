@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/robbitoe/aeh/internal/aeh"
 )
@@ -38,7 +39,7 @@ Tracking
 `
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	code, err := dispatch(ctx, os.Args[1:])
 	if err != nil {

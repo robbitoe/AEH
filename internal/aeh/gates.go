@@ -184,7 +184,7 @@ func runShell(ctx context.Context, dir, command string, timeout time.Duration, p
 	cmd.WaitDelay = 2 * time.Second
 	var buf bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &buf, &buf
-	err := cmd.Run()
+	err := runProcessTree(cmd)
 	if ctx.Err() != nil {
 		err = ctx.Err()
 	}

@@ -358,24 +358,11 @@ func TestResumeAllowsProfileChanges(t *testing.T) {
 }
 
 func TestInterruptedAgentRetainsWorktreeWithoutRetry(t *testing.T) {
-	// Some Windows sh launchers leave their child alive when the launcher is killed.
-	// Keep the simulated agent bounded and let cleanup wait for its log handle.
-	f := newFixture(t, map[string]string{"medio": agentGood + "; sleep 2"}, []string{"medio"}, "")
+	// Signal readiness after the sleeping child has started, then cancel while
+	// both the shell and its child still hold the agent's log handles.
+	f := newFixture(t, map[string]string{"medio": agentGood + "; sleep 30 & echo ready > agent-ready; wait"}, []string{"medio"}, "")
 	wt := f.repo.WorktreePath("OUT-001-T1-a1")
 	t.Cleanup(func() {
-		logPath := filepath.Join(f.repo.RunDir("OUT-001", "T1-a1"), "agent.err")
-		deadline := time.Now().Add(15 * time.Second)
-		for {
-			err := os.Remove(logPath)
-			if err == nil || os.IsNotExist(err) {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Errorf("release interrupted agent log: %v", err)
-				break
-			}
-			time.Sleep(25 * time.Millisecond)
-		}
 		removeWorktree(f.dir, wt)
 		deleteBranch(f.dir, AttemptBranch("OUT-001", "T1", 1))
 	})
@@ -389,7 +376,7 @@ func TestInterruptedAgentRetainsWorktreeWithoutRetry(t *testing.T) {
 			case <-ctx.Done():
 				return
 			case <-tick.C:
-				if _, err := os.Stat(filepath.Join(wt, "src", "fees.txt")); err == nil {
+				if _, err := os.Stat(filepath.Join(wt, "agent-ready")); err == nil {
 					cancel()
 					return
 				}
@@ -408,6 +395,11 @@ func TestInterruptedAgentRetainsWorktreeWithoutRetry(t *testing.T) {
 	}
 	if st.Head != st.Base {
 		t.Fatal("interrupted attempt advanced the integration branch")
+	}
+	for _, name := range []string{"agent.out", "agent.err"} {
+		if err := os.Remove(filepath.Join(f.repo.RunDir("OUT-001", "T1-a1"), name)); err != nil {
+			t.Fatalf("interrupted agent still holds %s: %v", name, err)
+		}
 	}
 }
 

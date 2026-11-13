@@ -57,7 +57,7 @@ func runAgent(ctx context.Context, p Profile, passEnv []string, dir, prompt, run
 	defer errf.Close()
 	cmd.Stdout, cmd.Stderr = out, errf
 
-	runErr := cmd.Run()
+	runErr := runProcessTree(cmd)
 	if ctx.Err() != nil {
 		return outPath, ctx.Err() // the whole run was cancelled
 	}
