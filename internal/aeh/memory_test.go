@@ -579,7 +579,8 @@ func TestSemverRejectsSigns(t *testing.T) {
 	}
 }
 
-// An init that stopped before its first commit is finished by the next init.
+// An init that stopped before its first commit is finished by the next init, but a repository
+// holding anything aeh did not write is left alone.
 func TestInitMemoryFinishesInterruptedInit(t *testing.T) {
 	r := newMemoryProject(t)
 	dir := memDir(t, r)
@@ -590,7 +591,22 @@ func TestInitMemoryFinishesInterruptedInit(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustGit(t, dir, "init", "-q", "-b", "main")
-	write(t, dir, "schema.md", "partial")
+
+	// The owner's own uncommitted wiki is never replaced.
+	write(t, dir, "wiki/index.md", "my notes\n")
+	if _, err := InitMemory(r); err == nil || !strings.Contains(err.Error(), "wiki/index.md") {
+		t.Fatalf("expected a refusal naming the foreign file, got %v", err)
+	}
+	if got := readFile(t, filepath.Join(dir, "wiki", "index.md")); got != "my notes\n" {
+		t.Fatalf("owner file replaced: %q", got)
+	}
+
+	// What an interrupted aeh init leaves behind is finished.
+	if err := os.Remove(filepath.Join(dir, "wiki", "index.md")); err != nil {
+		t.Fatal(err)
+	}
+	write(t, dir, "schema.md", memorySchema)
+	write(t, dir, "wiki/features/.gitkeep", "")
 	if created, err := InitMemory(r); err != nil || !created {
 		t.Fatalf("retry: created=%v err=%v", created, err)
 	}

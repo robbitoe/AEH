@@ -154,7 +154,11 @@ func InitMemory(r Repo) (bool, error) {
 			return false, err
 		}
 		if _, err := git(dir, "rev-parse", "--verify", "--quiet", "HEAD"); err != nil {
-			// An earlier init stopped before its first commit: finish it.
+			// Finish an init that stopped before its first commit, but only when nothing in
+			// the directory could be someone else's work.
+			if err := checkUnfinishedInit(dir); err != nil {
+				return false, err
+			}
 			return true, seedMemory(dir)
 		}
 		return false, checkMemoryLayout(dir)
@@ -198,6 +202,64 @@ func seedMemory(dir string) error {
 }
 
 const nl = "\n"
+
+// checkUnfinishedInit accepts a repository only when HEAD is unborn, nothing is staged, and
+// every file present is one aeh's init writes, with the content aeh writes. Anything else may
+// be the owner's work, so init refuses instead of replacing it.
+func checkUnfinishedInit(dir string) error {
+	if _, err := git(dir, "symbolic-ref", "-q", "HEAD"); err != nil {
+		return fmt.Errorf("memory init: %s has no readable HEAD; inspect it or move it away", dir)
+	}
+	if staged, _ := git(dir, "ls-files"); staged != "" {
+		return fmt.Errorf("memory init: %s has staged files and no commit; it is not an unfinished aeh init, move it away", dir)
+	}
+	expected := map[string]bool{}
+	for _, name := range memoryLayout {
+		expected[name] = true
+	}
+	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if p == filepath.Join(dir, ".git") {
+			return filepath.SkipDir
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		if !expected[rel] || !isSeedContent(rel, b) {
+			return fmt.Errorf("memory init: %s has no commit and contains %s, which aeh did not write; move the directory away first", dir, rel)
+		}
+		return nil
+	})
+}
+
+// isSeedContent reports whether b is what seedMemory writes for name (the log's date may differ).
+func isSeedContent(name string, b []byte) bool {
+	switch name {
+	case "schema.md":
+		return string(b) == memorySchema
+	case "wiki/index.md":
+		return string(b) == renderIndex(nil)
+	case "wiki/features/.gitkeep":
+		return len(b) == 0
+	case "wiki/log.md":
+		head := "# Log" + nl + nl + "Append-only. One entry per memory change." + nl + nl + "## ["
+		tail := "] init | memory created" + nl
+		s := string(b)
+		return strings.HasPrefix(s, head) && strings.HasSuffix(s, tail) && len(s) == len(head)+len("2006-01-02")+len(tail)
+	}
+	return false
+}
 
 // checkMemoryLayout reports files an initialized memory is missing from its last commit.
 func checkMemoryLayout(dir string) error {
@@ -293,7 +355,7 @@ func fingerprint(m MemorySnapshot) string {
 }
 
 // ContractFingerprint is what a run's contract depends on: which code every feature owns, and
-// the declared feature's version and text. Other features' versions are left out, so recording
+// the declared feature's title, version and text (everything the prompt shows of it). Other features' versions are left out, so recording
 // another outcome does not stop a blocked outcome from resuming.
 func (m MemorySnapshot) ContractFingerprint(declared string) string {
 	type owner struct {
@@ -304,13 +366,14 @@ func (m MemorySnapshot) ContractFingerprint(declared string) string {
 		Present         bool
 		Owners          []owner
 		Declared        string
+		DeclaredTitle   string
 		DeclaredVersion string
 		DeclaredBody    string
 	}{Present: m.Present, Declared: declared}
 	for _, s := range m.Specs {
 		v.Owners = append(v.Owners, owner{s.Feature, s.Paths})
 		if s.Feature == declared {
-			v.DeclaredVersion = s.Version
+			v.DeclaredTitle, v.DeclaredVersion = s.Title, s.Version
 			sum := sha256.Sum256([]byte(s.Body))
 			v.DeclaredBody = hex.EncodeToString(sum[:])
 		}
