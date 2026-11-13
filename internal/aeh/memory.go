@@ -40,8 +40,11 @@ var (
 	ErrMemoryChanged = errors.New("memory changed since the run started")
 )
 
-// memoryNow is replaced in tests.
-var memoryNow = time.Now
+// memoryNow and memoryWriteFile are replaced in tests.
+var (
+	memoryNow       = time.Now
+	memoryWriteFile = writeFileAtomic
+)
 
 // memoryGitIdentity signs memory commits. They never leave the machine.
 // author.* and committer.* override user.*, so all of them are pinned.
@@ -742,7 +745,7 @@ func parseSemver(v string) ([3]int, error) {
 		return n, fmt.Errorf("version %q must be MAJOR.MINOR.PATCH", v)
 	}
 	for i, p := range parts {
-		if p == "" || len(p) > 1 && p[0] == '0' {
+		if p == "" || len(p) > 1 && p[0] == '0' || strings.Trim(p, "0123456789") != "" {
 			return n, fmt.Errorf("version %q must be MAJOR.MINOR.PATCH", v)
 		}
 		x, err := strconv.Atoi(p)
@@ -894,7 +897,10 @@ func (w memoryWrites) write(dir, rel string, b []byte) error {
 			return err
 		}
 	}
-	if err := writeFileAtomic(full, b); err != nil {
+	if err := memoryWriteFile(full, b); err != nil {
+		if _, statErr := os.Lstat(full); errors.Is(statErr, os.ErrNotExist) {
+			_ = os.Remove(filepath.Dir(full)) // only succeeds when empty, e.g. a new feature directory
+		}
 		return err
 	}
 	w[rel] = b
@@ -959,9 +965,8 @@ func memoryClean(dir string) error {
 			return fmt.Errorf("%w: an index flag hides changes to %s; clear it with git update-index --no-assume-unchanged --no-skip-worktree", ErrMemoryDirty, line[2:])
 		}
 	}
-	if _, err := git(dir, "update-index", "-q", "--really-refresh"); err != nil {
-		return fmt.Errorf("memory status: %w", err)
-	}
+	// Refreshing the index exits nonzero when a tracked file changed; status reports that below.
+	_, _ = git(dir, "update-index", "-q", "--really-refresh")
 	out, err := git(dir, "status", "--porcelain", "--untracked-files=all")
 	if err != nil {
 		return fmt.Errorf("memory status: %w", err)

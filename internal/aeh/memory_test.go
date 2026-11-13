@@ -538,3 +538,43 @@ func TestMemoryCommitIdentityIsPinned(t *testing.T) {
 		t.Fatalf("identity %q", got)
 	}
 }
+
+// A failure on the first write (a full disk, say) must not leave an empty feature directory.
+func TestFailedFirstWriteLeavesNoDirectory(t *testing.T) {
+	r := newMemoryProject(t)
+	dir := memDir(t, r)
+	memoryWriteFile = func(p string, b []byte) error {
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			return err
+		}
+		return errors.New("disk full")
+	}
+	t.Cleanup(func() { memoryWriteFile = writeFileAtomic })
+	if _, err := CreateSpec(r, "checkout", "Checkout", []string{"src/checkout/**"}); err == nil {
+		t.Fatal("expected the write to fail")
+	}
+	memoryWriteFile = writeFileAtomic
+	if _, err := os.Stat(filepath.Join(dir, "wiki", "features", "checkout")); !os.IsNotExist(err) {
+		t.Fatalf("feature directory left behind: %v", err)
+	}
+	if _, err := LoadMemory(r); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTrackedEditIsDirty(t *testing.T) {
+	r := newMemoryProject(t)
+	dir := memDir(t, r)
+	write(t, dir, "wiki/log.md", "edited\n")
+	if err := memoryClean(dir); !errors.Is(err, ErrMemoryDirty) {
+		t.Fatalf("expected ErrMemoryDirty, got %v", err)
+	}
+}
+
+func TestSemverRejectsSigns(t *testing.T) {
+	for _, v := range []string{"1.+2.3", "-1.2.3", "1.2.+3", "1.2.3 "} {
+		if _, err := parseSemver(v); err == nil {
+			t.Errorf("%q accepted", v)
+		}
+	}
+}
