@@ -44,7 +44,13 @@ var (
 var memoryNow = time.Now
 
 // memoryGitIdentity signs memory commits. They never leave the machine.
-var memoryGitIdentity = []string{"-c", "user.name=aeh", "-c", "user.email=aeh@localhost", "-c", "commit.gpgsign=false"}
+// author.* and committer.* override user.*, so all of them are pinned.
+var memoryGitIdentity = []string{
+	"-c", "user.name=aeh", "-c", "user.email=aeh@localhost",
+	"-c", "author.name=aeh", "-c", "author.email=aeh@localhost",
+	"-c", "committer.name=aeh", "-c", "committer.email=aeh@localhost",
+	"-c", "commit.gpgsign=false",
+}
 
 // Spec is one feature's document. Paths name the code the feature owns.
 type Spec struct {
@@ -849,12 +855,29 @@ func commitMemory(dir string, files []string, subject string, trailers ...string
 	if _, err := git(dir, append([]string{"add", "--"}, files...)...); err != nil {
 		return fmt.Errorf("memory commit: %w", err)
 	}
+	// With paths, commit records only those paths: anything else staged in the shared
+	// index (for example by the owner) stays staged and out of this commit.
 	args := append(append([]string{}, memoryGitIdentity...), "commit", "-q", "--no-verify", "-m", subject)
 	if len(trailers) > 0 {
 		args = append(args, "-m", strings.Join(trailers, "\n"))
 	}
+	args = append(append(args, "--"), files...)
 	if _, err := git(dir, args...); err != nil {
 		return fmt.Errorf("memory commit: %w", err)
+	}
+	if files[0] == "." {
+		return nil
+	}
+	changed, err := git(dir, "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "HEAD")
+	if err != nil {
+		return fmt.Errorf("memory commit: %w", err)
+	}
+	got := strings.Split(changed, "\n")
+	sort.Strings(got)
+	want := append([]string{}, files...)
+	sort.Strings(want)
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		return fmt.Errorf("memory commit: HEAD changed %v, expected exactly %v; check the memory repository", got, want)
 	}
 	return nil
 }
@@ -862,11 +885,41 @@ func commitMemory(dir string, files []string, subject string, trailers ...string
 // memoryWrites remembers what this command wrote, so a rollback touches only its own work.
 type memoryWrites map[string][]byte
 
+// write replaces a file only while it still matches HEAD (memory was clean when the command
+// started), so an edit saved in the meantime is never overwritten.
 func (w memoryWrites) write(dir, rel string, b []byte) error {
-	if err := writeFileAtomic(filepath.Join(dir, filepath.FromSlash(rel)), b); err != nil {
+	full := filepath.Join(dir, filepath.FromSlash(rel))
+	if _, mine := w[rel]; !mine {
+		if err := unchangedSinceHead(dir, rel); err != nil {
+			return err
+		}
+	}
+	if err := writeFileAtomic(full, b); err != nil {
 		return err
 	}
 	w[rel] = b
+	return nil
+}
+
+func unchangedSinceHead(dir, rel string) error {
+	full := filepath.Join(dir, filepath.FromSlash(rel))
+	headBlob, inHead := git(dir, "rev-parse", "--verify", "--quiet", "HEAD:"+rel)
+	_, statErr := os.Lstat(full)
+	switch {
+	case inHead != nil && errors.Is(statErr, os.ErrNotExist):
+		return nil
+	case inHead != nil:
+		return fmt.Errorf("memory write: %s appeared while aeh was writing; nothing was overwritten", rel)
+	case statErr != nil:
+		return fmt.Errorf("memory write: %s: %w", rel, statErr)
+	}
+	disk, err := git(dir, "hash-object", "--", rel)
+	if err != nil {
+		return fmt.Errorf("memory write: %w", err)
+	}
+	if disk != headBlob {
+		return fmt.Errorf("memory write: %s changed while aeh was writing; nothing was overwritten", rel)
+	}
 	return nil
 }
 
@@ -885,6 +938,7 @@ func (w memoryWrites) restore(dir string, cause error) error {
 			_, _ = git(dir, "checkout", "-q", "HEAD", "--", rel)
 		} else {
 			_ = os.Remove(full)
+			_ = os.Remove(filepath.Dir(full)) // only succeeds when empty, e.g. a new feature directory
 		}
 	}
 	if len(kept) > 0 {
@@ -920,6 +974,21 @@ func memoryClean(dir string) error {
 
 // verifyMemoryRepo checks that dir is its own repository and has no remote.
 func verifyMemoryRepo(dir string) error {
+	// Checked before Git runs: a .git file or .git/commondir would point Git at another repository.
+	gitPath := filepath.Join(dir, ".git")
+	if fi, err := os.Lstat(gitPath); err != nil || !fi.IsDir() {
+		return fmt.Errorf("memory: %s must be a plain .git directory", gitPath)
+	}
+	if _, err := os.Lstat(filepath.Join(gitPath, "commondir")); !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("memory: %s has a commondir file; memory must not share another repository's Git data", gitPath)
+	}
+	common, err := git(dir, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return fmt.Errorf("memory: %w", err)
+	}
+	if !samePath(common, gitPath) {
+		return fmt.Errorf("memory: Git data resolves to %s, not %s", common, gitPath)
+	}
 	top, err := git(dir, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return fmt.Errorf("memory: %w", err)
@@ -947,7 +1016,8 @@ func verifyMemoryRepo(dir string) error {
 
 // checkProjectPrivacy requires .aeh/ to be ignored and untracked in the project.
 func checkProjectPrivacy(main string) error {
-	tracked, err := git(main, "ls-files", "--", ".aeh")
+	// icase: on Windows and macOS, .AEH/ names the same files as .aeh/.
+	tracked, err := git(main, "ls-files", "--", ":(icase).aeh")
 	if err != nil {
 		return fmt.Errorf("memory privacy: %w", err)
 	}

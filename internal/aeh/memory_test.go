@@ -448,3 +448,93 @@ func TestRecordAfterCRLFEdit(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A .git/commondir file would send memory commits to another repository.
+func TestMemoryRejectsCommonDirRedirect(t *testing.T) {
+	r := newMemoryProject(t)
+	other, _ := newRepo(t)
+	write(t, memDir(t, r), ".git/commondir", filepath.ToSlash(filepath.Join(other, ".git"))+"\n")
+	if _, err := LoadMemory(r); err == nil || !strings.Contains(err.Error(), "commondir") {
+		t.Fatalf("expected a commondir error, got %v", err)
+	}
+}
+
+func TestPrivacyCatchesTrackedCaseAlias(t *testing.T) {
+	dir, _ := newRepo(t)
+	write(t, dir, ".gitignore", ".aeh/\n")
+	write(t, dir, ".AEH/memory/leak.md", "secret\n")
+	mustGit(t, dir, "add", "-f", ".gitignore", ".AEH/memory/leak.md")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "alias")
+	r, _ := OpenRepo(dir)
+	if err := checkProjectPrivacy(r.Root); err == nil || !strings.Contains(err.Error(), "tracks") {
+		t.Fatalf("expected a tracked-files error, got %v", err)
+	}
+}
+
+// Something the owner staged meanwhile must not ride along in aeh's commit.
+func TestRecordCommitsOnlyItsOwnFiles(t *testing.T) {
+	r := newMemoryProject(t)
+	dir := memDir(t, r)
+	w := memoryWrites{}
+	if err := w.write(dir, "wiki/index.md", []byte("aeh index\n")); err != nil {
+		t.Fatal(err)
+	}
+	write(t, dir, "wiki/notes.md", "owner draft\n")
+	mustGit(t, dir, "add", "wiki/notes.md")
+	if err := w.commit(dir, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustGit(t, dir, "show", "--name-only", "--format=", "HEAD"); got != "wiki/index.md" {
+		t.Fatalf("commit contained %q", got)
+	}
+	if got := mustGit(t, dir, "diff", "--cached", "--name-only"); got != "wiki/notes.md" {
+		t.Fatalf("owner's staged file was consumed: %q", got)
+	}
+}
+
+// An edit saved between aeh reading a file and writing it is never overwritten.
+func TestWriteRefusesChangedFile(t *testing.T) {
+	r := newMemoryProject(t)
+	dir := memDir(t, r)
+	write(t, dir, "wiki/log.md", "owner edit\n")
+	w := memoryWrites{}
+	if err := w.write(dir, "wiki/log.md", []byte("aeh log\n")); err == nil {
+		t.Fatal("aeh overwrote an edited file")
+	}
+	if got := readFile(t, filepath.Join(dir, "wiki", "log.md")); got != "owner edit\n" {
+		t.Fatalf("owner edit lost: %q", got)
+	}
+}
+
+func TestFailedCreateLeavesMemoryUsable(t *testing.T) {
+	r := newMemoryProject(t)
+	dir := memDir(t, r)
+	mustGit(t, dir, "config", "commit.cleanup", "invalid-mode")
+	if _, err := CreateSpec(r, "checkout", "Checkout", []string{"src/checkout/**"}); err == nil {
+		t.Fatal("expected the commit to fail")
+	}
+	mustGit(t, dir, "config", "--unset", "commit.cleanup")
+	if _, err := os.Stat(filepath.Join(dir, "wiki", "features", "checkout")); !os.IsNotExist(err) {
+		t.Fatalf("feature directory left behind: %v", err)
+	}
+	if _, err := LoadMemory(r); err != nil {
+		t.Fatal(err)
+	}
+	if err := memoryClean(dir); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMemoryCommitIdentityIsPinned(t *testing.T) {
+	r := newMemoryProject(t)
+	dir := memDir(t, r)
+	for _, kv := range [][2]string{{"author.name", "Owner"}, {"author.email", "owner@example.com"}, {"committer.name", "Owner"}, {"committer.email", "owner@example.com"}} {
+		mustGit(t, dir, "config", kv[0], kv[1])
+	}
+	if _, err := CreateSpec(r, "checkout", "Checkout", []string{"src/checkout/**"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustGit(t, dir, "log", "-1", "--format=%an <%ae> / %cn <%ce>"); got != "aeh <aeh@localhost> / aeh <aeh@localhost>" {
+		t.Fatalf("identity %q", got)
+	}
+}
