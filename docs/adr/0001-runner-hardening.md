@@ -16,13 +16,13 @@ A QA and security review of the MVP-1 runner found that the verified candidate c
 6. **Environment.** Agents, gate commands and the harness's own git calls inherit only OS and tool-discovery variables plus the names listed in `pass_env`. Credentials reach an agent only through `pass_env` or the profile's `env`. Harness git calls run with `--no-replace-objects`, `core.fsmonitor=false` and hooks disabled, because replace refs could swap the object behind a verified SHA and hooks or fsmonitor would run agent-written programs. Clean and smudge filters defined in Git config still run, but only as selected by the base's attributes (see 9); an agent that can edit that config already runs with the user's permissions. This reduces accidental exposure; it is not isolation, since processes still run with the user's permissions.
 7. **Diff limit.** Changes Git cannot count in lines (binaries) fail the scope gate.
 8. **Agent instruction files.** `AGENTS.md`, `CLAUDE.md`, `CLAUDE.local.md`, `.claude/` and `.codex/` fail the scope gate in any directory, so a candidate cannot plant instructions that steer the reviewer. Path matching is case-insensitive on Windows and macOS.
-9. **Git control files.** `.gitattributes`, `.gitmodules` and `.lfsconfig` fail the scope gate in any directory. A candidate therefore cannot select clean or smudge filters, so the verification checkout applies only the base's attributes, which the owner already trusts. Filter programs themselves come from Git config, which an agent can only change with the user's permissions (no process sandbox yet).
+9. **Git control files.** `.gitattributes`, `.gitmodules` and `.lfsconfig` fail the scope gate in any directory, and so does any change to a submodule pointer (gitlink), because the gates cannot see the submodule's content and a submodule commit could bring its own attributes. A candidate therefore cannot select clean or smudge filters, so the verification checkout applies only the base's attributes, which the owner already trusts. Filter programs themselves come from Git config, which an agent can only change with the user's permissions (no process sandbox yet).
 
 ## Consequences
 
 - Accepted work is exactly the commit that passed the gates.
 - Recovery after a crash is manual: remove the outcome lock and any retained worktrees and attempt branches.
-- Outcomes cannot change `.gitattributes`, `.gitmodules` or `.lfsconfig`; the owner changes them by hand.
+- Outcomes cannot change `.gitattributes`, `.gitmodules`, `.lfsconfig` or submodule pointers; the owner changes them by hand.
 - Outcomes cannot change binary files until a measurable limit for them is defined.
 - A build or test command that leaves a background process holding its output (for example a Gradle or MSBuild daemon) ends with `exec.ErrWaitDelay`, so the gate counts as interrupted and the outcome blocks. Disable such daemons in `commands` until AEH handles it.
 - Process isolation remains pending (sandbox without network, only the worktree mounted).

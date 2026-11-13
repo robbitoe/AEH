@@ -89,3 +89,20 @@ func TestSealedTreeComparesObjects(t *testing.T) {
 		t.Fatal("changed acceptance path passed")
 	}
 }
+
+func TestScopeRejectsSubmodulePointer(t *testing.T) {
+	dir, base := newRepo(t)
+	mustGit(t, dir, "update-index", "--add", "--cacheinfo", "160000,"+base+",src/mod")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "add gitlink")
+	commit, _ := headCommit(dir)
+	changes, err := candidateChanges(dir, base, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 1 || !changes[0].Gitlink || changes[0].Path != "src/mod" {
+		t.Fatalf("gitlink not detected: %+v", changes)
+	}
+	if g := gateScope(changes, nil, []string{"src/"}, 100); g.Passed || !strings.Contains(g.Output, "submodule") {
+		t.Fatalf("scope accepted a submodule pointer: %s", g.Output)
+	}
+}

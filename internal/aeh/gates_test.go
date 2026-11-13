@@ -31,24 +31,24 @@ func TestMatchAny(t *testing.T) {
 
 func TestGateScope(t *testing.T) {
 	protected := []string{"aeh/", "tests/acceptance/"}
-	ok := gateScope([]fileChange{{"src/a.go", 10}}, protected, []string{"src/"}, 100)
+	ok := gateScope([]fileChange{{Path: "src/a.go", Lines: 10}}, protected, []string{"src/"}, 100)
 	if !ok.Passed {
 		t.Fatalf("expected pass, got %s", ok.Output)
 	}
 	for name, changes := range map[string][]fileChange{
 		"empty":     nil,
-		"protected": {{"tests/acceptance/check.sh", 1}},
-		"outside":   {{"lib/b.go", 1}},
-		"too large": {{"src/a.go", 101}},
-		"binary":    {{"src/data.bin", -1}},
-		"agents.md": {{"src/AGENTS.md", 1}},
-		"claude.md": {{"src/sub/Claude.md", 1}},
-		"settings":  {{"src/.claude/settings.json", 1}},
-		"codex":     {{"src/.codex/config.toml", 1}},
-		"attrs":     {{"src/.gitattributes", 1}},
-		"root attr": {{".GitAttributes", 1}},
-		"modules":   {{".gitmodules", 1}},
-		"lfs":       {{"src/.lfsconfig", 1}},
+		"protected": {{Path: "tests/acceptance/check.sh", Lines: 1}},
+		"outside":   {{Path: "lib/b.go", Lines: 1}},
+		"too large": {{Path: "src/a.go", Lines: 101}},
+		"binary":    {{Path: "src/data.bin", Lines: -1}},
+		"agents.md": {{Path: "src/AGENTS.md", Lines: 1}},
+		"claude.md": {{Path: "src/sub/Claude.md", Lines: 1}},
+		"settings":  {{Path: "src/.claude/settings.json", Lines: 1}},
+		"codex":     {{Path: "src/.codex/config.toml", Lines: 1}},
+		"attrs":     {{Path: "src/.gitattributes", Lines: 1}},
+		"root attr": {{Path: ".GitAttributes", Lines: 1}},
+		"modules":   {{Path: ".gitmodules", Lines: 1}},
+		"lfs":       {{Path: "src/.lfsconfig", Lines: 1}},
 	} {
 		if g := gateScope(changes, protected, []string{"src/"}, 100); g.Passed {
 			t.Errorf("%s: expected failure", name)

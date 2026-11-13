@@ -76,6 +76,8 @@ func gateScope(changes []fileChange, protected, allowed []string, maxLines int) 
 			problems = append(problems, "agent instruction file modified: "+c.Path)
 		} else if gitControlFile(c.Path) {
 			problems = append(problems, "git control file modified: "+c.Path)
+		} else if c.Gitlink {
+			problems = append(problems, "submodule pointer changed (its content cannot be checked): "+c.Path)
 		} else if matchAny(c.Path, protected) {
 			problems = append(problems, "protected path modified: "+c.Path)
 		} else if len(allowed) > 0 && !matchAny(c.Path, allowed) {

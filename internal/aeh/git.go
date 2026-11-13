@@ -68,8 +68,9 @@ func dirtyPaths(root string, paths []string) (string, error) {
 
 // fileChange is one entry of `git diff --cached --numstat`.
 type fileChange struct {
-	Path  string
-	Lines int // -1 means Git could not measure the change in lines.
+	Path    string
+	Lines   int  // -1 means Git could not measure the change in lines.
+	Gitlink bool // a submodule pointer: its content is not visible to the gates
 }
 
 // candidateCommit freezes the proposed tree as a single commit on the pinned base.
@@ -112,6 +113,35 @@ func candidateChanges(wt, base, commit string) ([]fileChange, error) {
 			lines = -1
 		}
 		changes = append(changes, fileChange{Path: parts[2], Lines: lines})
+	}
+	return markGitlinks(wt, base, commit, changes)
+}
+
+// markGitlinks flags submodule pointers (mode 160000) on either side of the change.
+func markGitlinks(wt, base, commit string, changes []fileChange) ([]fileChange, error) {
+	out, err := git(wt, "diff", "--raw", "-z", "--no-renames", "--no-abbrev", base, commit)
+	if err != nil {
+		return nil, err
+	}
+	fields := strings.Split(strings.TrimSuffix(out, "\x00"), "\x00")
+	for i := 0; i+1 < len(fields); i += 2 {
+		meta, path := fields[i], fields[i+1]
+		modes := strings.Fields(strings.TrimPrefix(meta, ":"))
+		if !strings.HasPrefix(meta, ":") || len(modes) < 2 {
+			return nil, fmt.Errorf("invalid Git raw diff record %q", meta)
+		}
+		if modes[0] != "160000" && modes[1] != "160000" {
+			continue
+		}
+		found := false
+		for j := range changes {
+			if changes[j].Path == path {
+				changes[j].Gitlink, found = true, true
+			}
+		}
+		if !found {
+			changes = append(changes, fileChange{Path: path, Gitlink: true})
+		}
 	}
 	return changes, nil
 }
