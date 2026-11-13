@@ -204,7 +204,7 @@
 
   <rect x="840" y="700" width="320" height="120" rx="10" class="box"/>
   <text x="856" y="728" class="t ink">Drift gate</text>
-  <text x="856" y="752" class="s mut">code that changes behavior must</text>
-  <text x="856" y="770" class="s mut">bump its feature spec version</text>
+  <text x="856" y="752" class="s mut">a change to a feature's code must</text>
+  <text x="856" y="770" class="s mut">declare it; then its spec version bumps</text>
   <text x="856" y="800" class="l hM">checked without a model</text>
 </svg>

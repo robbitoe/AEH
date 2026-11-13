@@ -51,7 +51,7 @@ Every request is classified before any work starts.
 | --- | --- | --- |
 | **Trivial** | A label, a color, a config value | Straight to a task, then build and test, then a patch note in the spec |
 | **Change** | Adjust how an existing feature behaves | Spec delta. You are asked only if the acceptance criteria change |
-| **New** | A new feature, a schema change, auth or payments | Full cycle: spec, mockup, approval, QA + Security + DBA |
+| **New** | A new feature, a schema change, auth or payments | Full cycle: spec, mockup, approval, QA + Security, plus a DBA when data changes |
 
 A model proposes the route. Deterministic rules can raise it but never lower it: touching migrations requires the DBA reviewer, touching auth requires the Security reviewer.
 
@@ -97,11 +97,11 @@ The memory follows the [LLM Wiki](https://gist.github.com/karpathy/442a6bf555914
   schema.md         conventions the engine follows when it writes the wiki
 ```
 
-The memory is private. It lives in `.aeh/memory/` in the project's main checkout, which `aeh init` adds to `.gitignore`, so it never reaches a public repository. It is its own local Git repository: every spec version is a commit there that records the code commit that implemented it. Branches and worktrees are cleaned up after a merge; the memory is never touched by cleanup. Agents read it; only the runner writes it, after a change passes the gates. Backing it up to a private remote is the owner's choice, not a default.
+The memory is private. It lives in `.aeh/memory/` in the project's main checkout, which `aeh init` adds to `.gitignore` and the scope gate will protect, so the memory directory never enters a commit. It is its own local Git repository: every spec version is a commit there that records the code commit that implemented it. Branches and worktrees are cleaned up after a merge; the memory is never touched by cleanup. Agents propose updates; only the runner writes the memory. Discovery and approval record drafts and approved specs before any code exists; an implementation is recorded after its gates and reviews pass. That does not stop private text from being copied into tracked files. Agents receive only the spec of the feature they work on, inside their prompt, and that text goes to the configured agent provider. Until the process sandbox exists, agents run with the user's permissions and could copy memory content into an allowed file, so review covers that risk. Backing it up to a private remote is the owner's choice, not a default.
 
 - **Ingest:** new input in `raw/` updates the pages it touches.
 - **Read:** every stage starts by reading `index.md` and the relevant pages, so agents work with the real context.
-- **Drift gate:** if a task changes the behavior of a feature, its spec must bump its version and add a changelog line. The check is deterministic.
+- **Drift gate:** When a task changes code that belongs to a feature (by the paths its spec declares), the task must declare that feature. The check is deterministic and runs with the other gates; once the change is accepted, the runner bumps that feature's spec version and adds a changelog line. It checks ownership by paths, not whether the spec text matches the behavior.
 - **Lint:** a periodic pass looks for contradictions, stale pages and orphans.
 
 Example: changing the "Pay" button to "Confirm payment" moves `checkout` from v1.3 to v1.3.1, with one changelog line and one log entry. No spec cycle, no approval.

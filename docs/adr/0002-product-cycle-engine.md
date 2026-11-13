@@ -14,11 +14,11 @@ MVP-1 built only the verification loop: an approved outcome with hand-written ac
 4. **Triage.** Every request is classified as trivial, change or new. A model proposes the route; deterministic rules can raise it but never lower it. Touching migrations requires a DBA reviewer; touching auth requires a Security reviewer.
 5. **Reviewers.** QA and Security review every code change, and a DBA reviews data model changes. Each reviewer is a different agent from the author.
 6. **Private memory.** The product memory follows the LLM Wiki pattern (raw sources, a maintained wiki, a schema, `index.md` and `log.md`) and lives in `.aeh/memory/` in the project's main checkout.
-   - `.aeh/` is git-ignored, so the memory is never published.
+   - `.aeh/` is git-ignored, and stage 1 adds it to the scope gate's protected paths, so the memory directory never enters a commit. That does not stop private text from being copied into tracked files. Agents receive only the spec of the feature they work on, inside their prompt, and that text goes to the configured agent provider. Until the process sandbox exists, agents run with the user's permissions and could copy memory content into an allowed file, so review covers that risk.
    - It is its own local Git repository with no remote. Each spec version is a commit that records the code commit that implemented it.
-   - Agents read it. Only the runner writes it, after a change passes the gates.
+   - Agents propose updates; only the runner (the `aeh` commands) writes the memory. Discovery and approval record drafts and approved specs through their own checks, before any code exists. An implementation is recorded after its gates and reviews pass: the runner bumps the spec version, adds the changelog line with the verified commit, and commits the memory.
    - Cleanup after a merge removes branches and worktrees, never the memory.
-7. **Drift gate.** When a task changes the behavior of a feature, its spec must bump its version and add a changelog line. The check is deterministic.
+7. **Drift gate.** When a task changes code that belongs to a feature (by the paths its spec declares), the task must declare that feature. The check is deterministic and runs with the other gates; once the change is accepted, the runner bumps that feature's spec version and adds a changelog line. It checks ownership by paths, not whether the spec text matches the behavior.
 8. **Scope limits.** The fixed line limit and the rule that discovery and planning are optional are dropped. Each roadmap stage ships as pull requests that can be reviewed in one pass.
 
 ## Consequences
