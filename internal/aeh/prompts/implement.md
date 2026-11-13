@@ -21,6 +21,9 @@ Actor: {{.Outcome.Actor}}
 ## Your task: {{.Task.ID}}
 
 {{.Task.Goal}}
+{{if .MemorySpec}}
+{{.MemorySpec}}
+{{end}}
 
 ## Rules
 

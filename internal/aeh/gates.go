@@ -8,20 +8,79 @@ import (
 	"os/exec"
 	"path"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 )
 
 // GateResult is the outcome of one deterministic check. Gates never call a model.
 type GateResult struct {
-	Name      string  `json:"name"`
-	Passed    bool    `json:"passed"`
-	Output    string  `json:"output,omitempty"`
-	Seconds   float64 `json:"seconds"`
-	Uncertain bool    `json:"uncertain,omitempty"`
+	Name      string   `json:"name"`
+	Passed    bool     `json:"passed"`
+	Output    string   `json:"output,omitempty"`
+	Seconds   float64  `json:"seconds"`
+	Uncertain bool     `json:"uncertain,omitempty"`
+	Skipped   bool     `json:"skipped,omitempty"`
+	Warnings  []string `json:"warnings,omitempty"`
 }
 
 const maxGateOutput = 6000
+
+// gateDrift checks path ownership against the run's memory snapshot, without I/O.
+// Renames must supply both paths; deletions supply the deleted path.
+func gateDrift(paths []string, memory MemorySnapshot, declared string) GateResult {
+	g := GateResult{Name: "drift", Passed: true}
+	if !memory.Present && declared == "" {
+		g.Skipped = true
+		g.Output = "skipped: no product memory and no declared feature"
+		return g
+	}
+	files := append([]string(nil), paths...)
+	sort.Strings(files)
+	touched := map[string][]string{}
+	var unowned []string
+	for i, file := range files {
+		if i > 0 && file == files[i-1] {
+			continue
+		}
+		owned := false
+		for _, spec := range memory.Specs {
+			if matchAny(file, spec.Paths) {
+				touched[spec.Feature] = append(touched[spec.Feature], file)
+				owned = true
+			}
+		}
+		if !owned {
+			unowned = append(unowned, file)
+		}
+	}
+	features := make([]string, 0, len(touched))
+	for feature := range touched {
+		features = append(features, feature)
+	}
+	sort.Strings(features)
+	if len(unowned) > 0 {
+		g.Warnings = append(g.Warnings, "files belong to no feature: "+strings.Join(unowned, ", "))
+	}
+	if declared != "" && len(touched[declared]) == 0 {
+		g.Warnings = append(g.Warnings, fmt.Sprintf("declared feature %q is not touched", declared))
+	}
+	var details []string
+	for _, feature := range features {
+		details = append(details, fmt.Sprintf("%s: %s", feature, strings.Join(touched[feature], ", ")))
+	}
+	switch {
+	case len(features) > 1:
+		g.Passed = false
+		g.Output = "multiple features touched; split into separate outcomes:\n" + strings.Join(details, "\n")
+	case len(features) == 1 && features[0] != declared:
+		g.Passed = false
+		g.Output = fmt.Sprintf("touched feature %q must be declared by this outcome (declared: %q):\n%s", features[0], declared, details[0])
+	default:
+		g.Output = "feature path ownership checked"
+	}
+	return g
+}
 
 // gateHash fails if the sealed acceptance tests differ inside the worktree.
 func gateHash(wt string, s Seal, paths []string) GateResult {

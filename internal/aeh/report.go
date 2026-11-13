@@ -16,6 +16,12 @@ func (ru *runner) writeReport() string {
 	fmt.Fprintf(&b, "# %s: %s\n\n", o.ID, o.Title)
 	fmt.Fprintf(&b, "Status: **%s** · Branch: `%s` · Base: `%s`\n\n", st.Status, st.Branch, short(st.Base))
 	fmt.Fprintf(&b, "Recorded branch head: `%s` · Contract SHA-256: `%s`\n\n", st.Head, st.Contract)
+	if o.Feature != "" {
+		fmt.Fprintf(&b, "Declared feature: `%s` · Change: `%s`\n\n", o.Feature, o.Change)
+		if result := ru.memoryRecordSummary(); result != "" {
+			fmt.Fprintf(&b, "%s\n\n", result)
+		}
+	}
 	if st.Question != "" {
 		fmt.Fprintf(&b, "## Open question\n\n%s\n\n", st.Question)
 	}
@@ -43,8 +49,14 @@ func (ru *runner) writeReport() string {
 			fmt.Fprintf(&b, "| %s | %d | %s | %s | %s | %.0f |\n", t.ID, a.N, a.Profile, result, gateSummary(r.Root, a.RunDir), a.Seconds)
 		}
 	}
+	for _, task := range st.Tasks {
+		for _, attempt := range task.Attempts {
+			writeDriftEvidence(&b, r.Root, attempt.RunDir, fmt.Sprintf("%s attempt %d", task.ID, attempt.N))
+		}
+	}
 	if st.FinalRun != "" {
 		fmt.Fprintf(&b, "\n## Final check on the integrated branch\n\n%s · `%s`\n", gateSummary(r.Root, st.FinalRun), st.FinalRun)
+		writeDriftEvidence(&b, r.Root, st.FinalRun, "Final check")
 	}
 	for _, task := range st.Tasks {
 		for _, attempt := range task.Attempts {
@@ -73,23 +85,48 @@ func (ru *runner) writeReport() string {
 
 // gateSummary renders "hash ok, scope ok, build FAIL" from a run directory's gates.json.
 func gateSummary(root, runDir string) string {
-	data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(runDir), "gates.json"))
-	if err != nil {
-		return ""
-	}
-	var gates []GateResult
-	if json.Unmarshal(data, &gates) != nil {
-		return ""
-	}
+	gates := readGateResults(root, runDir)
 	parts := make([]string, len(gates))
 	for i, g := range gates {
 		status := "ok"
-		if !g.Passed {
+		if g.Skipped {
+			status = "skipped"
+		} else if !g.Passed {
 			status = "FAIL"
 		}
 		parts[i] = g.Name + " " + status
 	}
 	return strings.Join(parts, ", ")
+}
+
+func readGateResults(root, runDir string) []GateResult {
+	data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(runDir), "gates.json"))
+	if err != nil {
+		return nil
+	}
+	var gates []GateResult
+	if json.Unmarshal(data, &gates) != nil {
+		return nil
+	}
+	return gates
+}
+
+func writeDriftEvidence(b *strings.Builder, root, runDir, label string) {
+	for _, g := range readGateResults(root, runDir) {
+		if g.Name != "drift" {
+			continue
+		}
+		status := "ok"
+		if g.Skipped {
+			status = "skipped"
+		} else if !g.Passed {
+			status = "FAIL"
+		}
+		fmt.Fprintf(b, "\n### %s: drift %s\n\n%s\n", label, status, g.Output)
+		for _, warning := range g.Warnings {
+			fmt.Fprintf(b, "\nWarning: %s\n", warning)
+		}
+	}
 }
 
 func short(s string) string {

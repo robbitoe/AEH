@@ -28,6 +28,7 @@ type runner struct {
 	log             io.Writer
 	implementPrompt string
 	reviewPrompt    string
+	memory          MemorySnapshot
 }
 
 // RunOutcome executes an outcome from aeh/outcomes/<id>.yaml until it is accepted or blocked.
@@ -44,13 +45,10 @@ func RunOutcome(ctx context.Context, r Repo, id string, log io.Writer) (State, e
 }
 
 // Do runs a level-1 change described in one sentence: one task, no sealed tests, no review.
-// link declares the feature the change modifies; it is enforced once the drift gate exists.
+// link declares the feature the change modifies, enforced by the drift gate.
 func Do(ctx context.Context, r Repo, text string, paths []string, profile string, link MemoryLink, log io.Writer) (State, error) {
 	if err := link.Validate(); err != nil {
 		return State{}, err
-	}
-	if link.Feature != "" {
-		return State{}, errors.New("--feature is not enforced yet: it arrives with the drift gate")
 	}
 	cfg, err := r.LoadConfig()
 	if err != nil {
@@ -66,9 +64,10 @@ func Do(ctx context.Context, r Repo, text string, paths []string, profile string
 		return State{}, errors.New("describe the change: aeh do \"...\"")
 	}
 	o := Outcome{
-		ID:    fmt.Sprintf("DO-%d", time.Now().UnixNano()),
-		Title: firstLine(text),
-		Level: 1,
+		ID:      fmt.Sprintf("DO-%d", time.Now().UnixNano()),
+		Title:   firstLine(text),
+		Level:   1,
+		Feature: link.Feature, Change: link.Change, Changelog: link.Note,
 		Tasks: []Task{{ID: "T1", Goal: text, Paths: paths, Start: profile}},
 	}
 	return run(ctx, r, cfg, o, log)
@@ -86,6 +85,10 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer) (Sta
 		return State{}, err
 	}
 	defer unlock()
+	memory, err := LoadMemory(r)
+	if err != nil {
+		return State{}, fmt.Errorf("load run memory: %w", err)
+	}
 	st, err := loadState(r, o.ID)
 	if err != nil {
 		return st, err
@@ -99,7 +102,15 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer) (Sta
 	if err := preflight(cfg, o); err != nil {
 		return st, err
 	}
-	ru := &runner{repo: r, cfg: cfg, outcome: o, protected: protectedPaths(cfg, o), state: &st, log: log}
+	if o.Feature != "" {
+		if !memory.Present {
+			return st, errors.New("declared feature requires product memory; run: aeh memory init")
+		}
+		if _, ok := memory.Spec(o.Feature); !ok {
+			return st, fmt.Errorf("declared feature %q does not exist in product memory", o.Feature)
+		}
+	}
+	ru := &runner{repo: r, cfg: cfg, outcome: o, protected: protectedPaths(cfg, o), state: &st, log: log, memory: memory}
 	if attrs := attributesFileInRepo(r.Root); attrs != "" {
 		ru.protected = append(ru.protected, attrs)
 	}
@@ -167,9 +178,32 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer) (Sta
 		err := ru.block(question)
 		return st, err
 	}
+	var pending PendingRecord
+	var pendingErr error
+	if o.Feature != "" {
+		current, err := LoadMemory(r)
+		if err != nil || current.Fingerprint != memory.Fingerprint {
+			reason := ErrMemoryChanged.Error()
+			if err != nil {
+				reason = err.Error()
+			}
+			err := ru.block(fmt.Sprintf("Cannot accept: %s. Inspect product memory and use a new outcome ID if its contract changed. What should change before retrying?", reason))
+			return st, err
+		}
+		pending = PendingRecord{OutcomeID: o.ID, Feature: o.Feature, Change: o.Change, Note: o.Changelog, Commit: st.Head}
+		pendingErr = SavePending(r, pending)
+		// Persist a retry message with acceptance, even if the process stops before recording.
+		st.MemoryError = "memory record is pending"
+		if pendingErr != nil {
+			st.MemoryError = fmt.Sprintf("save pending record: %v", pendingErr)
+		}
+	}
 	st.Status = StatusAccepted
 	if err := saveState(r, &st); err != nil {
 		return st, err
+	}
+	if o.Feature != "" {
+		ru.recordMemory(pending, pendingErr)
 	}
 	report := ru.writeReport()
 	ru.logf("%s accepted. Branch %s is ready to review and merge. Report: %s", o.ID, branch, report)
@@ -191,6 +225,13 @@ func (ru *runner) contractHash() (string, error) {
 	for i := range outcome.Tasks {
 		outcome.Tasks[i].Start = ""
 	}
+	var bodyHash string
+	if spec, ok := ru.memory.Spec(outcome.Feature); outcome.Feature != "" && ok {
+		bodyHash = fmt.Sprintf("%x", sha256.Sum256([]byte(spec.Body)))
+	}
+	type memoryContract struct {
+		Fingerprint, Feature, Change, Changelog, SpecBodySHA256 string
+	}
 	data, err := json.Marshal(struct {
 		Commands        any
 		PassEnv         []string
@@ -200,7 +241,9 @@ func (ru *runner) contractHash() (string, error) {
 		Seal            string
 		ImplementPrompt string
 		ReviewPrompt    string
-	}{commands, ru.cfg.PassEnv, ru.cfg.Protected, ru.cfg.Limits, outcome, seal, ru.implementPrompt, ru.reviewPrompt})
+		Memory          memoryContract
+	}{commands, ru.cfg.PassEnv, ru.cfg.Protected, ru.cfg.Limits, outcome, seal, ru.implementPrompt, ru.reviewPrompt,
+		memoryContract{ru.memory.Fingerprint, outcome.Feature, outcome.Change, outcome.Changelog, bodyHash}})
 	if err != nil {
 		return "", fmt.Errorf("encode execution contract: %w", err)
 	}
@@ -289,6 +332,7 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 		Outcome: o, Task: t, Protected: ru.protected, MaxLines: maxLines,
 		Build: ru.cfg.Commands.Build, Test: ru.cfg.Commands.Test, Answers: ru.state.Answers,
 		Attempt: n, FailedGate: prev.FailedGate, Feedback: prev.Feedback,
+		MemorySpec: memorySpecBlock(ru.memory, o.Feature),
 	})
 	if err != nil {
 		return res, fmt.Errorf("render prompt: %w", err)
@@ -302,6 +346,9 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 			status = "FAIL: " + firstLine(g.Output)
 		}
 		ru.logf("    %-6s %s", g.Name, status)
+		for _, warning := range g.Warnings {
+			ru.logf("    %s warning: %s", g.Name, warning)
+		}
 		return g.Passed
 	}
 	record := func() error {
@@ -346,6 +393,9 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 			return res, err
 		}
 		passed = check(gateScope(changes, ru.protected, t.Paths, maxLines))
+		if passed {
+			passed = check(gateDrift(changedPaths(changes), ru.memory, o.Feature))
+		}
 	}
 	verified := wt + "-verify"
 	if passed {
@@ -495,6 +545,13 @@ func (ru *runner) finalCheck(ctx context.Context) (bool, string, error) {
 		gates = append(gates, gateHash(wt, *ru.seal, o.Acceptance))
 	}
 	if len(gates) == 0 || gates[len(gates)-1].Passed {
+		changes, err := candidateChanges(r.Root, ru.state.Base, ru.state.Head)
+		if err != nil {
+			return false, "", fmt.Errorf("list final changes: %w", err)
+		}
+		gates = append(gates, gateDrift(changedPaths(changes), ru.memory, o.Feature))
+	}
+	if gates[len(gates)-1].Passed {
 		gates = append(gates, checkoutGate(gateCommand(ctx, "build", wt, ru.cfg.Commands.Build, timeout, ru.cfg.PassEnv), wt, head))
 	}
 	if gates[len(gates)-1].Passed {
@@ -513,6 +570,9 @@ func (ru *runner) finalCheck(ctx context.Context) (bool, string, error) {
 	}
 	ru.state.FinalRun = rel(r.Root, runDir)
 	for _, g := range gates {
+		for _, warning := range g.Warnings {
+			ru.logf("    %s warning: %s", g.Name, warning)
+		}
 		if !g.Passed {
 			ru.logf("    %-6s FAIL: %s", g.Name, firstLine(g.Output))
 			if g.Uncertain {
@@ -620,9 +680,53 @@ func verifySeal(r Repo, o Outcome) (*Seal, error) {
 
 // protectedPaths are the config's protected paths plus the harness files and the sealed tests.
 func protectedPaths(cfg Config, o Outcome) []string {
-	out := []string{"aeh/"}
+	out := []string{"aeh/", ".aeh/"}
 	out = append(out, cfg.Protected...)
 	return append(out, o.Acceptance...)
+}
+
+func changedPaths(changes []fileChange) []string {
+	paths := make([]string, len(changes))
+	for i, change := range changes {
+		paths[i] = change.Path
+	}
+	return paths
+}
+
+// recordMemory runs only after acceptance has been saved. Recording errors never undo it.
+func (ru *runner) recordMemory(p PendingRecord, pendingErr error) {
+	err := pendingErr
+	if err != nil {
+		err = fmt.Errorf("save pending record: %w", err)
+	} else {
+		ru.state.MemoryVersion, ru.state.MemoryCommit, err = RecordChange(ru.repo, p, ru.memory.Fingerprint)
+		if err == nil {
+			if clearErr := ClearPending(ru.repo, p.OutcomeID); clearErr != nil {
+				err = fmt.Errorf("clear pending record: %w", clearErr)
+			}
+		}
+	}
+	ru.state.MemoryError = ""
+	if err != nil {
+		ru.state.MemoryError = err.Error()
+	}
+	ru.logf("%s", ru.memoryRecordSummary())
+	if err := saveState(ru.repo, ru.state); err != nil {
+		ru.logf("warning: save memory record result: %v", err)
+	}
+}
+
+func (ru *runner) memoryRecordSummary() string {
+	if ru.outcome.Feature == "" {
+		return ""
+	}
+	if ru.state.MemoryError != "" {
+		return fmt.Sprintf("memory not recorded: %s; retry with: aeh memory record %s", ru.state.MemoryError, ru.outcome.ID)
+	}
+	if ru.state.MemoryVersion != "" {
+		return fmt.Sprintf("memory recorded: %s %s (memory commit %s)", ru.outcome.Feature, ru.state.MemoryVersion, short(ru.state.MemoryCommit))
+	}
+	return ""
 }
 
 func firstLine(s string) string {
