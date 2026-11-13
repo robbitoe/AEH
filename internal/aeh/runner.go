@@ -225,12 +225,9 @@ func (ru *runner) contractHash() (string, error) {
 	for i := range outcome.Tasks {
 		outcome.Tasks[i].Start = ""
 	}
-	var bodyHash string
-	if spec, ok := ru.memory.Spec(outcome.Feature); outcome.Feature != "" && ok {
-		bodyHash = fmt.Sprintf("%x", sha256.Sum256([]byte(spec.Body)))
-	}
+	// Ownership of every feature plus the declared spec; not the versions of other features.
 	type memoryContract struct {
-		Fingerprint, Feature, Change, Changelog, SpecBodySHA256 string
+		Fingerprint, Feature, Change, Changelog string
 	}
 	data, err := json.Marshal(struct {
 		Commands        any
@@ -243,7 +240,7 @@ func (ru *runner) contractHash() (string, error) {
 		ReviewPrompt    string
 		Memory          memoryContract
 	}{commands, ru.cfg.PassEnv, ru.cfg.Protected, ru.cfg.Limits, outcome, seal, ru.implementPrompt, ru.reviewPrompt,
-		memoryContract{ru.memory.Fingerprint, outcome.Feature, outcome.Change, outcome.Changelog, bodyHash}})
+		memoryContract{ru.memory.ContractFingerprint(outcome.Feature), outcome.Feature, outcome.Change, outcome.Changelog}})
 	if err != nil {
 		return "", fmt.Errorf("encode execution contract: %w", err)
 	}

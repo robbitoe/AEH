@@ -150,7 +150,14 @@ func InitMemory(r Repo) (bool, error) {
 		if err := rejectLinksInside(dir); err != nil {
 			return false, err
 		}
-		return false, verifyMemoryRepo(dir)
+		if err := verifyMemoryRepo(dir); err != nil {
+			return false, err
+		}
+		if _, err := git(dir, "rev-parse", "--verify", "--quiet", "HEAD"); err != nil {
+			// An earlier init stopped before its first commit: finish it.
+			return true, seedMemory(dir)
+		}
+		return false, checkMemoryLayout(dir)
 	}
 	if entries, err := os.ReadDir(dir); err == nil && len(entries) > 0 {
 		return false, fmt.Errorf("memory init: %s exists and is not a memory repository; move it away first", dir)
@@ -167,22 +174,43 @@ func InitMemory(r Repo) (bool, error) {
 	if err := verifyMemoryRepo(dir); err != nil {
 		return false, err
 	}
+	return true, seedMemory(dir)
+}
+
+// memoryLayout lists the files every initialized memory has.
+var memoryLayout = []string{"schema.md", "wiki/features/.gitkeep", "wiki/index.md", "wiki/log.md"}
+
+// seedMemory writes the initial files and makes the first commit.
+func seedMemory(dir string) error {
 	today := memoryNow().UTC().Format("2006-01-02")
 	files := map[string]string{
 		"schema.md":              memorySchema,
 		"wiki/index.md":          renderIndex(nil),
-		"wiki/log.md":            "# Log\n\nAppend-only. One entry per memory change.\n\n## [" + today + "] init | memory created\n",
+		"wiki/log.md":            "# Log" + nl + nl + "Append-only. One entry per memory change." + nl + nl + "## [" + today + "] init | memory created" + nl,
 		"wiki/features/.gitkeep": "",
 	}
-	for name, content := range files {
-		if err := writeFileAtomic(filepath.Join(dir, filepath.FromSlash(name)), []byte(content)); err != nil {
-			return false, fmt.Errorf("memory init: %w", err)
+	for _, name := range memoryLayout {
+		if err := writeFileAtomic(filepath.Join(dir, filepath.FromSlash(name)), []byte(files[name])); err != nil {
+			return fmt.Errorf("memory init: %w", err)
 		}
 	}
-	if err := commitMemory(dir, []string{"."}, "aeh: initialize memory"); err != nil {
-		return false, err
+	return commitMemory(dir, memoryLayout, "aeh: initialize memory")
+}
+
+const nl = "\n"
+
+// checkMemoryLayout reports files an initialized memory is missing from its last commit.
+func checkMemoryLayout(dir string) error {
+	var missing []string
+	for _, name := range memoryLayout {
+		if _, err := git(dir, "cat-file", "-e", "HEAD:"+name); err != nil {
+			missing = append(missing, name)
+		}
 	}
-	return true, nil
+	if len(missing) > 0 {
+		return fmt.Errorf("memory init: %s is incomplete (missing from its last commit: %s); restore them from its history or move the directory away", dir, strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 // LoadMemory reads every spec. A missing memory is not an error; a corrupt one is.
@@ -258,6 +286,34 @@ func fingerprint(m MemorySnapshot) string {
 	}{Present: m.Present}
 	for _, s := range m.Specs {
 		v.Specs = append(v.Specs, entry{s.Feature, s.Version, s.Paths})
+	}
+	b, _ := json.Marshal(v)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// ContractFingerprint is what a run's contract depends on: which code every feature owns, and
+// the declared feature's version and text. Other features' versions are left out, so recording
+// another outcome does not stop a blocked outcome from resuming.
+func (m MemorySnapshot) ContractFingerprint(declared string) string {
+	type owner struct {
+		Feature string
+		Paths   []string
+	}
+	v := struct {
+		Present         bool
+		Owners          []owner
+		Declared        string
+		DeclaredVersion string
+		DeclaredBody    string
+	}{Present: m.Present, Declared: declared}
+	for _, s := range m.Specs {
+		v.Owners = append(v.Owners, owner{s.Feature, s.Paths})
+		if s.Feature == declared {
+			v.DeclaredVersion = s.Version
+			sum := sha256.Sum256([]byte(s.Body))
+			v.DeclaredBody = hex.EncodeToString(sum[:])
+		}
 	}
 	b, _ := json.Marshal(v)
 	sum := sha256.Sum256(b)

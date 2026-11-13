@@ -32,7 +32,7 @@ Execution
         --paths a/,b/               restrict the change to these paths
         --profile <name>            start with this profile
         --feature <f> --change patch|minor|major --note "..."
-                                    the feature this change modifies (drift gate pending)
+                                    the feature this change modifies; recorded in memory
   aeh answer <ID> "<text>"          answer a blocked outcome so it can run again
 
 Memory (local, private: .aeh/memory/ of the main checkout, never published by aeh)
