@@ -344,6 +344,8 @@ func TestResumeAllowsProfileChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := strings.Replace(readFile(t, f.repo.ConfigPath()), "  timeout_minutes: 1\n", "  timeout_minutes: 2\n", 1)
+	outcome := strings.Replace(readFile(t, f.repo.OutcomePath(st.ID)), "    paths: [src/]", "    paths: [src/]\n    start: medio", 1)
+	write(t, f.dir, "aeh/outcomes/OUT-001.yaml", outcome)
 	cfg += "    timeout_minutes: 5\nnotify:\n  webhook: \"\"\n"
 	write(t, f.dir, "aeh/config.yaml", cfg)
 	st, err := RunOutcome(context.Background(), f.repo, st.ID, nil)

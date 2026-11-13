@@ -307,33 +307,22 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 		check(GateResult{Name: res.FailedGate, Output: res.Feedback})
 		return res, record()
 	}
-	verified := wt + "-verify"
-	if err := addWorktreeDetached(r.Root, verified, commit); err != nil {
-		return res, err
-	}
-	defer func() {
-		if res.Worktree != verified {
-			removeWorktree(r.Root, verified)
-		}
-	}()
-	if err := verifyCheckout(verified, commit); err != nil {
-		return res, err
-	}
 	if err := writePrivateJSON(filepath.Join(runDir, "candidate.json"), map[string]string{"base": base, "commit": commit, "contract": ru.state.Contract}); err != nil {
 		return res, err
 	}
-	timeout := time.Duration(ru.cfg.Commands.TimeoutMinutes) * time.Minute
+	// Hash and scope read Git objects in the main repository, so nothing from the
+	// candidate is checked out, and no checkout filter runs, until both have passed.
 	passed := true
 	if ru.seal != nil {
-		passed = check(gateHash(verified, *ru.seal, o.Acceptance))
+		passed = check(gateSealedTree(r.Root, base, commit, o.Acceptance))
 	}
 	var diff string
 	if passed {
-		changes, err := candidateChanges(verified, base, commit)
+		changes, err := candidateChanges(r.Root, base, commit)
 		if err != nil {
 			return res, err
 		}
-		diff, err = candidateDiff(verified, base, commit)
+		diff, err = candidateDiff(r.Root, base, commit)
 		if err != nil {
 			return res, err
 		}
@@ -342,6 +331,21 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 		}
 		passed = check(gateScope(changes, ru.protected, t.Paths, maxLines))
 	}
+	verified := wt + "-verify"
+	if passed {
+		if err := addWorktreeDetached(r.Root, verified, commit); err != nil {
+			return res, err
+		}
+		defer func() {
+			if res.Worktree != verified {
+				removeWorktree(r.Root, verified)
+			}
+		}()
+		if err := verifyCheckout(verified, commit); err != nil {
+			return res, err
+		}
+	}
+	timeout := time.Duration(ru.cfg.Commands.TimeoutMinutes) * time.Minute
 	if passed {
 		passed = check(checkoutGate(gateCommand(ctx, "build", verified, ru.cfg.Commands.Build, timeout, ru.cfg.PassEnv), verified, commit))
 	}

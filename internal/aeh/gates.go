@@ -38,6 +38,25 @@ func gateHash(wt string, s Seal, paths []string) GateResult {
 	return g
 }
 
+// gateSealedTree passes when the candidate leaves the acceptance paths identical to the base.
+// It compares Git objects, so it runs before anything from the candidate is checked out.
+// The base holds the sealed tests: runs start from a clean, sealed checkout and advance only
+// through candidates that passed this gate.
+func gateSealedTree(root, base, commit string, paths []string) GateResult {
+	g := GateResult{Name: "hash"}
+	args := append([]string{"--literal-pathspecs", "diff", "--name-only", "--no-renames", "--no-ext-diff", "--no-textconv", base, commit, "--"}, paths...)
+	out, err := git(root, args...)
+	switch {
+	case err != nil:
+		g.Output = "compare acceptance tests: " + err.Error()
+	case out != "":
+		g.Output = "acceptance tests were modified; they are sealed and must not change:\n" + out
+	default:
+		g.Passed = true
+	}
+	return g
+}
+
 // gateScope fails if the change touches protected paths, leaves the task's paths, or is too large.
 func gateScope(changes []fileChange, protected, allowed []string, maxLines int) GateResult {
 	g := GateResult{Name: "scope"}

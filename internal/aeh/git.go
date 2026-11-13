@@ -10,10 +10,14 @@ import (
 	"strings"
 )
 
-// git runs a git command in dir and returns trimmed stdout. It disables fsmonitor, which a
-// worktree's config could point at an agent-written program, and filters the environment.
+// gitSafety keeps agent-writable Git state from changing what the harness sees or runs:
+// replace refs could swap the object behind a verified SHA, and hooks or fsmonitor would
+// execute programs the agent wrote.
+var gitSafety = []string{"--no-replace-objects", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.DevNull}
+
+// git runs a git command in dir with gitSafety and a filtered environment, and returns trimmed stdout.
 func git(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", append([]string{"-c", "core.fsmonitor=false"}, args...)...)
+	cmd := exec.Command("git", append(append([]string{}, gitSafety...), args...)...)
 	cmd.Dir = dir
 	cmd.Env = commandEnv(nil)
 	var out, errb bytes.Buffer
@@ -123,6 +127,19 @@ func verifyCheckout(wt, commit string) error {
 	}
 	if head != commit {
 		return fmt.Errorf("verification HEAD changed from %s to %s", commit, head)
+	}
+	// assume-unchanged (lowercase tag) and skip-worktree (S) make status ignore a tracked file.
+	flags, err := git(wt, "ls-files", "-v")
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(flags, "\n") {
+		if line != "" && (line[0] == 'S' || line[0] >= 'a' && line[0] <= 'z') {
+			return fmt.Errorf("verification set an index flag that hides changes: %s", line)
+		}
+	}
+	if _, err := git(wt, "update-index", "-q", "--really-refresh"); err != nil {
+		return err
 	}
 	status, err := git(wt, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
 	if err != nil {
