@@ -1,8 +1,14 @@
 # AEH — Autonomous Engineering Harness
 
-AEH turns an approved outcome into verified code on its own branch. You decide what to build and approve the acceptance tests; AEH runs agent CLIs (Codex, Claude Code, a local model) in isolated git worktrees and accepts a change only when deterministic gates pass.
+AEH is a product-cycle engine: it takes a product from a first idea to verified, documented code, and keeps a private memory of everything it learned along the way. See the [vision](docs/vision.md) for the full cycle: discover, approve, build, remember.
+
+![AEH map](docs/aeh-map.svg)
 
 The runner decides; models only propose.
+
+## What works today
+
+The build stage. AEH turns an approved outcome into verified code on its own branch. You decide what to build and approve the acceptance tests; AEH runs agent CLIs (Codex, Claude Code, a local model) in isolated git worktrees and accepts a change only when deterministic gates pass. The rest of this README describes that engine.
 
 > **Status: MVP-1.** Worktrees separate Git changes. Agent CLIs and build/test commands run with your user's permissions, subject to any sandbox configured on the CLI itself. Use trusted repositories, profiles, and commands until AEH has a process sandbox.
 
@@ -105,12 +111,18 @@ Make sure your project's `.gitignore` covers build output (`bin/`, `obj/`, `node
 | `aeh status` | Status, tasks and attempts of every outcome. |
 | `aeh notify test` | Sends a test event to the webhook. |
 
-## Not in this version
+## Roadmap
 
-- Container sandbox for agents.
-- `discover`, `ingest`, `scope`, `outcomes propose` and `clarify`: outcomes and tests are written by hand or with your agent CLI.
-- Automatic planning: tasks are listed in the outcome file.
-- Parallel tasks, metrics and a dashboard.
+The engine above is the build stage of the [vision](docs/vision.md). Next, in order:
+
+1. **Memory.** A private wiki in `.aeh/memory/` with versioned specs, kept in sync with the code by a deterministic drift gate.
+2. **Triage and reviewers.** Trivial, change and new routes, with QA, Security and DBA reviewers chosen by route.
+3. **Specs to code.** An approved feature produces its tasks and acceptance tests.
+4. **Discovery.** From a vague idea to a spec book with HTML mockups.
+5. **Live review.** Specs keep evolving while approved features are built.
+6. **Sandbox.** Agents in a container with no network by default.
+
+Until then, outcomes, tasks and acceptance tests are written by hand or with your agent CLI.
 
 ## Development
 
@@ -121,7 +133,7 @@ go vet ./...
 go test ./...
 ```
 
-Agent instruction files (`AGENTS.md`, `CLAUDE.md`, `.claude/`, `.codex/`) are git-ignored: keep your own locally.
+Agent instruction files (`AGENTS.md`, `CLAUDE.md`, `.claude/`, `.codex/`), agent coordination notes (`.agents/`) and local state (`.aeh/`) are git-ignored: they stay on your machine. Design decisions are recorded in [docs/adr](docs/adr).
 
 ## License
 
