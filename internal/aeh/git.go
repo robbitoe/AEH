@@ -181,6 +181,23 @@ func verifyCheckout(wt, commit string) error {
 	return nil
 }
 
+// attributesFileInRepo returns core.attributesFile as a repository path when it points inside
+// the repository. Such a file selects filters like .gitattributes, so it must be protected too.
+func attributesFileInRepo(root string) string {
+	p, err := git(root, "config", "--path", "--get", "core.attributesFile")
+	if err != nil || p == "" {
+		return ""
+	}
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(root, p)
+	}
+	r, err := filepath.Rel(root, p)
+	if err != nil || !filepath.IsLocal(r) {
+		return ""
+	}
+	return filepath.ToSlash(r)
+}
+
 // moveBranch advances an unchecked-out integration branch only from the verified base.
 func moveBranch(root, branch, base, commit string) error {
 	ref := "refs/heads/" + branch

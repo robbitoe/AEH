@@ -129,3 +129,25 @@ func TestScopeSeesPointerChangeHiddenByIgnoreAll(t *testing.T) {
 		t.Fatalf("scope missed a pointer change hidden by ignore=all: %+v %s", changes, g.Output)
 	}
 }
+
+func TestAttributesFileInRepoIsProtected(t *testing.T) {
+	dir, _ := newRepo(t)
+	if got := attributesFileInRepo(dir); got != "" {
+		t.Fatalf("no attributes file configured, got %q", got)
+	}
+	mustGit(t, dir, "config", "core.attributesFile", "src/attrs")
+	if got := attributesFileInRepo(dir); got != "src/attrs" {
+		t.Fatalf("relative attributes file: got %q", got)
+	}
+	mustGit(t, dir, "config", "core.attributesFile", filepath.ToSlash(filepath.Join(dir, "src", "attrs")))
+	if got := attributesFileInRepo(dir); got != "src/attrs" {
+		t.Fatalf("absolute attributes file inside the repo: got %q", got)
+	}
+	mustGit(t, dir, "config", "core.attributesFile", filepath.ToSlash(filepath.Join(t.TempDir(), "attrs")))
+	if got := attributesFileInRepo(dir); got != "" {
+		t.Fatalf("attributes file outside the repo: got %q", got)
+	}
+	if g := gateScope([]fileChange{{Path: "src/attrs", Lines: 1}}, []string{"src/attrs"}, []string{"src/"}, 100); g.Passed {
+		t.Fatal("scope accepted a change to the configured attributes file")
+	}
+}

@@ -87,6 +87,9 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer) (Sta
 		return st, err
 	}
 	ru := &runner{repo: r, cfg: cfg, outcome: o, protected: protectedPaths(cfg, o), state: &st, log: log}
+	if attrs := attributesFileInRepo(r.Root); attrs != "" {
+		ru.protected = append(ru.protected, attrs)
+	}
 	if ru.implementPrompt, err = loadPrompt(r, "implement.md"); err != nil {
 		return st, fmt.Errorf("load implementation prompt: %w", err)
 	}
