@@ -13,3 +13,7 @@ CLAUDE.md
 CLAUDE.local.md
 .claude/
 .codex/
+
+# agent coordination notes and AEH local state, including the private memory, never committed
+.agents/
+.aeh/
