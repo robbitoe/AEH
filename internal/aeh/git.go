@@ -93,7 +93,7 @@ func candidateCommit(wt, base, msg string) (string, error) {
 }
 
 func candidateChanges(wt, base, commit string) ([]fileChange, error) {
-	out, err := git(wt, "diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", base, commit)
+	out, err := git(wt, "diff", "--numstat", "-z", "--no-renames", "--ignore-submodules=none", "--no-ext-diff", "--no-textconv", base, commit)
 	if err != nil {
 		return nil, err
 	}
@@ -119,7 +119,7 @@ func candidateChanges(wt, base, commit string) ([]fileChange, error) {
 
 // markGitlinks flags submodule pointers (mode 160000) on either side of the change.
 func markGitlinks(wt, base, commit string, changes []fileChange) ([]fileChange, error) {
-	out, err := git(wt, "diff", "--raw", "-z", "--no-renames", "--no-abbrev", base, commit)
+	out, err := git(wt, "diff", "--raw", "-z", "--no-renames", "--ignore-submodules=none", "--no-abbrev", base, commit)
 	if err != nil {
 		return nil, err
 	}
@@ -147,7 +147,7 @@ func markGitlinks(wt, base, commit string, changes []fileChange) ([]fileChange, 
 }
 
 func candidateDiff(wt, base, commit string) (string, error) {
-	return git(wt, "diff", "--no-renames", "--no-ext-diff", "--no-textconv", base, commit)
+	return git(wt, "diff", "--no-renames", "--ignore-submodules=none", "--no-ext-diff", "--no-textconv", base, commit)
 }
 
 func verifyCheckout(wt, commit string) error {

@@ -106,3 +106,26 @@ func TestScopeRejectsSubmodulePointer(t *testing.T) {
 		t.Fatalf("scope accepted a submodule pointer: %s", g.Output)
 	}
 }
+
+func TestScopeSeesPointerChangeHiddenByIgnoreAll(t *testing.T) {
+	dir, first := newRepo(t)
+	write(t, dir, "src/a.txt", "two\n")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "two")
+	second, _ := headCommit(dir)
+	write(t, dir, ".gitmodules", "[submodule \"mod\"]\n\tpath = src/mod\n\turl = ./mod\n\tignore = all\n")
+	mustGit(t, dir, "add", ".gitmodules")
+	mustGit(t, dir, "update-index", "--add", "--cacheinfo", "160000,"+first+",src/mod")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "submodule")
+	base, _ := headCommit(dir)
+	mustGit(t, dir, "config", "diff.ignoreSubmodules", "all")
+	mustGit(t, dir, "update-index", "--cacheinfo", "160000,"+second+",src/mod")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "move pointer")
+	commit, _ := headCommit(dir)
+	changes, err := candidateChanges(dir, base, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g := gateScope(changes, nil, []string{"src/"}, 100); g.Passed || !strings.Contains(g.Output, "submodule") {
+		t.Fatalf("scope missed a pointer change hidden by ignore=all: %+v %s", changes, g.Output)
+	}
+}

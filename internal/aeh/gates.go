@@ -44,7 +44,7 @@ func gateHash(wt string, s Seal, paths []string) GateResult {
 // through candidates that passed this gate.
 func gateSealedTree(root, base, commit string, paths []string) GateResult {
 	g := GateResult{Name: "hash"}
-	args := append([]string{"--literal-pathspecs", "diff", "--name-only", "--no-renames", "--no-ext-diff", "--no-textconv", base, commit, "--"}, paths...)
+	args := append([]string{"--literal-pathspecs", "diff", "--name-only", "--no-renames", "--ignore-submodules=none", "--no-ext-diff", "--no-textconv", base, commit, "--"}, paths...)
 	out, err := git(root, args...)
 	switch {
 	case err != nil:
