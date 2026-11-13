@@ -42,18 +42,21 @@ type TaskState struct {
 
 // State is the local, ignored record of an outcome's execution.
 type State struct {
-	ID        string      `json:"id"`
-	Title     string      `json:"title"`
-	Status    string      `json:"status"`
-	Base      string      `json:"base"`
-	Head      string      `json:"verified_head"`
-	Contract  string      `json:"contract_sha256"`
-	FinalRun  string      `json:"final_run,omitempty"`
-	Branch    string      `json:"branch"`
-	Tasks     []TaskState `json:"tasks"`
-	Question  string      `json:"question,omitempty"`
-	Answers   []string    `json:"answers,omitempty"`
-	UpdatedAt time.Time   `json:"updated_at"`
+	ID            string      `json:"id"`
+	Title         string      `json:"title"`
+	Status        string      `json:"status"`
+	Base          string      `json:"base"`
+	Head          string      `json:"verified_head"`
+	Contract      string      `json:"contract_sha256"`
+	FinalRun      string      `json:"final_run,omitempty"`
+	MemoryVersion string      `json:"memory_version,omitempty"`
+	MemoryCommit  string      `json:"memory_commit,omitempty"`
+	MemoryError   string      `json:"memory_error,omitempty"`
+	Branch        string      `json:"branch"`
+	Tasks         []TaskState `json:"tasks"`
+	Question      string      `json:"question,omitempty"`
+	Answers       []string    `json:"answers,omitempty"`
+	UpdatedAt     time.Time   `json:"updated_at"`
 }
 
 func (s *State) task(id string) *TaskState {

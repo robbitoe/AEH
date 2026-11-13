@@ -108,7 +108,7 @@ Make sure your project's `.gitignore` covers build output (`bin/`, `obj/`, `node
 | `aeh init` | Creates `aeh/config.yaml`, an example outcome, and ignores `.aeh/`. |
 | `aeh tests approve <ID>` | Seals the outcome's acceptance tests. |
 | `aeh run <ID>` | Runs the outcome. Exit code 0 accepted, 3 blocked, 1 error. |
-| `aeh do "<change>" [--paths a/,b/] [--profile name]` | Level-1 change with one task. |
+| `aeh do "<change>" [--paths a/,b/] [--profile name] [--feature slug --change patch\|minor\|major --note "..."]` | Level-1 change with one task; optionally links and records a feature. |
 | `aeh answer <ID> "<text>"` | Answers a blocked outcome; the answer goes into the next prompt. |
 | `aeh status` | Status, tasks and attempts of every outcome. |
 | `aeh notify test` | Sends a test event to the webhook. |
@@ -120,7 +120,13 @@ Make sure your project's `.gitignore` covers build output (`bin/`, `obj/`, `node
 
 ### Product memory (in progress)
 
-The memory is a local wiki in `.aeh/memory/` of the project's main checkout, also when you run from a linked worktree. It is its own Git repository with no remote, and the project ignores `.aeh/`, so aeh does not publish it. Each feature has a spec with a version and the paths it owns; `index.md` and `log.md` are maintained by aeh. Only aeh commands write it, one at a time per project. You can edit spec text by hand and commit it inside the memory repository; aeh refuses to record on top of uncommitted changes. Linking an outcome to a feature (`--feature`) and the drift gate arrive in the next step of stage 1.
+The memory is a local wiki in `.aeh/memory/` of the project's main checkout, also when you run from a linked worktree. It is its own Git repository with no remote, and the project ignores `.aeh/`, so aeh does not publish it. Each feature has a spec with a version and the paths it owns; `index.md` and `log.md` are maintained by aeh. Only aeh commands write it, one at a time per project. You can edit spec text by hand and commit it inside the memory repository; aeh refuses to record on top of uncommitted changes.
+
+Link an outcome using `feature: checkout`, `change: patch` (or `minor` / `major`), and a one-line `changelog: ...`. For `aeh do`, use `--feature checkout --change patch --note "..."`. The implementation prompt includes only that feature's spec, as reference data sent to the configured agent provider. Prompt overrides can include it with `{{.MemorySpec}}`; the value is empty without a declared feature.
+
+The deterministic drift gate runs after scope and before build on each attempt, and again on the accumulated diff in the final check. Changes to a feature's paths must declare that feature; touching multiple features, including overlapping paths or a rename across features, fails with a request to split the outcome. Untouched declared features and files without an owning feature produce warnings in the evidence and report. With no memory and no declared feature, drift is skipped. Candidates may never modify `.aeh/`.
+
+The execution contract includes the memory fingerprint and the declared spec's body hash, so changes to memory ownership or versions, or the declared spec text, reject resume. A changed memory fingerprint before acceptance blocks the outcome. After acceptance, aeh bumps the feature's version and records the verified code commit in its changelog. If recording fails (for example, memory has uncommitted edits), the outcome stays accepted and a pending record remains. Commit or discard those edits, then retry with `aeh memory record <ID>`. Outcomes without a feature do not write memory.
 
 ## Roadmap
 

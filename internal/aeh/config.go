@@ -64,6 +64,9 @@ type Outcome struct {
 	Level       int         `yaml:"level"`
 	Actor       string      `yaml:"actor"`
 	Description string      `yaml:"description"`
+	Feature     string      `yaml:"feature,omitempty"`
+	Change      string      `yaml:"change,omitempty"`
+	Changelog   string      `yaml:"changelog,omitempty"`
 	Criteria    []Criterion `yaml:"criteria"`
 	Acceptance  []string    `yaml:"acceptance"`
 	Tasks       []Task      `yaml:"tasks"`
@@ -164,6 +167,9 @@ func (r Repo) LoadOutcome(id string) (Outcome, error) {
 }
 
 func (o *Outcome) normalize() error {
+	if err := (MemoryLink{Feature: o.Feature, Change: o.Change, Note: o.Changelog}).Validate(); err != nil {
+		return fmt.Errorf("outcome %s: memory link: %w", o.ID, err)
+	}
 	if strings.TrimSpace(o.Title) == "" {
 		return fmt.Errorf("outcome %s: title is required", o.ID)
 	}
