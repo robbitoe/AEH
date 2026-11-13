@@ -102,6 +102,9 @@ func assignAndResume(job uintptr, pid uint32) error {
 		const threadSuspendResume = 0x0002
 		thread, _, err := openThread.Call(threadSuspendResume, 0, uintptr(entry.ThreadID))
 		if thread == 0 {
+			if errors.Is(err, syscall.Errno(87)) { // ERROR_INVALID_PARAMETER: the thread already exited
+				continue
+			}
 			return fmt.Errorf("open thread %d of process %d: %w", entry.ThreadID, pid, err)
 		}
 		previous, _, err := resumeThread.Call(thread)
@@ -178,12 +181,15 @@ func killJob(job uintptr) error {
 func captureJobProcesses(job uintptr, deadline time.Time, processes map[uint32]syscall.Handle) error {
 	capacity := uint32(64)
 	for time.Now().Before(deadline) {
-		buffer := make([]byte, 8+int(capacity)*int(unsafe.Sizeof(uintptr(0))))
+		// []uintptr guarantees the alignment of the ULONG_PTR list after the
+		// two-DWORD header (8 bytes: one word on 64-bit, two on 32-bit).
+		word := int(unsafe.Sizeof(uintptr(0)))
+		buffer := make([]uintptr, (8+int(capacity)*word+word-1)/word)
 		info := (*struct {
 			Assigned, Count uint32
 			PIDs            [1]uintptr
 		})(unsafe.Pointer(&buffer[0]))
-		ok, _, err := queryJob.Call(job, 3, uintptr(unsafe.Pointer(info)), uintptr(len(buffer)), 0)
+		ok, _, err := queryJob.Call(job, 3, uintptr(unsafe.Pointer(info)), uintptr(len(buffer)*word), 0)
 		if ok == 0 {
 			if errors.Is(err, syscall.ERROR_MORE_DATA) {
 				capacity = info.Assigned + 16
