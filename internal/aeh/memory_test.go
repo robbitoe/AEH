@@ -669,3 +669,34 @@ func TestStaleProjectLock(t *testing.T) {
 	}
 	unlock()
 }
+
+// An init that stopped after staging its seed files is finished; a foreign staged file is not.
+func TestInitMemoryFinishesStagedInit(t *testing.T) {
+	r := newMemoryProject(t)
+	dir := memDir(t, r)
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, dir, "init", "-q", "-b", "main")
+	write(t, dir, "notes.md", "mine\n")
+	mustGit(t, dir, "add", "notes.md")
+	if _, err := InitMemory(r); err == nil || !strings.Contains(err.Error(), "notes.md") {
+		t.Fatalf("expected a refusal naming the staged file, got %v", err)
+	}
+	mustGit(t, dir, "rm", "-q", "--cached", "notes.md")
+	if err := os.Remove(filepath.Join(dir, "notes.md")); err != nil {
+		t.Fatal(err)
+	}
+	write(t, dir, "schema.md", memorySchema)
+	write(t, dir, "wiki/features/.gitkeep", "")
+	mustGit(t, dir, "add", "schema.md", "wiki/features/.gitkeep")
+	if created, err := InitMemory(r); err != nil || !created {
+		t.Fatalf("retry after staging: created=%v err=%v", created, err)
+	}
+	if err := memoryClean(dir); err != nil {
+		t.Fatal(err)
+	}
+}

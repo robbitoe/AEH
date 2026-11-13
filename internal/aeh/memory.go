@@ -210,12 +210,28 @@ func checkUnfinishedInit(dir string) error {
 	if _, err := git(dir, "symbolic-ref", "-q", "HEAD"); err != nil {
 		return fmt.Errorf("memory init: %s has no readable HEAD; inspect it or move it away", dir)
 	}
-	if staged, _ := git(dir, "ls-files"); staged != "" {
-		return fmt.Errorf("memory init: %s has staged files and no commit; it is not an unfinished aeh init, move it away", dir)
-	}
 	expected := map[string]bool{}
 	for _, name := range memoryLayout {
 		expected[name] = true
+	}
+	// An init may stop after staging its seed files: those may stay staged, exactly as on disk.
+	staged, err := git(dir, "ls-files", "-s")
+	if err != nil {
+		return fmt.Errorf("memory init: %w", err)
+	}
+	for _, line := range strings.Split(staged, "\n") {
+		if line == "" {
+			continue
+		}
+		meta, rel, ok := strings.Cut(line, "\t")
+		fields := strings.Fields(meta)
+		if !ok || len(fields) != 3 || !expected[rel] {
+			return fmt.Errorf("memory init: %s has no commit and stages %s, which aeh did not write; move the directory away first", dir, rel)
+		}
+		disk, err := git(dir, "hash-object", "--", rel)
+		if err != nil || disk != fields[1] {
+			return fmt.Errorf("memory init: %s has no commit and its staged %s differs from the file; move the directory away first", dir, rel)
+		}
 	}
 	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
