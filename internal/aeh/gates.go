@@ -74,6 +74,8 @@ func gateScope(changes []fileChange, protected, allowed []string, maxLines int) 
 		}
 		if agentInstructionFile(c.Path) {
 			problems = append(problems, "agent instruction file modified: "+c.Path)
+		} else if gitControlFile(c.Path) {
+			problems = append(problems, "git control file modified: "+c.Path)
 		} else if matchAny(c.Path, protected) {
 			problems = append(problems, "protected path modified: "+c.Path)
 		} else if len(allowed) > 0 && !matchAny(c.Path, allowed) {
@@ -90,6 +92,14 @@ func gateScope(changes []fileChange, protected, allowed []string, maxLines int) 
 	g.Passed = true
 	g.Output = fmt.Sprintf("%d files, %d changed lines", len(changes), total)
 	return g
+}
+
+// gitControlFile reports files that tell Git how to transform or fetch content. A candidate
+// could otherwise select clean/smudge filters so build and test see bytes other than the
+// committed blobs; with these fixed, verification uses the base's attributes only.
+func gitControlFile(file string) bool {
+	name := strings.ToLower(file[strings.LastIndexAny(file, "/\\")+1:])
+	return name == ".gitattributes" || name == ".gitmodules" || name == ".lfsconfig"
 }
 
 // agentInstructionFile reports files that agent CLIs load as instructions or settings.

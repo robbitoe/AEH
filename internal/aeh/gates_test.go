@@ -45,6 +45,10 @@ func TestGateScope(t *testing.T) {
 		"claude.md": {{"src/sub/Claude.md", 1}},
 		"settings":  {{"src/.claude/settings.json", 1}},
 		"codex":     {{"src/.codex/config.toml", 1}},
+		"attrs":     {{"src/.gitattributes", 1}},
+		"root attr": {{".GitAttributes", 1}},
+		"modules":   {{".gitmodules", 1}},
+		"lfs":       {{"src/.lfsconfig", 1}},
 	} {
 		if g := gateScope(changes, protected, []string{"src/"}, 100); g.Passed {
 			t.Errorf("%s: expected failure", name)
