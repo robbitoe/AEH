@@ -338,11 +338,7 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 	var gates []GateResult
 	check := func(g GateResult) bool {
 		gates = append(gates, g)
-		status := "ok"
-		if !g.Passed {
-			status = "FAIL: " + firstLine(g.Output)
-		}
-		ru.logf("    %-6s %s", g.Name, status)
+		ru.logf("    %-6s %s", g.Name, gateStatus(g))
 		for _, warning := range g.Warnings {
 			ru.logf("    %s warning: %s", g.Name, warning)
 		}
@@ -570,14 +566,13 @@ func (ru *runner) finalCheck(ctx context.Context) (bool, string, error) {
 		for _, warning := range g.Warnings {
 			ru.logf("    %s warning: %s", g.Name, warning)
 		}
+		ru.logf("    %-6s %s", g.Name, gateStatus(g))
 		if !g.Passed {
-			ru.logf("    %-6s FAIL: %s", g.Name, firstLine(g.Output))
 			if g.Uncertain {
 				return false, fmt.Sprintf("Final %s stopped. Confirm all processes stopped and review possible effects before answering. See the final check artifacts.", g.Name), nil
 			}
 			return false, fmt.Sprintf("The integrated branch fails the %q check:\n%s", g.Name, tail(strings.TrimSpace(g.Output), 1500)), nil
 		}
-		ru.logf("    %-6s ok", g.Name)
 	}
 	if ctx.Err() != nil {
 		return false, "", ctx.Err()
@@ -680,6 +675,18 @@ func protectedPaths(cfg Config, o Outcome) []string {
 	out := []string{"aeh/", ".aeh/"}
 	out = append(out, cfg.Protected...)
 	return append(out, o.Acceptance...)
+}
+
+// gateStatus is the console word for a gate: ok, skipped, or FAIL with the first output line.
+// It matches the report, which also tells a skipped gate apart from one that passed.
+func gateStatus(g GateResult) string {
+	switch {
+	case !g.Passed:
+		return "FAIL: " + firstLine(g.Output)
+	case g.Skipped:
+		return "skipped"
+	}
+	return "ok"
 }
 
 func changedPaths(changes []fileChange) []string {

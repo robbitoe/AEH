@@ -203,9 +203,9 @@ func seedMemory(dir string) error {
 
 const nl = "\n"
 
-// checkUnfinishedInit accepts a repository only when HEAD is unborn, nothing is staged, and
-// every file present is one aeh's init writes, with the content aeh writes. Anything else may
-// be the owner's work, so init refuses instead of replacing it.
+// checkUnfinishedInit accepts a repository only when HEAD is unborn, anything staged is one of
+// aeh's init files exactly as on disk, and every file present is one aeh's init writes, with the
+// content aeh writes. Anything else may be the owner's work, so init refuses instead of replacing it.
 func checkUnfinishedInit(dir string) error {
 	if _, err := git(dir, "symbolic-ref", "-q", "HEAD"); err != nil {
 		return fmt.Errorf("memory init: %s has no readable HEAD; inspect it or move it away", dir)
