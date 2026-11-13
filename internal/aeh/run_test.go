@@ -242,7 +242,7 @@ func TestReviewerCanReject(t *testing.T) {
 func TestDoRunsLevelOne(t *testing.T) {
 	f := newFixture(t, map[string]string{"medio": agentGood}, []string{"medio"}, "")
 	var log strings.Builder
-	st, err := Do(context.Background(), f.repo, "write the fees file", []string{"src/"}, "", &log)
+	st, err := Do(context.Background(), f.repo, "write the fees file", []string{"src/"}, "", MemoryLink{}, &log)
 	if err != nil {
 		t.Fatal(err)
 	}

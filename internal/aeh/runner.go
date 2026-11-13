@@ -44,7 +44,14 @@ func RunOutcome(ctx context.Context, r Repo, id string, log io.Writer) (State, e
 }
 
 // Do runs a level-1 change described in one sentence: one task, no sealed tests, no review.
-func Do(ctx context.Context, r Repo, text string, paths []string, profile string, log io.Writer) (State, error) {
+// link declares the feature the change modifies; it is enforced once the drift gate exists.
+func Do(ctx context.Context, r Repo, text string, paths []string, profile string, link MemoryLink, log io.Writer) (State, error) {
+	if err := link.Validate(); err != nil {
+		return State{}, err
+	}
+	if link.Feature != "" {
+		return State{}, errors.New("--feature is not enforced yet: it arrives with the drift gate")
+	}
 	cfg, err := r.LoadConfig()
 	if err != nil {
 		return State{}, err

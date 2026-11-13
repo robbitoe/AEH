@@ -182,7 +182,7 @@
   <!-- MEMORY -->
   <rect x="20" y="650" width="1160" height="190" rx="14" class="zM"/>
   <text x="40" y="678" class="z hM">MEMORY · LIVING WIKI</text>
-  <text x="250" y="678" class="s mut">every stage reads it · only the runner writes it · local, never published</text>
+  <text x="250" y="678" class="s mut">every stage reads it · only the runner writes it · local · not published by default</text>
 
   <rect x="40" y="700" width="320" height="120" rx="10" class="box"/>
   <text x="56" y="728" class="t ink">Raw sources</text>
