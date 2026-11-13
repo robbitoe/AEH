@@ -14,6 +14,16 @@ go install github.com/robbitoe/aeh/cmd/aeh@latest
 
 Requires Go 1.24+, git, and the agent CLIs your profiles use.
 
+### Agent profiles
+
+The `aeh init` template was checked against Codex CLI 0.167 and Claude Code 2.1 on Windows:
+
+- Every profile reads the prompt from stdin (`stdin: true`). On Windows the CLIs are `.cmd` shims, and `cmd.exe` cuts a multi-line argument at the first newline.
+- Claude Code runs with `--safe-mode`, so your personal `CLAUDE.md`, plugins, hooks and MCP servers do not change the run, and with `--permission-prompts none`, so anything that would ask for permission is denied instead of waiting. `acceptEdits` lets it edit files; add `--allowedTools` entries if it should run your build or tests.
+- `claude-review` is a read-only reviewer (`--tools Read,Grep,Glob`) for when Codex implements; `codex-review` is the reverse.
+- `local` points Claude Code at LM Studio's Anthropic-compatible endpoint. Set the port your server uses and a model it has loaded.
+- Unattended runs need sign-ins that last: `claude setup-token` for Claude Code and `codex login` for Codex.
+
 ## Quick start
 
 ```sh

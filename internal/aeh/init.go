@@ -50,11 +50,26 @@ profiles:
     command: ["codex", "exec", "--sandbox", "read-only", "-"]
     stdin: true
     timeout_minutes: 15
+  # Claude Code reads the prompt from stdin (on Windows a multi-line argument to the
+  # claude.cmd shim is cut at the first newline). --safe-mode skips your personal
+  # CLAUDE.md, plugins, hooks and MCP servers so runs are reproducible.
+  # --permission-prompts none denies anything that would ask instead of waiting.
+  # acceptEdits lets it edit files; to let it run your tests too, add for example
+  # "--allowedTools", "Bash(npm test:*)".
   fuerte:
-    command: ["claude", "-p", "{{prompt}}", "--permission-mode", "acceptEdits", "--output-format", "json"]
+    command: ["claude", "-p", "--safe-mode", "--permission-mode", "acceptEdits", "--permission-prompts", "none", "--output-format", "json"]
+    stdin: true
     timeout_minutes: 30
+  # Read-only Claude reviewer; use it as "reviewer" when Codex implements.
+  claude-review:
+    command: ["claude", "-p", "--safe-mode", "--tools", "Read,Grep,Glob", "--permission-prompts", "none", "--output-format", "text"]
+    stdin: true
+    timeout_minutes: 15
+  # A local model through LM Studio's Anthropic-compatible endpoint. Use the port your
+  # server listens on and a model id it has loaded.
   local:
-    command: ["claude", "-p", "{{prompt}}", "--permission-mode", "acceptEdits", "--model", "openai/gpt-oss-20b"]
+    command: ["claude", "-p", "--safe-mode", "--permission-mode", "acceptEdits", "--permission-prompts", "none", "--model", "qwen/qwen3-4b-2507"]
+    stdin: true
     env:
       ANTHROPIC_BASE_URL: "http://localhost:1234"
       ANTHROPIC_AUTH_TOKEN: "lmstudio"
