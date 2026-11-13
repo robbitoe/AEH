@@ -75,6 +75,12 @@ func Do(ctx context.Context, r Repo, text string, paths []string, profile string
 }
 
 func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer) (State, error) {
+	// One run or memory write at a time per project, across linked worktrees.
+	unlockProject, err := lockProject(r)
+	if err != nil {
+		return State{}, err
+	}
+	defer unlockProject()
 	unlock, err := lockOutcome(r, o.ID)
 	if err != nil {
 		return State{}, err

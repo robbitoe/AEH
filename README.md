@@ -91,6 +91,7 @@ aeh/                      committed
   state/                  progress per outcome
   runs/<ID>/<task>-a<n>/  prompt, agent output, candidate SHA, diff, gate results
   reports/<ID>.md         evidence report
+  pending/<ID>.json       accepted changes still to be written to memory
   memory/                 product memory: its own local Git repository, no remote
 ```
 

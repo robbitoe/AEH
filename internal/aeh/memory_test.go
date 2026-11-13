@@ -1,6 +1,7 @@
 package aeh
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -327,5 +328,123 @@ func TestLintFindsOverlapAndStaleIndex(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(warnings, "\n"), "overlapping") {
 		t.Fatalf("expected an overlap warning, got %v", warnings)
+	}
+}
+
+// A .git junction would redirect memory writes into another repository.
+func TestMemoryRejectsGitDirLink(t *testing.T) {
+	r := newMemoryProject(t)
+	dir := memDir(t, r)
+	other, _ := newRepo(t)
+	if err := os.Rename(filepath.Join(dir, ".git"), filepath.Join(t.TempDir(), "moved")); err != nil {
+		t.Fatal(err)
+	}
+	link, target := filepath.Join(dir, ".git"), filepath.Join(other, ".git")
+	if err := os.Symlink(target, link); err != nil {
+		if runtime.GOOS != "windows" {
+			t.Skipf("symlink: %v", err)
+		}
+		if out, err := exec.Command("cmd", "/c", "mklink", "/J", link, target).CombinedOutput(); err != nil {
+			t.Skipf("junction: %v %s", err, out)
+		}
+	}
+	if _, err := LoadMemory(r); err == nil || !strings.Contains(err.Error(), "link") {
+		t.Fatalf("expected a link error, got %v", err)
+	}
+	if _, err := InitMemory(r); err == nil {
+		t.Fatal("init accepted a linked .git")
+	}
+}
+
+func TestRunWaitsForProjectLock(t *testing.T) {
+	f := newFixture(t, map[string]string{"medio": agentGood}, []string{"medio"}, "")
+	unlock, err := lockProject(f.repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	var log strings.Builder
+	if _, err := RunOutcome(context.Background(), f.repo, "OUT-001", &log); err == nil || !strings.Contains(err.Error(), "project lock") {
+		t.Fatalf("run ignored the project lock: %v", err)
+	}
+}
+
+func TestPendingRecordsDoNotBreakStatus(t *testing.T) {
+	r := newMemoryProject(t)
+	if err := SavePending(r, PendingRecord{OutcomeID: "OUT-011", Feature: "checkout", Change: "patch", Note: "n", Commit: fakeSHA('a')}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ListStates(r); err != nil {
+		t.Fatalf("status broke with a pending record: %v", err)
+	}
+}
+
+func TestPrivacyRequiresIgnoredDirectory(t *testing.T) {
+	dir, _ := newRepo(t)
+	write(t, dir, ".gitignore", ".aeh/memory/wiki/index.md\n")
+	r, _ := OpenRepo(dir)
+	if _, err := InitMemory(r); err == nil || !strings.Contains(err.Error(), "not ignored") {
+		t.Fatalf("expected a privacy error, got %v", err)
+	}
+}
+
+// A failed write restores only what aeh wrote and keeps what someone else changed meanwhile.
+func TestRollbackKeepsOtherEdits(t *testing.T) {
+	r := newMemoryProject(t)
+	dir := memDir(t, r)
+	w := memoryWrites{}
+	if err := w.write(dir, "wiki/index.md", []byte("aeh index\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.write(dir, "wiki/log.md", []byte("aeh log\n")); err != nil {
+		t.Fatal(err)
+	}
+	write(t, dir, "wiki/log.md", "owner edit\n")
+	err := w.restore(dir, errors.New("commit failed"))
+	if err == nil || !strings.Contains(err.Error(), "wiki/log.md") || !strings.Contains(err.Error(), "commit failed") {
+		t.Fatalf("restore error %v", err)
+	}
+	if got := readFile(t, filepath.Join(dir, "wiki", "log.md")); got != "owner edit\n" {
+		t.Fatalf("owner edit lost: %q", got)
+	}
+	if got := mustGit(t, dir, "status", "--porcelain", "--", "wiki/index.md"); got != "" {
+		t.Fatalf("aeh's own write was not restored: %s", got)
+	}
+}
+
+func TestRecordRefusesHiddenIndexFlags(t *testing.T) {
+	r := newMemoryProject(t)
+	if _, err := CreateSpec(r, "checkout", "Checkout", []string{"src/checkout/**"}); err != nil {
+		t.Fatal(err)
+	}
+	dir := memDir(t, r)
+	for _, flag := range []string{"--assume-unchanged", "--skip-worktree"} {
+		mustGit(t, dir, "update-index", flag, "wiki/features/checkout/spec.md")
+		p := PendingRecord{OutcomeID: "OUT-012", Feature: "checkout", Change: "patch", Note: "n", Commit: fakeSHA('a')}
+		if _, _, err := RecordChange(r, p, ""); !errors.Is(err, ErrMemoryDirty) {
+			t.Fatalf("%s: expected ErrMemoryDirty, got %v", flag, err)
+		}
+		mustGit(t, dir, "update-index", "--no"+flag[1:], "wiki/features/checkout/spec.md")
+	}
+}
+
+// The owner may save and commit a spec with CRLF line endings on Windows.
+func TestRecordAfterCRLFEdit(t *testing.T) {
+	r := newMemoryProject(t)
+	if _, err := CreateSpec(r, "checkout", "Checkout", []string{"src/checkout/**"}); err != nil {
+		t.Fatal(err)
+	}
+	dir := memDir(t, r)
+	spec := filepath.Join(dir, "wiki", "features", "checkout", "spec.md")
+	if err := os.WriteFile(spec, []byte(strings.ReplaceAll(readFile(t, spec), "\n", "\r\n")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "crlf")
+	p := PendingRecord{OutcomeID: "OUT-013", Feature: "checkout", Change: "patch", Note: "n", Commit: fakeSHA('a')}
+	if v, _, err := RecordChange(r, p, ""); err != nil || v != "0.1.1" {
+		t.Fatalf("record after CRLF edit: %s %v", v, err)
+	}
+	if err := memoryClean(dir); err != nil {
+		t.Fatal(err)
 	}
 }

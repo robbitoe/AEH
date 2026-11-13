@@ -138,6 +138,9 @@ func InitMemory(r Repo) (bool, error) {
 		return false, fmt.Errorf("memory init: %w", err)
 	}
 	if _, err := os.Lstat(filepath.Join(dir, ".git")); err == nil {
+		if err := rejectLinksInside(dir); err != nil {
+			return false, err
+		}
 		return false, verifyMemoryRepo(dir)
 	}
 	if entries, err := os.ReadDir(dir); err == nil && len(entries) > 0 {
@@ -194,10 +197,10 @@ func loadMemoryDir(dir string) (MemorySnapshot, error) {
 	if err := rejectLink(dir); err != nil {
 		return snap, fmt.Errorf("memory: %w", err)
 	}
-	if err := verifyMemoryRepo(dir); err != nil {
+	if err := rejectLinksInside(dir); err != nil {
 		return snap, err
 	}
-	if err := rejectLinksInside(dir); err != nil {
+	if err := verifyMemoryRepo(dir); err != nil {
 		return snap, err
 	}
 	snap.Present = true
@@ -291,18 +294,16 @@ func CreateSpec(r Repo, feature, title string, paths []string) (Spec, error) {
 	if err != nil {
 		return Spec{}, err
 	}
-	rel := specRel(feature)
-	if err := writeFileAtomic(filepath.Join(snap.Dir, filepath.FromSlash(rel)), []byte(text)); err != nil {
-		return Spec{}, err
-	}
-	files := []string{rel, "wiki/index.md", "wiki/log.md"}
-	err = writeIndexAndLog(snap.Dir, "["+today+"] create | "+feature+" 0.1.0")
+	w := memoryWrites{}
+	err = w.write(snap.Dir, specRel(feature), []byte(text))
 	if err == nil {
-		err = commitMemory(snap.Dir, files, "create "+feature+" 0.1.0")
+		err = writeIndexAndLog(snap.Dir, w, "["+today+"] create | "+feature+" 0.1.0")
+	}
+	if err == nil {
+		err = w.commit(snap.Dir, "create "+feature+" 0.1.0")
 	}
 	if err != nil {
-		restoreMemory(snap.Dir, files)
-		return Spec{}, err
+		return Spec{}, w.restore(snap.Dir, err)
 	}
 	return spec, nil
 }
@@ -374,17 +375,16 @@ func RecordChange(r Repo, p PendingRecord, expectedFingerprint string) (version,
 	if _, err := parseSpec(text); err != nil {
 		return "", "", fmt.Errorf("record %s: updated spec is invalid: %w", p.OutcomeID, err)
 	}
-	files := []string{rel, "wiki/index.md", "wiki/log.md"}
-	err = writeFileAtomic(full, []byte(text))
+	w := memoryWrites{}
+	err = w.write(dir, rel, []byte(text))
 	if err == nil {
-		err = writeIndexAndLog(dir, fmt.Sprintf("[%s] record | %s %s | %s @ %s", today, p.Feature, version, p.OutcomeID, short))
+		err = writeIndexAndLog(dir, w, fmt.Sprintf("[%s] record | %s %s | %s @ %s", today, p.Feature, version, p.OutcomeID, short))
 	}
 	if err == nil {
-		err = commitMemory(dir, files, fmt.Sprintf("record %s %s (%s)", p.Feature, version, p.OutcomeID), marker, "AEH-Version: "+version)
+		err = w.commit(dir, fmt.Sprintf("record %s %s (%s)", p.Feature, version, p.OutcomeID), marker, "AEH-Version: "+version)
 	}
 	if err != nil {
-		restoreMemory(dir, files)
-		return "", "", fmt.Errorf("record %s: %w", p.OutcomeID, err)
+		return "", "", fmt.Errorf("record %s: %w", p.OutcomeID, w.restore(dir, err))
 	}
 	memoryCommit, err = git(dir, "rev-parse", "HEAD")
 	return version, memoryCommit, err
@@ -420,7 +420,9 @@ func findRecord(dir, marker string) (version, commit string, ok bool, err error)
 }
 
 // Pending records live next to the outcome state, so `aeh memory record <ID>` can retry them.
-func pendingPath(r Repo, id string) string { return filepath.Join(r.StateDir(), id+".memory.json") }
+// They are kept out of the state directory, which holds only outcome states.
+func pendingDir(r Repo) string             { return filepath.Join(r.Root, ".aeh", "pending") }
+func pendingPath(r Repo, id string) string { return filepath.Join(pendingDir(r), id+".json") }
 
 // SavePending stores a record that still has to reach memory.
 func SavePending(r Repo, p PendingRecord) error {
@@ -466,13 +468,13 @@ func ClearPending(r Repo, id string) error {
 
 // ListPending returns every pending record of this checkout.
 func ListPending(r Repo) ([]PendingRecord, error) {
-	matches, err := filepath.Glob(filepath.Join(r.StateDir(), "*.memory.json"))
+	matches, err := filepath.Glob(filepath.Join(pendingDir(r), "*.json"))
 	if err != nil {
 		return nil, err
 	}
 	var out []PendingRecord
 	for _, m := range matches {
-		id := strings.TrimSuffix(filepath.Base(m), ".memory.json")
+		id := strings.TrimSuffix(filepath.Base(m), ".json")
 		p, ok, err := LoadPending(r, id)
 		if err != nil {
 			return out, err
@@ -810,12 +812,12 @@ func renderIndex(specs []Spec) string {
 	return b.String()
 }
 
-func writeIndexAndLog(dir, logEntry string) error {
+func writeIndexAndLog(dir string, w memoryWrites, logEntry string) error {
 	snap, err := loadMemoryDir(dir)
 	if err != nil {
 		return err
 	}
-	if err := writeFileAtomic(filepath.Join(dir, "wiki", "index.md"), []byte(renderIndex(snap.Specs))); err != nil {
+	if err := w.write(dir, "wiki/index.md", []byte(renderIndex(snap.Specs))); err != nil {
 		return err
 	}
 	logPath := filepath.Join(dir, "wiki", "log.md")
@@ -827,7 +829,20 @@ func writeIndexAndLog(dir, logEntry string) error {
 		b = append(b, '\n')
 	}
 	b = append(b, []byte("\n## "+logEntry+"\n")...)
-	return writeFileAtomic(logPath, b)
+	return w.write(dir, "wiki/log.md", b)
+}
+
+// commit stages exactly the files this command wrote, after checking nobody changed them.
+func (w memoryWrites) commit(dir, subject string, trailers ...string) error {
+	files := make([]string, 0, len(w))
+	for rel, wrote := range w {
+		if now, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(rel))); err != nil || !bytes.Equal(now, wrote) {
+			return fmt.Errorf("memory commit: %s changed while aeh was writing it", rel)
+		}
+		files = append(files, rel)
+	}
+	sort.Strings(files)
+	return commitMemory(dir, files, subject, trailers...)
 }
 
 func commitMemory(dir string, files []string, subject string, trailers ...string) error {
@@ -844,19 +859,55 @@ func commitMemory(dir string, files []string, subject string, trailers ...string
 	return nil
 }
 
-// restoreMemory undoes this command's uncommitted writes. Memory was clean when it started.
-func restoreMemory(dir string, files []string) {
-	_, _ = git(dir, append([]string{"reset", "-q", "HEAD", "--"}, files...)...)
-	for _, f := range files {
-		if _, err := git(dir, "cat-file", "-e", "HEAD:"+f); err == nil {
-			_, _ = git(dir, "checkout", "-q", "HEAD", "--", f)
+// memoryWrites remembers what this command wrote, so a rollback touches only its own work.
+type memoryWrites map[string][]byte
+
+func (w memoryWrites) write(dir, rel string, b []byte) error {
+	if err := writeFileAtomic(filepath.Join(dir, filepath.FromSlash(rel)), b); err != nil {
+		return err
+	}
+	w[rel] = b
+	return nil
+}
+
+// restore undoes this command's uncommitted writes. A file whose content is no longer what
+// this command wrote was edited by someone else meanwhile: it is kept and reported.
+func (w memoryWrites) restore(dir string, cause error) error {
+	var kept []string
+	for rel, wrote := range w {
+		full := filepath.Join(dir, filepath.FromSlash(rel))
+		if now, err := os.ReadFile(full); err != nil || !bytes.Equal(now, wrote) {
+			kept = append(kept, rel)
+			continue
+		}
+		_, _ = git(dir, "reset", "-q", "HEAD", "--", rel)
+		if _, err := git(dir, "cat-file", "-e", "HEAD:"+rel); err == nil {
+			_, _ = git(dir, "checkout", "-q", "HEAD", "--", rel)
 		} else {
-			_ = os.Remove(filepath.Join(dir, filepath.FromSlash(f)))
+			_ = os.Remove(full)
 		}
 	}
+	if len(kept) > 0 {
+		sort.Strings(kept)
+		return fmt.Errorf("%w; these files changed during the write and were left as they are, check them by hand: %s", cause, strings.Join(kept, ", "))
+	}
+	return cause
 }
 
 func memoryClean(dir string) error {
+	// assume-unchanged (lowercase tag) and skip-worktree (S) hide edits from status.
+	flags, err := git(dir, "ls-files", "-v")
+	if err != nil {
+		return fmt.Errorf("memory status: %w", err)
+	}
+	for _, line := range strings.Split(flags, "\n") {
+		if line != "" && (line[0] == 'S' || line[0] >= 'a' && line[0] <= 'z') {
+			return fmt.Errorf("%w: an index flag hides changes to %s; clear it with git update-index --no-assume-unchanged --no-skip-worktree", ErrMemoryDirty, line[2:])
+		}
+	}
+	if _, err := git(dir, "update-index", "-q", "--really-refresh"); err != nil {
+		return fmt.Errorf("memory status: %w", err)
+	}
 	out, err := git(dir, "status", "--porcelain", "--untracked-files=all")
 	if err != nil {
 		return fmt.Errorf("memory status: %w", err)
@@ -903,20 +954,22 @@ func checkProjectPrivacy(main string) error {
 	if tracked != "" {
 		return fmt.Errorf("memory privacy: the project tracks files under .aeh/; untrack them (git rm -r --cached .aeh) before using memory")
 	}
-	if _, err := git(main, "check-ignore", "-q", "--no-index", ".aeh/memory/wiki/index.md"); err != nil {
-		return errors.New("memory privacy: .aeh/ is not ignored by the project; add it to .gitignore (aeh init does)")
+	// The directory itself must be ignored: then Git never descends into it and no rule
+	// inside can re-include a file. A probe below it guards against odd patterns.
+	for _, probe := range []string{".aeh/", ".aeh/memory/wiki/features/probe/spec.md", ".aeh/pending/probe.json"} {
+		if _, err := git(main, "check-ignore", "-q", "--no-index", probe); err != nil {
+			return errors.New("memory privacy: the .aeh/ directory is not ignored by the project; add \".aeh/\" to .gitignore (aeh init does)")
+		}
 	}
 	return nil
 }
 
-// rejectLinksInside walks memory (not its .git) and fails on any link or reparse point.
+// rejectLinksInside walks memory, its .git included, and fails on any link or reparse point,
+// so no Git command or write can be redirected outside the memory directory.
 func rejectLinksInside(dir string) error {
 	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
-		}
-		if p == filepath.Join(dir, ".git") {
-			return filepath.SkipDir
 		}
 		info, err := os.Lstat(p)
 		if err != nil {
