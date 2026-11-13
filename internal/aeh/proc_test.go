@@ -37,11 +37,19 @@ func TestProcessTreeCancellation(t *testing.T) {
 				if err := listener.(*net.TCPListener).SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
 					t.Fatal(err)
 				}
-				parentTimeout := 5 * time.Second
+				parentTimeout := 10 * time.Second
 				if runner == "shell" && cause == "deadline" {
 					parentTimeout = 15 * time.Second // exercise the gate's own timeout
 				}
-				ctx, cancel := context.WithTimeout(context.Background(), parentTimeout)
+				var ctx context.Context
+				var cancel context.CancelFunc
+				if cause == "cancel" {
+					// Do not race readiness with a five-second deadline: process
+					// startup can take longer under load. Accept bounds readiness.
+					ctx, cancel = context.WithCancel(context.Background())
+				} else {
+					ctx, cancel = context.WithTimeout(context.Background(), parentTimeout)
+				}
 				defer cancel()
 				args := []string{exe, "-test.run=^TestProcessTreeHelper$", "--", "aeh-proc-helper", "2", listener.Addr().String()}
 				dir := t.TempDir()
@@ -67,7 +75,15 @@ func TestProcessTreeCancellation(t *testing.T) {
 							}
 						}
 						command := strings.Join(quoted, " ")
-						_, err = runShell(ctx, shellDir, command, 5*time.Second, nil)
+						timeout := 10 * time.Second
+						if cause == "cancel" {
+							timeout = 15 * time.Second // listener bounds startup to ten seconds
+						}
+						var output string
+						output, err = runShell(ctx, shellDir, command, timeout, nil)
+						if err != nil {
+							err = fmt.Errorf("run shell helper: %w\n%s", err, output)
+						}
 					}
 					done <- err
 				}()
@@ -75,6 +91,19 @@ func TestProcessTreeCancellation(t *testing.T) {
 				for i := 0; i < 3; i++ {
 					conn, err := listener.Accept()
 					if err != nil {
+						cancel()
+						select {
+						case runErr := <-done:
+							t.Logf("helper runner: %v", runErr)
+						case <-time.After(3 * time.Second):
+							t.Log("helper runner did not finish cleanup")
+						}
+						if output, readErr := os.ReadFile(filepath.Join(dir, "agent.out")); readErr == nil {
+							t.Logf("helper output: %s", output)
+						}
+						if output, readErr := os.ReadFile(filepath.Join(dir, "agent.err")); readErr == nil {
+							t.Logf("helper errors: %s", output)
+						}
 						t.Fatalf("wait for helper %d: %v", i, err)
 					}
 					t.Cleanup(func() { conn.Close() })
@@ -85,15 +114,8 @@ func TestProcessTreeCancellation(t *testing.T) {
 					if _, err := fmt.Fscanln(bufio.NewReader(conn), &pid); err != nil {
 						t.Fatalf("read helper PID: %v", err)
 					}
-					// Also clean up explicitly if the tree-kill assertion fails.
-					process, err := os.FindProcess(pid)
-					if err != nil {
-						t.Fatal(err)
-					}
-					t.Cleanup(func() {
-						_ = process.Kill()
-						_ = process.Release()
-					})
+					// Cancellation cleans up the job/group. Do not kill by PID here:
+					// Unix may reuse it before cleanup (darwin has no pidfd).
 					connections = append(connections, conn)
 				}
 				wantErr := context.DeadlineExceeded
