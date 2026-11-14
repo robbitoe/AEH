@@ -6,13 +6,19 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
 
-// Profile describes how to launch one agent CLI.
+// Profile describes how to launch one agent.
 // Command arguments may contain {{prompt}} and {{prompt_file}} placeholders.
+// Provider is a free name (openai, anthropic, lmstudio...) used to keep reviewers independent
+// from authors. Transport is how the agent is reached; only "cli" exists today, "api" is
+// reserved for a later stage.
 type Profile struct {
+	Provider       string            `yaml:"provider"`
+	Transport      string            `yaml:"transport"`
 	Command        []string          `yaml:"command"`
 	Env            map[string]string `yaml:"env"`
 	Stdin          bool              `yaml:"stdin"`
@@ -33,9 +39,14 @@ type Config struct {
 	Limits    struct {
 		MaxDiffLines int `yaml:"max_diff_lines"`
 	} `yaml:"limits"`
-	Ladder   []string `yaml:"ladder"`
-	Reviewer string   `yaml:"reviewer"`
-	Notify   struct {
+	Ladder    []string       `yaml:"ladder"`
+	Reviewer  string         `yaml:"reviewer"` // legacy: one reviewer for every role
+	Reviewers ReviewerPolicy `yaml:"reviewers"`
+	Triage    struct {
+		Profile string       `yaml:"profile"`
+		Rules   []TriageRule `yaml:"rules"`
+	} `yaml:"triage"`
+	Notify struct {
 		Webhook string `yaml:"webhook"`
 	} `yaml:"notify"`
 	Profiles map[string]Profile `yaml:"profiles"`
@@ -67,6 +78,8 @@ type Outcome struct {
 	Feature     string      `yaml:"feature,omitempty"`
 	Change      string      `yaml:"change,omitempty"`
 	Changelog   string      `yaml:"changelog,omitempty"`
+	Route       string      `yaml:"route,omitempty"`     // the owner's route; a floor that rules may raise
+	Reviewers   []string    `yaml:"reviewers,omitempty"` // roles to add, e.g. [dba]
 	Criteria    []Criterion `yaml:"criteria"`
 	Acceptance  []string    `yaml:"acceptance"`
 	Tasks       []Task      `yaml:"tasks"`
@@ -85,7 +98,64 @@ func (r Repo) LoadConfig() (Config, error) {
 	if err := yaml.Unmarshal(b, &c); err != nil {
 		return c, fmt.Errorf("parse config: %w", err)
 	}
+	declared, err := checkConfigYAML(b)
+	if err != nil {
+		return c, err
+	}
+	// Presence of the key, not the decoder, decides whether the legacy reviewer still applies.
+	c.Reviewers.declared = declared
 	return c, c.validate()
+}
+
+// checkConfigYAML rejects anchors, aliases, merge keys and explicit tags, and a reviewers key
+// whose value is not a plain mapping. The config decides who reviews; it must read the same to
+// the owner and to aeh. It reports whether the reviewers key is present: yaml.v3 skips
+// UnmarshalYAML for null values and null tags, so the decoder cannot be trusted to tell.
+func checkConfigYAML(b []byte) (reviewersDeclared bool, err error) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		return false, fmt.Errorf("parse config: %w", err)
+	}
+	var walk func(n *yaml.Node) error
+	walk = func(n *yaml.Node) error {
+		if n.Kind == yaml.AliasNode || n.Anchor != "" {
+			return fmt.Errorf("config: line %d: YAML anchors and aliases are not supported", n.Line)
+		}
+		if n.Style&yaml.TaggedStyle != 0 {
+			return fmt.Errorf("config: line %d: explicit YAML tags are not supported", n.Line)
+		}
+		if n.Kind == yaml.MappingNode {
+			for i := 0; i+1 < len(n.Content); i += 2 {
+				if n.Content[i].Value == "<<" && n.Content[i].Tag == "!!merge" {
+					return fmt.Errorf("config: line %d: YAML merge keys are not supported", n.Content[i].Line)
+				}
+			}
+		}
+		for _, c := range n.Content {
+			if err := walk(c); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walk(&doc); err != nil {
+		return false, err
+	}
+	if len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
+		return false, nil
+	}
+	m := doc.Content[0]
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value != "reviewers" {
+			continue
+		}
+		v := m.Content[i+1]
+		if v.Kind != yaml.MappingNode || v.Tag != "!!map" {
+			return false, errors.New("config: reviewers must be a mapping of independence and roles; remove the key to use the legacy reviewer")
+		}
+		reviewersDeclared = true
+	}
+	return reviewersDeclared, nil
 }
 
 func (c *Config) validate() error {
@@ -101,18 +171,84 @@ func (c *Config) validate() error {
 	if len(c.Ladder) == 0 {
 		return errors.New("config: ladder needs at least one profile")
 	}
+	onLadder := map[string]bool{}
 	for _, name := range c.Ladder {
+		if onLadder[name] {
+			return fmt.Errorf("config: profile %q appears twice in the ladder", name)
+		}
+		onLadder[name] = true
 		if err := c.checkProfile(name); err != nil {
 			return err
 		}
 	}
+	names := []string{}
 	if c.Reviewer != "" {
-		if err := c.checkProfile(c.Reviewer); err != nil {
+		names = append(names, c.Reviewer)
+	}
+	for _, role := range roleOrder {
+		names = append(names, c.Reviewers.list(role)...)
+	}
+	if c.Triage.Profile != "" {
+		names = append(names, c.Triage.Profile)
+	}
+	for _, name := range names {
+		if err := c.checkProfile(name); err != nil {
 			return err
 		}
 	}
+	switch c.Reviewers.Independence {
+	case "":
+		c.Reviewers.Independence = IndependenceProvider
+	case IndependenceProvider, IndependenceProfile:
+	default:
+		return fmt.Errorf("config: reviewers.independence %q must be provider or profile", c.Reviewers.Independence)
+	}
+	seen := map[string]bool{}
+	for i, rule := range c.Triage.Rules {
+		if err := rule.validate(); err != nil {
+			return fmt.Errorf("config: triage rule %d (%s): %w", i+1, rule.Name, err)
+		}
+		if seen[rule.Name] {
+			return fmt.Errorf("config: triage rule %q is defined twice", rule.Name)
+		}
+		seen[rule.Name] = true
+	}
+	for name := range c.Profiles {
+		p := c.Profiles[name]
+		switch p.Transport {
+		case "":
+			p.Transport = TransportCLI
+		case TransportCLI:
+		case TransportAPI:
+			return fmt.Errorf("config: profile %q: transport api is not supported yet", name)
+		default:
+			return fmt.Errorf("config: profile %q: transport %q must be cli", name, p.Transport)
+		}
+		if !validProvider(p.Provider) {
+			return fmt.Errorf("config: profile %q: provider must be one word of printable characters without spaces", name)
+		}
+		c.Profiles[name] = p
+	}
 	return nil
 }
+
+// validProvider accepts an empty provider (not declared) or one word of printable,
+// non-space characters.
+func validProvider(s string) bool {
+	for _, r := range s {
+		if unicode.IsSpace(r) || !unicode.IsPrint(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// Transports a profile can use. Validation lets only cli through, and runAgent launches it;
+// an api transport would be one more branch there, with its own proposal.
+const (
+	TransportCLI = "cli"
+	TransportAPI = "api" // reserved
+)
 
 func (c Config) checkProfile(name string) error {
 	p, ok := c.Profiles[name]
@@ -181,6 +317,14 @@ func (o *Outcome) normalize() error {
 	}
 	if o.Level >= 2 && len(o.Acceptance) == 0 {
 		return fmt.Errorf("outcome %s: level 2 needs acceptance test paths", o.ID)
+	}
+	if o.Route != "" && !validRoute(o.Route) {
+		return fmt.Errorf("outcome %s: route %q must be trivial, change or new", o.ID, o.Route)
+	}
+	for _, role := range o.Reviewers {
+		if !validRole(role) {
+			return fmt.Errorf("outcome %s: reviewer role %q must be qa, security or dba", o.ID, role)
+		}
 	}
 	if len(o.Tasks) == 0 {
 		goal := o.Title

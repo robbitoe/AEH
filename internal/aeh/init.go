@@ -31,22 +31,48 @@ limits:
 # retries once with feedback, then tries the next profile, then blocks.
 ladder: [medio, fuerte]
 
-# Level 2 requires a separate reviewer profile with plain-text final output.
-reviewer: codex-review
+# Triage classifies each outcome before any agent runs. The route decides who reviews:
+#   trivial -> qa;  change and new -> qa + security.  Rules may raise the route or add
+# reviewers (never lower or remove them). Without a triage profile and without a route
+# declared in the outcome, the route is "change". If triage fails, the route is "new".
+triage:
+  profile: codex-review
+  # Example rules; adjust the paths to where this project keeps its data model and auth.
+  # "**" matches any number of directories; a match on a directory covers everything below.
+  rules:
+    - name: data
+      paths: ["**/migrations", "**/*.sql", "db"]
+      route: new
+      reviewers: [dba]
+    - name: auth
+      paths: ["**/auth", "**/security"]
+      route: new
+      reviewers: [security]
+
+# Reviewer profiles per role, in order of preference. For each review aeh takes the first
+# profile that is independent from the author of the change. Reviewers need plain-text output.
+reviewers:
+  independence: provider   # provider: another provider than the author; profile: any other profile
+  qa: [claude-review, codex-review]
+  security: [codex-review, claude-review]
+  dba: [claude-review, codex-review]
 
 notify:
   webhook: ""          # POST {event, outcome, title, message} when an outcome blocks or is accepted
 
-# How each agent CLI is launched. {{prompt}} is replaced with the prompt text,
-# {{prompt_file}} with a file holding it; set stdin: true to pipe it instead.
-# Check the flags against the CLI version you have installed.
+# How each agent is launched. provider is a free name used to keep reviewers independent
+# from authors; transport is "cli" (an "api" transport is planned, not available yet).
+# {{prompt}} is replaced with the prompt text, {{prompt_file}} with a file holding it;
+# set stdin: true to pipe it instead. Check the flags against the CLI version you have installed.
 profiles:
   medio:
+    provider: openai
     command: ["codex", "exec", "--sandbox", "workspace-write", "--json", "-"]
     stdin: true
     timeout_minutes: 30
     # quota_exit_codes: []  # Set only when the CLI documents a distinct quota exit code.
   codex-review:
+    provider: openai
     command: ["codex", "exec", "--sandbox", "read-only", "-"]
     stdin: true
     timeout_minutes: 15
@@ -57,17 +83,20 @@ profiles:
   # acceptEdits lets it edit files; to let it run your tests too, add for example
   # "--allowedTools", "Bash(npm test:*)".
   fuerte:
+    provider: anthropic
     command: ["claude", "-p", "--safe-mode", "--permission-mode", "acceptEdits", "--permission-prompts", "none", "--output-format", "json"]
     stdin: true
     timeout_minutes: 30
-  # Read-only Claude reviewer; use it as "reviewer" when Codex implements.
+  # Read-only Claude reviewer; it reviews what Codex implements.
   claude-review:
+    provider: anthropic
     command: ["claude", "-p", "--safe-mode", "--tools", "Read,Grep,Glob", "--permission-prompts", "none", "--output-format", "text"]
     stdin: true
     timeout_minutes: 15
   # A local model through LM Studio's Anthropic-compatible endpoint. Use the port your
   # server listens on and a model id it has loaded.
   local:
+    provider: lmstudio
     command: ["claude", "-p", "--safe-mode", "--permission-mode", "acceptEdits", "--permission-prompts", "none", "--model", "qwen/qwen3-4b-2507"]
     stdin: true
     env:
@@ -76,7 +105,8 @@ profiles:
     timeout_minutes: 30
 `
 
-const outcomeExample = `# Copy to OUT-001.yaml and edit. Level 2 = sealed tests + review; level 1 = gates only.
+const outcomeExample = `# Copy to OUT-001.yaml and edit. Level 2 = sealed acceptance tests; level 1 = gates without them.
+# Every outcome is reviewed; the route (trivial, change, new) decides by whom.
 id: OUT-001
 title: The administrator generates the month's fees without duplicate charges
 level: 2
@@ -91,6 +121,11 @@ criteria:
   - given: the March fees were already generated
     when: the administrator generates them again
     then: no unit has more than one fee for March
+
+# Optional. Your route for this outcome: triage does not run, and rules may still raise it.
+# route: change
+# Optional. Reviewer roles to add to the route's, e.g. when the data model lives in entities.
+# reviewers: [dba]
 
 # Acceptance tests you approve with "aeh tests approve OUT-001". Agents can never change them.
 acceptance:

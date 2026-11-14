@@ -118,7 +118,7 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer) (Sta
 		return st, fmt.Errorf("load implementation prompt: %w", err)
 	}
 	if o.Level >= 2 {
-		if ru.reviewPrompt, err = loadPrompt(r, "review.md"); err != nil {
+		if ru.reviewPrompt, _, err = loadReviewPrompt(r, RoleQA); err != nil {
 			return st, fmt.Errorf("load review prompt: %w", err)
 		}
 	}
