@@ -98,25 +98,31 @@ func (r Repo) LoadConfig() (Config, error) {
 	if err := yaml.Unmarshal(b, &c); err != nil {
 		return c, fmt.Errorf("parse config: %w", err)
 	}
-	if err := checkConfigYAML(b); err != nil {
+	declared, err := checkConfigYAML(b)
+	if err != nil {
 		return c, err
 	}
+	// Presence of the key, not the decoder, decides whether the legacy reviewer still applies.
+	c.Reviewers.declared = declared
 	return c, c.validate()
 }
 
-// checkConfigYAML rejects anchors, aliases and merge keys, and a reviewers key whose value is
-// not a mapping. The config decides who reviews; it must read the same to the owner and to aeh.
-// yaml.v3 does not call UnmarshalYAML for null, so "reviewers:", "reviewers: ~" and
-// "reviewers: null" would otherwise leave the legacy reviewer in charge of every role.
-func checkConfigYAML(b []byte) error {
+// checkConfigYAML rejects anchors, aliases, merge keys and explicit tags, and a reviewers key
+// whose value is not a plain mapping. The config decides who reviews; it must read the same to
+// the owner and to aeh. It reports whether the reviewers key is present: yaml.v3 skips
+// UnmarshalYAML for null values and null tags, so the decoder cannot be trusted to tell.
+func checkConfigYAML(b []byte) (reviewersDeclared bool, err error) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(b, &doc); err != nil {
-		return fmt.Errorf("parse config: %w", err)
+		return false, fmt.Errorf("parse config: %w", err)
 	}
 	var walk func(n *yaml.Node) error
 	walk = func(n *yaml.Node) error {
 		if n.Kind == yaml.AliasNode || n.Anchor != "" {
 			return fmt.Errorf("config: line %d: YAML anchors and aliases are not supported", n.Line)
+		}
+		if n.Style&yaml.TaggedStyle != 0 {
+			return fmt.Errorf("config: line %d: explicit YAML tags are not supported", n.Line)
 		}
 		if n.Kind == yaml.MappingNode {
 			for i := 0; i+1 < len(n.Content); i += 2 {
@@ -133,18 +139,23 @@ func checkConfigYAML(b []byte) error {
 		return nil
 	}
 	if err := walk(&doc); err != nil {
-		return err
+		return false, err
 	}
 	if len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
-		return nil
+		return false, nil
 	}
 	m := doc.Content[0]
 	for i := 0; i+1 < len(m.Content); i += 2 {
-		if m.Content[i].Value == "reviewers" && m.Content[i+1].Kind != yaml.MappingNode {
-			return errors.New("config: reviewers must be a mapping of independence and roles; remove the key to use the legacy reviewer")
+		if m.Content[i].Value != "reviewers" {
+			continue
 		}
+		v := m.Content[i+1]
+		if v.Kind != yaml.MappingNode || v.Tag != "!!map" {
+			return false, errors.New("config: reviewers must be a mapping of independence and roles; remove the key to use the legacy reviewer")
+		}
+		reviewersDeclared = true
 	}
-	return nil
+	return reviewersDeclared, nil
 }
 
 func (c *Config) validate() error {

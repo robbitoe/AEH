@@ -319,8 +319,8 @@ type ReviewerPolicy struct {
 	declared bool
 }
 
-// UnmarshalYAML marks the section as declared and rejects unknown keys, so a misspelled
-// role cannot silently drop a review.
+// UnmarshalYAML rejects unknown keys, so a misspelled role cannot silently drop a review.
+// LoadConfig decides declared from the document itself; setting it here covers direct decoding.
 func (p *ReviewerPolicy) UnmarshalYAML(n *yaml.Node) error {
 	if n.Kind != yaml.MappingNode {
 		return fmt.Errorf("reviewers must be a mapping of independence and roles")
