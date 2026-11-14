@@ -22,6 +22,10 @@ func TestParseCriteria(t *testing.T) {
 		{"fenced heading lookalike", "```\n## Acceptance criteria\n- AC-1: x\n```\n## Changelog\n", nil, false},
 		{"crlf and trailing spaces", "## Acceptance criteria  \r\n- AC-1: Pays.  \r\n## Changelog\r\n", []SpecCriterion{{1, "Pays."}}, true},
 		{"ends at first-level heading", "## Acceptance criteria\n- AC-1: Pays.\n# Appendix\n- anything\n", []SpecCriterion{{1, "Pays."}}, true},
+		{"closing hashes and indent", "  ## Acceptance criteria ##\n- AC-1: Pays.\n\nSome prose.\n## Changelog\n", []SpecCriterion{{1, "Pays."}}, true},
+		{"million", "## Acceptance criteria\n- AC-1000000: Pays.\n", []SpecCriterion{{1000000, "Pays."}}, true},
+		{"html without section", "<!-- note -->\nText.\n", nil, false},
+		{"prose after blank", "## Acceptance criteria\n- AC-1: Pays.\n\nThis explains AC rules in general.\n", []SpecCriterion{{1, "Pays."}}, true},
 	}
 	for _, c := range ok {
 		got, present, err := parseCriteria(c.body)
@@ -30,20 +34,33 @@ func TestParseCriteria(t *testing.T) {
 		}
 	}
 	bad := map[string]string{
-		"leading zero":      "## Acceptance criteria\n- AC-01: x\n",
-		"zero":              "## Acceptance criteria\n- AC-0: x\n",
-		"duplicate":         "## Acceptance criteria\n- AC-1: x\n- AC-1: y\n",
-		"no text":           "## Acceptance criteria\n- AC-1:   \n",
-		"other bullet":      "## Acceptance criteria\n- AC-1: x\n* AC-2: y\n",
-		"plain bullet":      "## Acceptance criteria\n- AC-1: x\n- also this\n",
-		"numbered":          "## Acceptance criteria\n1. AC-1: x\n",
-		"continuation":      "## Acceptance criteria\n- AC-1: x\n  and more\n",
-		"tab continuation":  "## Acceptance criteria\n- AC-1: x\n\tand more\n",
-		"observed reserved": "## Acceptance criteria\n- AC-1 (observed): x\n",
-		"empty section":     "## Acceptance criteria\nNothing yet.\n## Changelog\n",
-		"two sections":      "## Acceptance criteria\n- AC-1: x\n## Acceptance criteria\n- AC-2: y\n",
-		"sub heading":       "## Acceptance criteria\n- AC-1: x\n### More\n- AC-2: y\n",
-		"no space":          "## Acceptance criteria\n- AC-1:x\n",
+		"leading zero":       "## Acceptance criteria\n- AC-01: x\n",
+		"zero":               "## Acceptance criteria\n- AC-0: x\n",
+		"duplicate":          "## Acceptance criteria\n- AC-1: x\n- AC-1: y\n",
+		"no text":            "## Acceptance criteria\n- AC-1:   \n",
+		"other bullet":       "## Acceptance criteria\n- AC-1: x\n* AC-2: y\n",
+		"plain bullet":       "## Acceptance criteria\n- AC-1: x\n- also this\n",
+		"numbered":           "## Acceptance criteria\n1. AC-1: x\n",
+		"continuation":       "## Acceptance criteria\n- AC-1: x\n  and more\n",
+		"tab continuation":   "## Acceptance criteria\n- AC-1: x\n\tand more\n",
+		"observed reserved":  "## Acceptance criteria\n- AC-1 (observed): x\n",
+		"empty section":      "## Acceptance criteria\nNothing yet.\n## Changelog\n",
+		"two sections":       "## Acceptance criteria\n- AC-1: x\n## Acceptance criteria\n- AC-2: y\n",
+		"sub heading":        "## Acceptance criteria\n- AC-1: x\n### More\n- AC-2: y\n",
+		"no space":           "## Acceptance criteria\n- AC-1:x\n",
+		"html comment hides": "## Acceptance criteria\n- AC-1: x\n<!--\n- AC-2: hidden\n-->\n",
+		"comment hides head": "## Acceptance criteria\n- AC-1: x\n<!-- ## Notes -->\n- AC-2: y\n",
+		"html block":         "<div>\n\n## Acceptance criteria\n- AC-1: x\n</div>\n",
+		"setext heading":     "## Acceptance criteria\n- AC-1: x\n\nNotes\n---\n- AC-2: y\n",
+		"thematic break":     "## Acceptance criteria\n- AC-1: x\n\n***\n",
+		"lazy continuation":  "## Acceptance criteria\n- AC-1: Reject unauthenticated requests\nexcept requests to /public.\n",
+		"quote":              "## Acceptance criteria\n- AC-1: x\n> - AC-2: y\n",
+		"nbsp bullet":        "## Acceptance criteria\n- AC-1: x\n- AC-2: y\n",
+		"table mention":      "## Acceptance criteria\n- AC-1: x\n\n| AC-2 | y |\n",
+		"indented heading":   "## Acceptance criteria\n- AC-1: x\n   ## Notes\n- AC-2: y\n", // AC-2 lands outside the section
+		"stray criterion":    "- AC-2: y\n\n## Acceptance criteria\n- AC-1: x\n",
+		"huge id":            "## Acceptance criteria\n- AC-99999999999999999999: x\n",
+		"sub heading 4":      "## Acceptance criteria\n- AC-1: x\n#### More\n",
 	}
 	for name, body := range bad {
 		if _, _, err := parseCriteria(body); err == nil {
@@ -70,8 +87,8 @@ func TestCriteriaDelta(t *testing.T) {
 	}
 }
 
-func TestCriteriaIdentity(t *testing.T) {
-	s := Spec{Approval: &SpecApproval{Criteria: []int{1, 2}, MaxCriterion: 3}}
+func TestCriteriaIdentityCheck(t *testing.T) {
+	id := criteriaIdentity{Known: map[int]bool{1: true, 2: true}, High: 3}
 	for _, c := range []struct {
 		ids []int
 		ok  bool
@@ -83,20 +100,12 @@ func TestCriteriaIdentity(t *testing.T) {
 		{[]int{1, 2, 3}, false},
 	} {
 		var crit []SpecCriterion
-		for _, id := range c.ids {
-			crit = append(crit, SpecCriterion{ID: id, Text: "x"})
+		for _, n := range c.ids {
+			crit = append(crit, SpecCriterion{ID: n, Text: "x"})
 		}
-		if err := checkCriteriaIdentity(s, crit); (err == nil) != c.ok {
+		if err := id.check(crit); (err == nil) != c.ok {
 			t.Errorf("ids %v: err %v, want ok=%v", c.ids, err, c.ok)
 		}
-	}
-	// An implementation raises the mark and its IDs stay known.
-	s.Implemented = []Implementation{{MaxCriterion: 5, Criteria: []ImplementedCriterion{{ID: 5, Text: "x"}}}}
-	if err := checkCriteriaIdentity(s, []SpecCriterion{{5, "y"}}); err != nil {
-		t.Errorf("implemented id must stay known: %v", err)
-	}
-	if err := checkCriteriaIdentity(s, []SpecCriterion{{4, "y"}}); err == nil {
-		t.Error("4 is below the implementation's mark")
 	}
 }
 
@@ -147,6 +156,31 @@ func TestApproveRecordsCriteriaAndRetiresNumbers(t *testing.T) {
 	if err != nil || !strings.Contains(strings.Join(errs, "\n"), "reuses a retired") {
 		t.Fatalf("lint must report the reuse: %v %v", errs, err)
 	}
+	// Lowering max_criterion and dropping criteria in a committed hand edit frees nothing:
+	// identity comes from memory's history.
+	dir := memDir(t, r)
+	ap := filepath.Join(dir, "wiki", "features", "checkout", approvalFile)
+	original := readFile(t, ap)
+	for _, forged := range []string{
+		strings.Replace(original, "max_criterion: 2", "max_criterion: 1", 1),                              // lower the mark
+		strings.Replace(original, "criteria: [1]", "criteria: [1, 2]", 1),                                 // vouch for 2
+		strings.Replace(strings.Replace(original, "criteria: [1]\n", "", 1), "max_criterion: 2\n", "", 1), // drop both
+	} {
+		if forged == original {
+			t.Fatalf("forgery did not apply: %s", original)
+		}
+		if err := os.WriteFile(ap, []byte(forged), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "forge approval")
+		if _, _, err := ApproveSpec(r, "checkout"); err == nil || !strings.Contains(err.Error(), "AC-3") {
+			t.Fatalf("a forged approval file freed a retired number: %v\n%s", err, forged)
+		}
+	}
+	if err := os.WriteFile(ap, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "restore approval")
 	editSpec(t, r, "checkout", "- AC-2: Reused.", "- AC-3: New.")
 	if _, _, err := ApproveSpec(r, "checkout"); err != nil {
 		t.Fatal(err)
@@ -258,6 +292,73 @@ func TestRecordWritesImplementation(t *testing.T) {
 	}
 	if err := memoryClean(dir); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// An ID an implementation had stays retired once a later approval removes it.
+func TestImplementationDoesNotReviveRetiredIDs(t *testing.T) {
+	r := newMemoryProject(t)
+	if _, err := CreateSpec(r, "checkout", "Checkout", []string{"src/checkout/**"}); err != nil {
+		t.Fatal(err)
+	}
+	describeSpec(t, r, "checkout", twoCriteria)
+	spec, _, err := ApproveSpec(r, "checkout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordImplementation(t, r, spec, "checkout-v0_1_0", fakeSHA('a'))
+	editSpec(t, r, "checkout", "- AC-2: Given a failed payment, when retried, then no second charge.\n", "")
+	if _, _, err := ApproveSpec(r, "checkout"); err != nil {
+		t.Fatal(err)
+	}
+	editSpec(t, r, "checkout", "then one order is created.\n", "then one order is created.\n- AC-2: Different text.\n")
+	if _, _, err := ApproveSpec(r, "checkout"); err == nil || !strings.Contains(err.Error(), "AC-3") {
+		t.Fatalf("the implementation revived retired AC-2: %v", err)
+	}
+	// Truncating implemented.yaml in a commit does not lower the mark either.
+	editSpec(t, r, "checkout", "- AC-2: Different text.\n", "")
+	dir := memDir(t, r)
+	if err := os.Remove(filepath.Join(dir, "wiki", "features", "checkout", implementedFile)); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "drop implementations")
+	editSpec(t, r, "checkout", "then one order is created.\n", "then one order is created.\n- AC-2: Again.\n")
+	if _, _, err := ApproveSpec(r, "checkout"); err == nil || !strings.Contains(err.Error(), "AC-3") {
+		t.Fatalf("dropping implemented.yaml freed AC-2: %v", err)
+	}
+}
+
+func recordImplementation(t *testing.T, r Repo, spec Spec, outcome, sha string) {
+	t.Helper()
+	crit, _, err := spec.Criteria()
+	if err != nil {
+		t.Fatal(err)
+	}
+	im := Implementation{Outcome: outcome, Approval: spec.Approval.Content, Code: sha}
+	for _, c := range crit {
+		im.Criteria = append(im.Criteria, ImplementedCriterion{ID: c.ID, Text: c.Text, Tests: []string{"tests/acceptance/" + outcome + "/ac.test.js"}})
+	}
+	p := PendingRecord{OutcomeID: outcome, Feature: spec.Feature, Change: "minor", Note: "Done.", Commit: sha, Implementation: &im}
+	if _, _, err := RecordChange(r, p, ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// An approved spec without criteria cannot record an implementation, and does not panic.
+func TestImplementationNeedsCriteria(t *testing.T) {
+	r := newMemoryProject(t)
+	if _, err := CreateSpec(r, "checkout", "Checkout", []string{"src/checkout/**"}); err != nil {
+		t.Fatal(err)
+	}
+	describeSpec(t, r, "checkout", "Pays once.")
+	spec, _, err := ApproveSpec(r, "checkout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	im := Implementation{Outcome: "checkout-v0_1_0", Approval: spec.Approval.Content, Code: fakeSHA('a')}
+	p := PendingRecord{OutcomeID: im.Outcome, Feature: "checkout", Change: "minor", Note: "Done.", Commit: im.Code, Implementation: &im}
+	if _, _, err := RecordChange(r, p, ""); err == nil || !strings.Contains(err.Error(), "no acceptance criteria") {
+		t.Fatalf("recorded an implementation without criteria: %v", err)
 	}
 }
 

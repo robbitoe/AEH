@@ -615,10 +615,7 @@ func ApproveSpec(r Repo, feature string) (Spec, bool, error) {
 	}
 	// Criteria are checked before the already-approved shortcut, so an approval never stands
 	// for criteria aeh cannot plan from.
-	crit, _, err := spec.Criteria()
-	if err == nil {
-		err = checkCriteriaIdentity(spec, crit)
-	}
+	crit, ident, err := checkSpecCriteria(snap.Dir, spec)
 	if err != nil {
 		return Spec{}, false, fmt.Errorf("approve %s: acceptance criteria: %w", feature, err)
 	}
@@ -629,7 +626,7 @@ func ApproveSpec(r Repo, feature string) (Spec, bool, error) {
 		return Spec{}, false, fmt.Errorf("approve %s: the spec still has the placeholder text; describe the feature first", feature)
 	}
 	today := memoryNow().UTC().Format("2006-01-02")
-	a := SpecApproval{Version: spec.Version, Content: approvalDigest(spec.Title, spec.Paths, spec.Body), Date: today, MaxCriterion: criteriaHighWater(spec)}
+	a := SpecApproval{Version: spec.Version, Content: approvalDigest(spec.Title, spec.Paths, spec.Body), Date: today, MaxCriterion: ident.High}
 	for _, c := range crit {
 		a.Criteria = append(a.Criteria, c.ID)
 		if c.ID > a.MaxCriterion {
@@ -726,7 +723,7 @@ func RecordChange(r Repo, p PendingRecord, expectedFingerprint string) (version,
 	}
 	var implemented []byte
 	if p.Implementation != nil {
-		if implemented, err = implementationRecord(spec, p); err != nil {
+		if implemented, err = implementationRecord(dir, spec, p); err != nil {
 			return "", "", fmt.Errorf("record %s: %w", p.OutcomeID, err)
 		}
 	}
@@ -761,7 +758,7 @@ func RecordChange(r Repo, p PendingRecord, expectedFingerprint string) (version,
 // implementationRecord checks an implementation against the spec it claims to implement and
 // returns the feature's implementation file with it appended. The spec must still read as the
 // owner approved it and planned it, and the criteria must be exactly the spec's.
-func implementationRecord(spec Spec, p PendingRecord) ([]byte, error) {
+func implementationRecord(dir string, spec Spec, p PendingRecord) ([]byte, error) {
 	im := *p.Implementation
 	if im.Outcome != p.OutcomeID || im.Code != p.Commit {
 		return nil, errors.New("implementation does not match the recorded outcome and commit")
@@ -769,9 +766,12 @@ func implementationRecord(spec Spec, p PendingRecord) ([]byte, error) {
 	if !spec.Approved() || spec.Approval.Content != im.Approval {
 		return nil, fmt.Errorf("feature %s no longer reads as the approved spec that was planned", spec.Feature)
 	}
-	crit, _, err := spec.Criteria()
+	crit, ident, err := checkSpecCriteria(dir, spec)
 	if err != nil {
 		return nil, fmt.Errorf("feature %s: acceptance criteria: %w", spec.Feature, err)
+	}
+	if len(crit) == 0 {
+		return nil, fmt.Errorf("feature %s has no acceptance criteria to implement", spec.Feature)
 	}
 	sort.Slice(crit, func(i, j int) bool { return crit[i].ID < crit[j].ID })
 	if len(crit) != len(im.Criteria) {
@@ -782,7 +782,7 @@ func implementationRecord(spec Spec, p PendingRecord) ([]byte, error) {
 			return nil, fmt.Errorf("implementation criterion %d differs from the approved AC-%d", im.Criteria[i].ID, c.ID)
 		}
 	}
-	im.MaxCriterion = criteriaHighWater(spec)
+	im.MaxCriterion = ident.High
 	if n := crit[len(crit)-1].ID; n > im.MaxCriterion {
 		im.MaxCriterion = n
 	}
@@ -975,11 +975,7 @@ func LintMemory(r Repo) (errs, warnings []string, err error) {
 		}
 	}
 	for _, s := range snap.Specs {
-		crit, _, cerr := s.Criteria()
-		if cerr == nil {
-			cerr = checkCriteriaIdentity(s, crit)
-		}
-		if cerr != nil {
+		if _, _, cerr := checkSpecCriteria(snap.Dir, s); cerr != nil {
 			errs = append(errs, fmt.Sprintf("feature %s: acceptance criteria: %v", s.Feature, cerr))
 		}
 		if s.Approval != nil && !s.Approved() {
