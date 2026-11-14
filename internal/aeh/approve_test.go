@@ -161,6 +161,14 @@ func TestSpecTextStopsAtChangelog(t *testing.T) {
 	if got := specText(tilde); got != "# X\n~~~\n```\n## Changelog\n~~~\n" {
 		t.Errorf("tilde fence: %q", got)
 	}
+	// Only spaces or tabs may follow a closing fence; a non-breaking space does not close it.
+	nbsp := "# X\n```md\n```\u00a0\n## Changelog\nRequirement A.\n```\n## Changelog\n"
+	if got, want := specText(nbsp), strings.TrimSuffix(nbsp, "## Changelog\n"); got != want {
+		t.Errorf("nbsp after fence: specText = %q, want %q", got, want)
+	}
+	if got := specText("# X\n```\nA\n``` \t\n## Changelog\n"); got != "# X\n```\nA\n``` \t\n" {
+		t.Errorf("spaces and tabs after a closing fence: %q", got)
+	}
 	if err := checkChangelog("# X\n````\n```\n## Changelog\n````\n## Notes\n"); err == nil {
 		t.Error("a changelog heading inside a fence must not satisfy checkChangelog")
 	}

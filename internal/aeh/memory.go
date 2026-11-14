@@ -147,7 +147,7 @@ func (f *codeFence) step(line string) bool {
 		f.char, f.n = c, n
 		return true
 	}
-	if c == f.char && n >= f.n && strings.TrimSpace(rest) == "" {
+	if c == f.char && n >= f.n && strings.Trim(rest, " \t") == "" { // only spaces or tabs may follow a closing fence
 		f.n = 0
 	}
 	return true

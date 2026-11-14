@@ -98,7 +98,30 @@ func (r Repo) LoadConfig() (Config, error) {
 	if err := yaml.Unmarshal(b, &c); err != nil {
 		return c, fmt.Errorf("parse config: %w", err)
 	}
+	if err := checkReviewersSection(b); err != nil {
+		return c, err
+	}
 	return c, c.validate()
+}
+
+// checkReviewersSection rejects a reviewers key whose value is not a mapping. yaml.v3 does not
+// call UnmarshalYAML for null, so "reviewers:", "reviewers: ~" and "reviewers: null" would
+// otherwise leave the legacy reviewer in charge of every role.
+func checkReviewersSection(b []byte) error {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	if len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
+		return nil
+	}
+	m := doc.Content[0]
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == "reviewers" && m.Content[i+1].Kind != yaml.MappingNode {
+			return errors.New("config: reviewers must be a mapping of independence and roles; remove the key to use the legacy reviewer")
+		}
+	}
+	return nil
 }
 
 func (c *Config) validate() error {
