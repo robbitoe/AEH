@@ -30,11 +30,7 @@ type SpecCriterion struct {
 var (
 	criterionLine = regexp.MustCompile(`^- AC-([1-9][0-9]*): (.*)$`)
 	observedLine  = regexp.MustCompile(`^- AC-[0-9]+ \(observed\):`)
-	strayLine     = regexp.MustCompile(`(?i)^\s*(?:>\s*)*(?:[-*+]|[0-9]+[.)])\s+AC-[0-9]`)
-	htmlStart     = regexp.MustCompile(`<[A-Za-z/!?]`)
-	// A URI or email autolink, or an angle-bracketed link destination: Markdown, not HTML.
-	// "<!--" is rejected before this exemption applies, so "<!--@x>" cannot pass as an email.
-	notHTML = regexp.MustCompile(`<[A-Za-z][A-Za-z0-9+.\-]{1,31}:[^\s<>]*>|<[A-Za-z0-9][A-Za-z0-9.+_\-]*@[A-Za-z0-9.\-]+>|\]\(<[^<>\n]*>|^\[[^\]]+\]:[ \t]*<[^<>\n]*>`)
+	strayLine     = regexp.MustCompile(`(?i)\bAC-[0-9]+\s*(?:\(observed\)\s*)?:`)
 )
 
 // headingAt0 returns a column-0 ATX heading as its level and text (closing hashes removed),
@@ -141,18 +137,10 @@ func normalizeCriterion(text string) string {
 	return b.String()
 }
 
-// hasRawHTML reports raw HTML outside inline code. "<!--" counts anywhere, code spans
-// included, because it is checked before any exemption.
-func hasRawHTML(line string) bool {
-	if strings.Contains(line, "<!--") {
-		return true
-	}
-	for _, seg := range splitCodeSpans(line) {
-		if !seg.code && htmlStart.MatchString(notHTML.ReplaceAllString(seg.text, "")) {
-			return true
-		}
-	}
-	return false
+// isCriteriaHeadingText reports text that reads as "Acceptance criteria" once markers are
+// removed, in any case: a second, differently written section the owner would take as real.
+func isCriteriaHeadingText(line string) bool {
+	return strings.EqualFold(strings.Trim(line, "#>-*+=_ \t"), strings.TrimPrefix(criteriaHeading, "## "))
 }
 
 func isASCIIBlank(line string) bool { return strings.Trim(line, " \t") == "" }
@@ -165,12 +153,16 @@ func isASCIIBlank(line string) bool { return strings.Trim(line, " \t") == "" }
 // next column-0 heading of level 1 or 2, and holds only criterion lines "- AC-<n>: <text>"
 // (n a positive integer without leading zeros) and blank lines. Prose, quotes, nested or
 // indented lines, sub-headings and fences belong outside it. In a spec that has the section,
-// these are errors anywhere: a criterion-like list item outside the section, a fence that is
-// not at column 0 (it could belong to a list item), raw HTML or an HTML comment outside code
-// spans (it can hide text), and a lone carriage return (Markdown reads it as a line break).
+// these are errors anywhere outside fences: "AC-<n>:" outside the section, another heading or
+// line that reads "Acceptance criteria", a fence that is not at column 0 (it could belong to a
+// list item), the character "<" (raw HTML can hide text; without "<" there is none), and a
+// lone carriage return (Markdown reads it as a line break). Write examples in a fence.
 func parseCriteria(body string) (crit []SpecCriterion, present bool, err error) {
 	var f codeFence
 	in, sections := false, 0
+	// attempted marks a spec that tries to have criteria without the exact section (another
+	// heading spelling, or criterion lines): an error, not a spec without criteria.
+	attempted := false
 	issue, issueAt := "", 0
 	note := func(n int, msg string) {
 		if issueAt == 0 {
@@ -190,10 +182,14 @@ func parseCriteria(body string) (crit []SpecCriterion, present bool, err error) 
 		if f.step(line) {
 			continue
 		}
-		if hasRawHTML(line) {
-			note(n, "raw HTML and HTML comments are not allowed in a spec with acceptance criteria, even in code spans for comments; they can hide text (write it in a fence)")
+		if strings.Contains(line, "<") {
+			note(n, `"<" is not allowed outside fences in a spec with acceptance criteria, because raw HTML can hide text; write it in a fence or in words`)
 		}
 		if level, text := headingAt0(line); level > 0 {
+			if isCriteriaHeadingText(text) && (level != 2 || text != strings.TrimPrefix(criteriaHeading, "## ")) {
+				note(n, fmt.Sprintf("the criteria heading must read exactly %q", criteriaHeading))
+				attempted = true
+			}
 			if level <= 2 {
 				in = level == 2 && text == strings.TrimPrefix(criteriaHeading, "## ")
 				if in {
@@ -205,8 +201,13 @@ func parseCriteria(body string) (crit []SpecCriterion, present bool, err error) 
 			continue
 		}
 		if !in {
-			if strayLine.MatchString(line) || observedLine.MatchString(line) {
-				note(n, fmt.Sprintf("a criterion outside the %q section would not be planned; move it into the section", criteriaHeading))
+			if strayLine.MatchString(line) {
+				note(n, fmt.Sprintf(`"AC-<n>:" outside the %q section would not be planned; move the criterion into the section, or refer to it as AC-<n> without a colon`, criteriaHeading))
+				attempted = attempted || criterionLine.MatchString(line)
+			}
+			if isCriteriaHeadingText(line) {
+				note(n, fmt.Sprintf("only the heading %q starts the criteria section; rename this line", criteriaHeading))
+				attempted = true
 			}
 			continue
 		}
@@ -239,7 +240,7 @@ func parseCriteria(body string) (crit []SpecCriterion, present bool, err error) 
 		}
 	}
 	switch {
-	case sections == 0:
+	case sections == 0 && !attempted:
 		return nil, false, nil
 	case issueAt > 0:
 		return nil, true, fmt.Errorf("acceptance criteria line %d: %s", issueAt, issue)
@@ -414,7 +415,9 @@ func loadCriteriaIdentity(dir string, s Spec) (criteriaIdentity, error) {
 	}
 	raise(s.Approval, s.Implemented)
 	aRel, iRel, sRel := approvalRel(s.Feature), implementedRel(s.Feature), specRel(s.Feature)
-	log, err := git(dir, "log", "--reverse", "--format=%H", "--", aRel, iRel)
+	// Spec-only commits matter too: restoring an old spec next to an old approval in separate
+	// commits makes a genuine pair only at the second one.
+	log, err := git(dir, "log", "--reverse", "--format=%H", "--", aRel, iRel, sRel)
 	if err != nil {
 		return id, fmt.Errorf("criteria history of %s: %w", s.Feature, err)
 	}

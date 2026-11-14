@@ -1521,7 +1521,8 @@ Acceptance criteria are what aeh plans and tests from. The section starts at the
 heading "## Acceptance criteria" and holds only lines "- AC-<n>: <text>" and blank lines; put
 prose before the heading. A changed criterion keeps its number; a new one takes a number above
 every number used before; a number removed in an approved version is never reused. In a spec
-with criteria, fences start at column 0 and raw HTML is not allowed outside code spans.
+with criteria, fences start at column 0, "<" appears only inside fences, and "AC-<n>:" only
+in the section.
 
 ## Rules
 

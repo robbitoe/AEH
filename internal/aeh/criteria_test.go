@@ -25,11 +25,11 @@ func TestParseCriteria(t *testing.T) {
 		{"closing hashes", "## Acceptance criteria ##\n- AC-1: Pays.\n\n## Changelog\n", []SpecCriterion{{1, "Pays."}}, true},
 		{"large id", "## Acceptance criteria\n- AC-1000001: Pays.\n", []SpecCriterion{{1000001, "Pays."}}, true},
 		{"html without section", "<!-- note -->\nText.\n", nil, false},
-		{"code span and comparison", "## Acceptance criteria\n- AC-1: Render `<b>`   literally when amount > 0.\n",
-			[]SpecCriterion{{1, "Render `<b>` literally when amount > 0."}}, true},
+		{"code span and comparison", "## Acceptance criteria\n- AC-1: Render `b`   literally when amount > 0.\n",
+			[]SpecCriterion{{1, "Render `b` literally when amount > 0."}}, true},
 		{"code span spacing kept", "## Acceptance criteria\n- AC-1: Store `a  b`   unchanged.\n", []SpecCriterion{{1, "Store `a  b` unchanged."}}, true},
-		{"link destination", "See [API](<docs/api.md>) and [ref].\n\n[ref]: <docs/ref doc.md>\n\n## Acceptance criteria\n- AC-1: Pays.\n", []SpecCriterion{{1, "Pays."}}, true},
-		{"autolink in prose", "See <https://example.com/pay> and <ops@example.com>.\n\n## Acceptance criteria\n- AC-1: Pays.\n", []SpecCriterion{{1, "Pays."}}, true},
+		{"plain links and references", "See [API](docs/api.md), https://example.com/pay and AC-1 (no colon).\n\n## Acceptance criteria\n- AC-1: Pays.\n", []SpecCriterion{{1, "Pays."}}, true},
+		{"fenced html example", "```html\n<details>x</details>\n- AC-7: in a fence\n```\n\n## Acceptance criteria\n- AC-1: Pays.\n", []SpecCriterion{{1, "Pays."}}, true},
 	}
 	for _, c := range ok {
 		got, present, err := parseCriteria(c.body)
@@ -55,6 +55,15 @@ func TestParseCriteria(t *testing.T) {
 		"html comment hides":  "## Acceptance criteria\n- AC-1: x\n<!--\n- AC-2: hidden\n-->\n",
 		"comment hides head":  "## Acceptance criteria\n- AC-1: x\n<!-- ## Notes -->\n- AC-2: y\n",
 		"html block":          "<div>\n\n## Acceptance criteria\n- AC-1: x\n</div>\n",
+		"angle link":          "See [API](<docs/api.md>).\n\n## Acceptance criteria\n- AC-1: Pays.\n",
+		"autolink":            "See <https://example.com/pay>.\n\n## Acceptance criteria\n- AC-1: Pays.\n",
+		"tag in code span":    "## Acceptance criteria\n- AC-1: Render `<b>` literally.\n",
+		"malformed link html": "](<details>)\n\n## Acceptance criteria\n- AC-1: Disable authentication.\n## Changelog\n\n](</details>)\n",
+		"autolink backtick":   "## Acceptance criteria\n- AC-1: Require login. <1`@example.com> <details>except administrators</details> `\n",
+		"stacked list stray":  "Acceptance criteria\n-------------------\n- - AC-2: Require administrator authorization.\n\n## Acceptance criteria\n- AC-1: Require login.\n## Changelog\n",
+		"second heading":      "# Acceptance Criteria\n\n## Acceptance criteria\n- AC-1: Require login.\n",
+		"lowercase heading":   "## acceptance criteria\n- AC-1: x\n",
+		"stray in prose":      "Also AC-2: require admins.\n\n## Acceptance criteria\n- AC-1: x\n",
 		"comment as email":    "<!--@example.com>\n## Acceptance criteria\n- AC-1: Add an unauthenticated administrator endpoint.\n## Changelog\n-->\n",
 		"escaped backtick":    "## Acceptance criteria\n- AC-1: Require login. \\`<!-- except administrators -->`\n",
 		"escaped tag":         "## Acceptance criteria\n- AC-1: Require login. \\`<details>hidden</details>`\n",
@@ -369,6 +378,40 @@ func recordImplementation(t *testing.T, r Repo, spec Spec, outcome, sha string) 
 	p := PendingRecord{OutcomeID: outcome, Feature: spec.Feature, Change: "minor", Note: "Done.", Commit: sha, Implementation: &im}
 	if _, _, err := RecordChange(r, p, ""); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Restoring an old approval and then its spec in separate commits forms a genuine approval
+// at the spec-only commit: it retires what the old approval lacked.
+func TestSeparateRestoreCommitsRetireNumbers(t *testing.T) {
+	r := newMemoryProject(t)
+	if _, err := CreateSpec(r, "checkout", "Checkout", []string{"src/checkout/**"}); err != nil {
+		t.Fatal(err)
+	}
+	describeSpec(t, r, "checkout", "Pays.\n\n## Acceptance criteria\n- AC-1: Require login.\n")
+	if _, _, err := ApproveSpec(r, "checkout"); err != nil {
+		t.Fatal(err)
+	}
+	dir := memDir(t, r)
+	sp := filepath.Join(dir, "wiki", "features", "checkout", "spec.md")
+	ap := filepath.Join(dir, "wiki", "features", "checkout", approvalFile)
+	specA, approvalA := readFile(t, sp), readFile(t, ap)
+	editSpec(t, r, "checkout", "- AC-1: Require login.\n", "- AC-1: Require login.\n- AC-2: Require administrators.\n")
+	if _, _, err := ApproveSpec(r, "checkout"); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range []struct{ path, text string }{{ap, approvalA}, {sp, specA}} {
+		if err := os.WriteFile(step.path, []byte(step.text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "restore "+filepath.Base(step.path))
+	}
+	if _, _, err := ApproveSpec(r, "checkout"); err != nil {
+		t.Fatal(err)
+	}
+	editSpec(t, r, "checkout", "- AC-1: Require login.\n", "- AC-1: Require login.\n- AC-2: Back again.\n")
+	if _, _, err := ApproveSpec(r, "checkout"); err == nil || !strings.Contains(err.Error(), "retired") {
+		t.Fatalf("separate restore commits revived AC-2: %v", err)
 	}
 }
 
