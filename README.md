@@ -58,14 +58,15 @@ aeh do "fix the null check in FeeService.Calculate" --paths src/Fees/
 3. AEH creates a candidate commit on the pinned base and checks it out in a clean verification worktree. Gates run in order and stop at the first failure. None of them calls a model:
    - **hash**: the sealed acceptance tests are unchanged;
    - **scope**: compare the candidate with its pinned base and enforce protected paths, task paths and the diff limit. Agent instruction files (`AGENTS.md`, `CLAUDE.md`, `.claude/`, `.codex/`) and Git control files (`.gitattributes`, `.gitmodules`, `.lfsconfig`) and submodule pointers may not change in any directory. Binary changes fail when Git cannot count their lines;
+   - **drift**: enforce the declared feature against product memory;
    - **build**: your build command (put lint here);
    - **test**: your test command.
-4. Level-2 outcomes require a separate `reviewer` profile that exits successfully and writes one verdict on the final nonempty line of plain stdout. Use `VERDICT: APPROVE` or `VERDICT: REJECT`. Configure a plain-text reviewer rather than a JSON/JSONL stream.
+4. Every route requires independent reviews, at level 1 too: QA for `trivial`; QA then security for `change` and `new`. Rules and the outcome can add DBA. Each reviewer must exit successfully and end plain stdout with exactly `VERDICT: APPROVE` or `VERDICT: REJECT`. Reviews stop at the first rejection, missing verdict or checkout modification. Every new candidate repeats all roles, and every approval records its role, profile, provider and exact SHA.
 5. If everything passes and the verification checkout remains clean, `aeh/<ID>` advances to the candidate commit. The runner checks that the branch still points to the expected base before advancing.
 
 On failure the attempt is discarded. The ladder is: retry with the same profile and the failure as feedback, then try the next profile, then block with a question. Answer it with `aeh answer <ID> "..."` and run again.
 
-Only timeouts and cancellations kill the agent, reviewer or gate command's process tree on Windows (a Job Object) and Unix (a dedicated process group), block immediately and retain the affected worktree. Background processes left by a command that exits normally keep running. Windows cancellation waits for member process objects to become signaled, within a two-second cleanup deadline; a failed wait returns a cleanup error. External services such as file scanners can still briefly hold log files after those processes exit. This is cleanup, not a process sandbox: Unix descendants that leave the process group can escape it. Windows processes started on the agent's behalf by another service can also escape the job, for example through WMI `Win32_Process.Create`, `schtasks`, out-of-process COM or `ShellExecute` via Explorer. Confirm the processes have stopped and inspect possible effects before answering. When you have finished inspecting the retained worktree, remove it with Git. Resume requires the same contract and recorded branch head. The contract covers the outcome, sealed tests, prompts, build and test commands, `pass_env`, protected paths and limits; profiles, task start profiles, ladder, reviewer, notify and timeouts may change between runs. Use a new outcome ID when intentionally changing the contract or when old state lacks those records.
+Only timeouts and cancellations kill the agent, reviewer or gate command's process tree on Windows (a Job Object) and Unix (a dedicated process group), block immediately and retain the affected worktree. Background processes left by a command that exits normally keep running. Windows cancellation waits for member process objects to become signaled, within a two-second cleanup deadline; a failed wait returns a cleanup error. External services such as file scanners can still briefly hold log files after those processes exit. This is cleanup, not a process sandbox: Unix descendants that leave the process group can escape it. Windows processes started on the agent's behalf by another service can also escape the job, for example through WMI `Win32_Process.Create`, `schtasks`, out-of-process COM or `ShellExecute` via Explorer. Confirm the processes have stopped and inspect possible effects before answering. When you have finished inspecting the retained worktree, remove it with Git. Resume requires the same contract and recorded branch head. The contract covers the outcome and its added roles, triage rules, initial route, saved triage output, implementation/triage/review prompt texts, sealed tests, build and test commands, `pass_env`, protected paths and limits. Profiles and their reviewer/triage assignments, task start profiles, ladder, independence policy, notify and timeouts may change between runs; independence is checked again on resume. Use a new outcome ID when intentionally changing the contract or when old state lacks those records.
 
 After the last task, build and tests run once more on the integrated branch. Accepted means proven there.
 
@@ -74,10 +75,66 @@ After the last task, build and tests run once more on the integrated branch. Acc
 | Level | Use for | What runs |
 | --- | --- | --- |
 | 0 | Typos, obvious fixes | Nothing: use your agent CLI directly |
-| 1 | Small change with a clear criterion | `aeh do`, or an outcome with `level: 1`: gates only |
-| 2 | Business rules, data, money, concurrency | Sealed acceptance tests, gates and cross review |
+| 1 | Small change with a clear criterion | `aeh do`, or an outcome with `level: 1`: gates and route-based reviews |
+| 2 | Business rules, data, money, concurrency | Sealed acceptance tests, gates and route-based reviews |
 
 Start at the lowest level that fits.
+
+## Triage, routes and reviewers
+
+Before implementation, AEH chooses a route once per outcome. An explicit `route: trivial|change|new` (or `aeh do --route ...`) skips the model. Otherwise `triage.profile` runs read-only with `triage.md` and a feature index containing titles and paths, without spec bodies. It must end with exactly `ROUTE: trivial`, `ROUTE: change` or `ROUTE: new`. Failure, interruption, a modified checkout or an invalid answer selects `new`. Without a triage profile, AEH defaults to `change` and warns in the console and report.
+
+- `trivial`: wording, formatting or a small fix that does not change feature behavior; QA reviews it.
+- `change`: existing feature behavior changes; QA and security review it.
+- `new`: a new capability, data/storage model, authentication/authorization or work spanning features; QA and security review it, with the prerequisites below.
+
+Levels control sealed tests; routes control reviewers. Rules and outcome `reviewers: [dba]` add roles. QA, security and DBA always run in that order. The effective route and accumulated roles can only increase across rejected candidates, tasks and resumes; an owner answer cannot lower them. Rules first examine all task paths conservatively (a task without paths can trigger every rule), then the actual candidate paths before any gate, including deletions and both sides of renames. Rules are never gates and do not call a model.
+
+```yaml
+triage:
+  profile: claude-review
+  rules:
+    - name: storage
+      paths: [db/**, migrations/**]
+      route: new
+      reviewers: [dba]
+    - name: payments
+      paths: [src/payments/**]
+      route: change
+reviewers:
+  independence: provider
+  qa: [claude-review, codex-review]
+  security: [claude-review, codex-review]
+  dba: [claude-review, codex-review]
+profiles:
+  codex:
+    provider: openai
+    transport: cli
+    command: [codex, exec, --skip-git-repo-check, --sandbox, workspace-write, "-"]
+    stdin: true
+  codex-review:
+    provider: openai
+    transport: cli
+    command: [codex, exec, --sandbox, read-only, "-"]
+    stdin: true
+  claude-review:
+    provider: anthropic
+    transport: cli
+    command: [claude, -p, --safe-mode, --tools, "Read,Grep,Glob", --permission-prompts, none, --output-format, text]
+    stdin: true
+```
+
+Use trusted CLI options appropriate to your installation; triage and reviewer profiles must be configured read-only. AEH additionally checks the checkout after each reviewer. `provider` is the provider identity used for independence. `transport` defaults to `cli`; `api` is reserved and is currently rejected. The preferred reviewer is the first independent profile in each role's list, selected against the author of that attempt, including after escalation. By default the reviewer must come from another provider. `reviewers.independence: profile` allows another profile of the same provider; a profile can never review itself. Preflight checks every reachable author and every role that any rule could require.
+
+For route `new`, prepare a declared feature with a spec in product memory, approve its current content with `aeh memory approve <feature>`, and use a level-2 outcome with sealed acceptance tests. Commit spec edits in the memory repository before approving. Any change to the spec title, paths or whole body voids approval. A rule that raises a candidate to `new` without these requirements blocks immediately, preserves the candidate evidence and leaves the integration head unchanged without consuming the rest of the ladder. Prepare the missing requirements and create an outcome with another ID: `aeh answer` cannot resume this block because the contract changes. For `aeh do`, move the request into `aeh/outcomes/<another-ID>.yaml` with feature, change, changelog, level 2, criteria, acceptance paths and tasks, approve the spec and tests, then use `aeh run`.
+
+If a later candidate raises the policy, AEH runs only the missing role reviews for earlier accepted tasks before the final gates. Each review uses that task's original base-to-commit diff and a fresh detached checkout of its accepted SHA, with a reviewer independent of its original author. A rejection stops the outcome and requires another outcome ID: the runner preserves the integrated tasks because it has no transactional branch/state rewind and replay mechanism. A timeout, cancellation, missing verdict, checkout modification or review error blocks the outcome; after resolving the failure, use `aeh answer` and `aeh run` to retry only the missing reviews. For a timeout or cancellation, confirm all processes stopped and review possible effects before answering; the affected worktree is retained for inspection.
+
+Triage prompt, output and parsed result live under `.aeh/runs/<ID>/triage/`. State records initial/effective routes, source and rules hit before contract creation, so resume never calls triage again. A crash during triage conservatively retains `new`. Reports include route evidence, every role's selection and verdict, roles not run and prompt sources. Overrides use `review-qa.md`, `review-security.md` and `review-dba.md`; a legacy `aeh/prompts/review.md` override still supplies QA and is named in the report.
+
+### Migrating existing configs and runs
+
+Add `provider:` to author and reviewer profiles, with reviewers available from another provider, or explicitly set `reviewers.independence: profile` and configure different reviewer profiles per role. Without a `reviewers:` section, the legacy `reviewer:` key still covers every required role when independent. Adding a `reviewers:` section replaces that legacy fallback, so list all required roles. Existing level-1 runs now require reviews. States written before stage 2 cannot resume; relaunch the work with another outcome ID.
 
 ## Files
 
@@ -108,12 +165,13 @@ Make sure your project's `.gitignore` covers build output (`bin/`, `obj/`, `node
 | `aeh init` | Creates `aeh/config.yaml`, an example outcome, and ignores `.aeh/`. |
 | `aeh tests approve <ID>` | Seals the outcome's acceptance tests. |
 | `aeh run <ID>` | Runs the outcome. Exit code 0 accepted, 3 blocked, 1 error. |
-| `aeh do "<change>" [--paths a/,b/] [--profile name] [--feature slug --change patch\|minor\|major --note "..."]` | Level-1 change with one task; optionally links and records a feature. |
+| `aeh do "<change>" [--paths a/,b/] [--profile name] [--route trivial\|change\|new] [--feature slug --change patch\|minor\|major --note "..."]` | Level-1 change with one task; optionally links and records a feature. |
 | `aeh answer <ID> "<text>"` | Answers a blocked outcome; the answer goes into the next prompt. |
 | `aeh status` | Status, tasks and attempts of every outcome. |
 | `aeh notify test` | Sends a test event to the webhook. |
 | `aeh memory init` | Creates the product memory in `.aeh/memory/` of the main checkout. |
 | `aeh memory new <feature> --title "..." --paths a/**` | Adds a feature spec at version 0.1.0. |
+| `aeh memory approve <feature>` | Approves the exact title, paths and full body of a spec. |
 | `aeh memory status` | Features, versions, last accepted change and pending records. |
 | `aeh memory lint` | Checks the memory and its privacy settings. |
 | `aeh memory record <ID>` | Retries a memory record that failed after an outcome was accepted. |
@@ -133,7 +191,7 @@ The execution contract includes which paths every feature owns and the declared 
 The engine above is the build stage of the [vision](docs/vision.md). Next, in order:
 
 1. **Memory.** A private wiki in `.aeh/memory/` with versioned specs, kept in sync with the code by a deterministic drift gate.
-2. **Triage and reviewers.** Trivial, change and new routes, with QA, Security and DBA reviewers chosen by route.
+2. **Triage and reviewers (implemented).** Trivial, change and new routes, with QA, security and DBA reviewers chosen by route and rules.
 3. **Specs to code.** An approved feature produces its tasks and acceptance tests.
 4. **Discovery.** From a vague idea to a spec book with HTML mockups.
 5. **Live review.** Specs keep evolving while approved features are built.

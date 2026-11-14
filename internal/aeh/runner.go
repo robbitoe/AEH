@@ -27,7 +27,9 @@ type runner struct {
 	state           *State
 	log             io.Writer
 	implementPrompt string
-	reviewPrompt    string
+	reviewPrompts   map[string]string
+	reviewSources   map[string]string
+	triagePrompt    string
 	memory          MemorySnapshot
 }
 
@@ -44,9 +46,13 @@ func RunOutcome(ctx context.Context, r Repo, id string, log io.Writer) (State, e
 	return run(ctx, r, cfg, o, log)
 }
 
-// Do runs a level-1 change described in one sentence: one task, no sealed tests, no review.
+// Do runs a level-1 change described in one sentence, with route-based reviews.
 // link declares the feature the change modifies, enforced by the drift gate.
-func Do(ctx context.Context, r Repo, text string, paths []string, profile string, link MemoryLink, log io.Writer) (State, error) {
+// A nonempty route overrides model triage, just like route: in an outcome.
+func Do(ctx context.Context, r Repo, text string, paths []string, profile string, link MemoryLink, log io.Writer, route string) (State, error) {
+	if route != "" && !validRoute(route) {
+		return State{}, errors.New("route must be trivial, change or new")
+	}
 	if err := link.Validate(); err != nil {
 		return State{}, err
 	}
@@ -67,6 +73,7 @@ func Do(ctx context.Context, r Repo, text string, paths []string, profile string
 		ID:      fmt.Sprintf("DO-%d", time.Now().UnixNano()),
 		Title:   firstLine(text),
 		Level:   1,
+		Route:   route,
 		Feature: link.Feature, Change: link.Change, Changelog: link.Note,
 		Tasks: []Task{{ID: "T1", Goal: text, Paths: paths, Start: profile}},
 	}
@@ -93,14 +100,58 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer) (Sta
 	if err != nil {
 		return st, err
 	}
+	if st.Version != 2 {
+		return st, errors.New("pre-stage-2 state cannot resume; relaunch with another outcome ID")
+	}
+	if st.RestartRequired {
+		return st, errors.New(st.Question)
+	}
+	if st.Title == "" {
+		st.Title = o.Title
+	}
 	switch st.Status {
 	case StatusAccepted:
 		return st, fmt.Errorf("%s is already accepted on branch %s", o.ID, st.Branch)
 	case StatusBlocked:
 		return st, fmt.Errorf("%s is blocked; answer it first: aeh answer %s \"...\"\n%s", o.ID, o.ID, st.Question)
 	}
-	if err := preflight(cfg, o); err != nil {
+	ru := &runner{repo: r, cfg: cfg, outcome: o, protected: protectedPaths(cfg, o), state: &st, log: log, memory: memory}
+	if attrs := attributesFileInRepo(r.Root); attrs != "" {
+		ru.protected = append(ru.protected, attrs)
+	}
+	if ru.implementPrompt, err = loadPrompt(r, "implement.md"); err != nil {
+		return st, fmt.Errorf("load implementation prompt: %w", err)
+	}
+	ru.reviewPrompts, ru.reviewSources = map[string]string{}, map[string]string{}
+	for _, role := range roleOrder {
+		if ru.reviewPrompts[role], ru.reviewSources[role], err = loadReviewPrompt(r, role); err != nil {
+			return st, fmt.Errorf("load review prompt: %w", err)
+		}
+	}
+	if ru.triagePrompt, err = loadPrompt(r, "triage.md"); err != nil {
+		return st, fmt.Errorf("load triage prompt: %w", err)
+	}
+	// Pure triage can block a known new route without requiring any agent setup.
+	// When a model is needed, validate its CLI and the reviewer policy first.
+	if st.InitialRoute == "" && o.Route == "" && cfg.Triage.Profile != "" {
+		if err := preflight(cfg, o, st.EffectiveRoute, st.Roles...); err != nil {
+			return st, err
+		}
+	}
+	if err := ru.triage(ctx); err != nil {
 		return st, err
+	}
+	var sealErr error
+	if o.Level >= 2 && len(o.Acceptance) > 0 {
+		ru.seal, sealErr = verifySeal(r, o)
+	}
+	if question := ru.newRequirements(); question != "" {
+		st.RestartRequired = true
+		err := ru.block(question)
+		return st, err
+	}
+	if sealErr != nil {
+		return st, sealErr
 	}
 	if o.Feature != "" {
 		if !memory.Present {
@@ -110,22 +161,8 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer) (Sta
 			return st, fmt.Errorf("declared feature %q does not exist in product memory", o.Feature)
 		}
 	}
-	ru := &runner{repo: r, cfg: cfg, outcome: o, protected: protectedPaths(cfg, o), state: &st, log: log, memory: memory}
-	if attrs := attributesFileInRepo(r.Root); attrs != "" {
-		ru.protected = append(ru.protected, attrs)
-	}
-	if ru.implementPrompt, err = loadPrompt(r, "implement.md"); err != nil {
-		return st, fmt.Errorf("load implementation prompt: %w", err)
-	}
-	if o.Level >= 2 {
-		if ru.reviewPrompt, _, err = loadReviewPrompt(r, RoleQA); err != nil {
-			return st, fmt.Errorf("load review prompt: %w", err)
-		}
-	}
-	if len(o.Acceptance) > 0 {
-		if ru.seal, err = verifySeal(r, o); err != nil {
-			return st, err
-		}
+	if err := preflight(cfg, o, st.EffectiveRoute, st.Roles...); err != nil {
+		return st, err
 	}
 	branch := IntegrationBranch(o.ID)
 	contract, err := ru.contractHash()
@@ -170,7 +207,15 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer) (Sta
 		}
 	}
 
-	ok, question, err := ru.finalCheck(ctx)
+	ok, question, err := ru.completeReviews(ctx)
+	if err != nil {
+		return st, err
+	}
+	if !ok {
+		err := ru.block(question)
+		return st, err
+	}
+	ok, question, err = ru.finalCheck(ctx)
 	if err != nil {
 		return st, err
 	}
@@ -237,9 +282,14 @@ func (ru *runner) contractHash() (string, error) {
 		Outcome         Outcome
 		Seal            string
 		ImplementPrompt string
-		ReviewPrompt    string
+		ReviewPrompts   map[string]string
+		TriagePrompt    string
+		TriageOutput    string
+		InitialRoute    string
+		Rules           []TriageRule
 		Memory          memoryContract
-	}{commands, ru.cfg.PassEnv, ru.cfg.Protected, ru.cfg.Limits, outcome, seal, ru.implementPrompt, ru.reviewPrompt,
+	}{commands, ru.cfg.PassEnv, ru.cfg.Protected, ru.cfg.Limits, outcome, seal, ru.implementPrompt, ru.reviewPrompts,
+		ru.triagePrompt, ru.state.TriageOutput, ru.state.InitialRoute, ru.cfg.Triage.Rules,
 		memoryContract{ru.memory.ContractFingerprint(outcome.Feature), outcome.Feature, outcome.Change, outcome.Changelog}})
 	if err != nil {
 		return "", fmt.Errorf("encode execution contract: %w", err)
@@ -284,6 +334,11 @@ func (ru *runner) runTask(ctx context.Context, t Task, ts *TaskState) (bool, str
 		if res.Passed {
 			return true, "", nil
 		}
+		if res.Requirements != "" {
+			ts.Status = StatusBlocked
+			ru.state.RestartRequired = true
+			return false, res.Requirements, nil
+		}
 		if res.Uncertain {
 			ts.Status = StatusBlocked
 			return false, fmt.Sprintf("Task %s stopped at %s. Confirm all processes stopped and review possible effects before answering to retry. See the attempt artifacts.", t.ID, res.FailedGate), nil
@@ -298,8 +353,9 @@ func (ru *runner) runTask(ctx context.Context, t Task, ts *TaskState) (bool, str
 
 type attemptResult struct {
 	Attempt
-	Feedback  string
-	Uncertain bool
+	Feedback     string
+	Uncertain    bool
+	Requirements string
 }
 
 // attempt runs one agent in a fresh worktree and passes the result through the gates.
@@ -310,6 +366,7 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 	res := attemptResult{Attempt: Attempt{N: n, Profile: profile, RunDir: rel(r.Root, runDir), StartedAt: time.Now().UTC()}}
 
 	base := ru.state.Head
+	res.Base = base
 	if current, _ := branchCommit(r.Root, IntegrationBranch(o.ID)); current != base {
 		return res, fmt.Errorf("integration branch %s changed", IntegrationBranch(o.ID))
 	}
@@ -366,25 +423,38 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 	if err := writePrivateJSON(filepath.Join(runDir, "candidate.json"), map[string]string{"base": base, "commit": commit, "contract": ru.state.Contract}); err != nil {
 		return res, err
 	}
+	res.Commit = commit
+	// --no-renames in candidateChanges includes both old and new rename paths.
+	changes, err := candidateChanges(r.Root, base, commit)
+	if err != nil {
+		return res, err
+	}
+	ru.observeRules(rulesForFiles(ru.cfg.Triage.Rules, changedPaths(changes)))
+	res.RolesNotRun = requiredRoles(ru.state.EffectiveRoute, ru.state.Roles)
+	if err := saveState(r, ru.state); err != nil {
+		return res, err
+	}
+	diff, err := candidateDiff(r.Root, base, commit)
+	if err != nil {
+		return res, err
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "diff.patch"), []byte(diff), 0o600); err != nil {
+		return res, err
+	}
+	if question := ru.newRequirements(); question != "" {
+		res.FailedGate, res.Feedback, res.Requirements = "requirements", question, question
+		if err := writePrivateJSON(filepath.Join(runDir, "requirements.json"), map[string]any{"route": ru.state.EffectiveRoute, "roles": ru.state.Roles, "rules": ru.state.RulesHit, "missing": question}); err != nil {
+			return res, err
+		}
+		return res, record()
+	}
 	// Hash and scope read Git objects in the main repository, so nothing from the
 	// candidate is checked out, and no checkout filter runs, until both have passed.
 	passed := true
 	if ru.seal != nil {
 		passed = check(gateSealedTree(r.Root, base, commit, o.Acceptance))
 	}
-	var diff string
 	if passed {
-		changes, err := candidateChanges(r.Root, base, commit)
-		if err != nil {
-			return res, err
-		}
-		diff, err = candidateDiff(r.Root, base, commit)
-		if err != nil {
-			return res, err
-		}
-		if err := os.WriteFile(filepath.Join(runDir, "diff.patch"), []byte(diff), 0o600); err != nil {
-			return res, err
-		}
 		passed = check(gateScope(changes, ru.protected, t.Paths, maxLines))
 		if passed {
 			passed = check(gateDrift(changedPaths(changes), ru.memory, o.Feature))
@@ -411,12 +481,23 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 	if passed {
 		passed = check(checkoutGate(gateCommand(ctx, "test", verified, ru.cfg.Commands.Test, timeout, ru.cfg.PassEnv), verified, commit))
 	}
-	if passed && o.Level >= 2 {
-		g, err := ru.review(ctx, t, verified, diff, runDir)
-		if err != nil {
-			return res, err
+	if passed {
+		roles := requiredRoles(ru.state.EffectiveRoute, ru.state.Roles)
+		res.RolesNotRun = nil
+		for i, role := range roles {
+			g, verdict, err := ru.review(ctx, t, role, profile, commit, verified, diff, runDir)
+			if err != nil {
+				return res, err
+			}
+			res.Reviews = append(res.Reviews, verdict)
+			passed = check(g)
+			if !passed {
+				res.RolesNotRun = append(res.RolesNotRun, roles[i+1:]...)
+				break
+			}
 		}
-		passed = check(checkoutGate(g, verified, commit))
+	} else {
+		res.RolesNotRun = requiredRoles(ru.state.EffectiveRoute, ru.state.Roles)
 	}
 	if !passed {
 		failed := gates[len(gates)-1]
@@ -451,33 +532,50 @@ func checkoutGate(g GateResult, wt, commit string) GateResult {
 	return g
 }
 
-// review asks the reviewer profile for a verdict on the diff. It only runs at level 2.
-func (ru *runner) review(ctx context.Context, t Task, wt, diff, runDir string) (GateResult, error) {
+// review binds a role's independent verdict to a candidate and verifies its checkout.
+func (ru *runner) review(ctx context.Context, t Task, role, author, commit, wt, diff, runDir string) (GateResult, ReviewVerdict, error) {
 	g := GateResult{Name: "review"}
-	start := time.Now()
-	prompt, err := renderPrompt("review.md", ru.reviewPrompt, promptData{Outcome: ru.outcome, Task: t, Diff: diff})
+	v := ReviewVerdict{Role: role, SHA: commit, Verdict: "INVALID", PromptSource: ru.reviewSources[role]}
+	profile, err := ru.cfg.reviewerFor(role, author)
 	if err != nil {
-		return g, err
+		return g, v, err
 	}
-	outPath, err := runAgent(ctx, ru.cfg.Profiles[ru.cfg.Reviewer], ru.cfg.PassEnv, wt, prompt, runDir, "review")
+	v.Profile, v.Provider = profile, ru.cfg.Profiles[profile].Provider
+	start := time.Now()
+	prompt, err := renderPrompt("review-"+role+".md", ru.reviewPrompts[role], promptData{Outcome: ru.outcome, Task: t, Diff: diff})
+	if err != nil {
+		return g, v, err
+	}
+	ru.logf("    review %s with %q (%s) on %s", role, profile, v.Provider, commit)
+	outPath, err := runAgent(ctx, ru.cfg.Profiles[profile], ru.cfg.PassEnv, wt, prompt, runDir, "review-"+role)
 	g.Seconds = time.Since(start).Seconds()
+	// Check even a rejected or failed reviewer: all reviewers are read-only.
+	checkoutErr := verifyCheckout(wt, commit)
 	if err != nil {
 		g.Output, g.Uncertain = err.Error(), uncertainExit(err)
-		return g, nil
+		if checkoutErr != nil {
+			g.Output += "\n" + checkoutErr.Error()
+		}
+		return g, v, nil
 	}
 	out, err := os.ReadFile(outPath)
 	if err != nil {
-		return g, fmt.Errorf("read reviewer output: %w", err)
+		return g, v, fmt.Errorf("read reviewer output: %w", err)
 	}
 	switch parseVerdict(string(out)) {
 	case "APPROVE":
 		g.Passed = true
+		v.Verdict = "APPROVE"
 	case "REJECT":
+		v.Verdict = "REJECT"
 		g.Output = "reviewer rejected the change:\n" + tail(string(out), maxGateOutput)
 	default:
 		g.Output = "reviewer gave no verdict"
 	}
-	return g, nil
+	if checkoutErr != nil {
+		g.Passed, g.Output, v.Verdict = false, checkoutErr.Error(), "INVALID"
+	}
+	return g, v, nil
 }
 
 // parseVerdict accepts one exact verdict on the final nonempty line of plain stdout.
@@ -495,9 +593,153 @@ func parseVerdict(out string) string {
 	return ""
 }
 
+func acceptedAttempt(task *TaskState) *Attempt {
+	for i := len(task.Attempts) - 1; i >= 0; i-- {
+		if task.Attempts[i].Passed {
+			return &task.Attempts[i]
+		}
+	}
+	return nil
+}
+
+func missingReviewRoles(a *Attempt, roles []string) []string {
+	var missing []string
+	for _, role := range roles {
+		approved := false
+		if a != nil {
+			for _, v := range a.Reviews {
+				if v.Role == role && v.SHA == a.Commit {
+					approved = v.Verdict == "APPROVE"
+				}
+			}
+		}
+		if !approved {
+			missing = append(missing, role)
+		}
+	}
+	return missing
+}
+
+// completeReviews applies the final policy to earlier accepted candidates, without
+// rerunning their agents, build/test gates, or already approved roles.
+func (ru *runner) completeReviews(ctx context.Context) (bool, string, error) {
+	roles := requiredRoles(ru.state.EffectiveRoute, ru.state.Roles)
+	for _, t := range ru.outcome.Tasks {
+		ts := ru.state.task(t.ID)
+		if ts.Status != StatusDone {
+			return false, fmt.Sprintf("Task %s has no accepted candidate", t.ID), nil
+		}
+		a := acceptedAttempt(ts)
+		if a == nil {
+			return false, fmt.Sprintf("Task %s has no accepted candidate", t.ID), nil
+		}
+		missing := missingReviewRoles(a, roles)
+		if len(missing) == 0 {
+			continue
+		}
+		if ok, question, err := ru.completeTaskReviews(ctx, t, a, missing); err != nil || !ok {
+			return ok, question, err
+		}
+	}
+	return true, "", nil
+}
+
+func (ru *runner) completeTaskReviews(ctx context.Context, t Task, a *Attempt, missing []string) (bool, string, error) {
+	r := ru.repo
+	runDir := filepath.Join(r.Root, filepath.FromSlash(a.RunDir))
+	// Existing stage-2 attempts recorded the base only in candidate.json.
+	if a.Base == "" {
+		data, err := os.ReadFile(filepath.Join(runDir, "candidate.json"))
+		if err != nil {
+			return false, "", err
+		}
+		var candidate struct{ Base, Commit string }
+		if err := json.Unmarshal(data, &candidate); err != nil {
+			return false, "", err
+		}
+		if candidate.Base == "" || candidate.Commit != a.Commit {
+			return false, "", fmt.Errorf("task %s candidate evidence does not match its accepted attempt", t.ID)
+		}
+		a.Base = candidate.Base
+	}
+	diff, err := candidateDiff(r.Root, a.Base, a.Commit)
+	if err != nil {
+		return false, "", err
+	}
+	wtRoot := filepath.Dir(r.WorktreePath(ru.outcome.ID + "-reviews"))
+	if err := os.MkdirAll(wtRoot, 0o700); err != nil {
+		return false, "", err
+	}
+	wt, err := os.MkdirTemp(wtRoot, ru.outcome.ID+"-"+t.ID+"-reviews-")
+	if err != nil {
+		return false, "", err
+	}
+	if err := addWorktreeDetached(r.Root, wt, a.Commit); err != nil {
+		_ = os.Remove(wt)
+		return false, "", err
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			removeWorktree(r.Root, wt)
+		}
+	}()
+	if err := verifyCheckout(wt, a.Commit); err != nil {
+		return false, "", err
+	}
+	gates := readGateResults(r.Root, a.RunDir)
+	for i, role := range missing {
+		g, verdict, err := ru.review(ctx, t, role, a.Profile, a.Commit, wt, diff, runDir)
+		if err != nil {
+			g.Output = err.Error()
+		}
+		a.Reviews = append(a.Reviews, verdict)
+		a.RolesNotRun = append([]string(nil), missing[i+1:]...)
+		gates = append(gates, g)
+		ru.logf("    added %s review for %s: %s", role, t.ID, gateStatus(g))
+		question := ""
+		if !g.Passed {
+			keep = g.Uncertain
+			if keep {
+				a.Worktree = wt
+			}
+			question = fmt.Sprintf("Task %s required %s review failed on its accepted SHA %s:\n%s\n", t.ID, role, a.Commit, tail(strings.TrimSpace(g.Output), 1500))
+			switch {
+			case g.Uncertain:
+				question += "Confirm all processes stopped and review possible effects before answering to retry. See the attempt artifacts."
+			case verdict.Verdict == "REJECT":
+				// Rejection requires a new candidate, but there is no transactional
+				// branch/state rewind and replay mechanism for integrated tasks.
+				ru.state.RestartRequired = true
+				question += "The integration branch already contains accepted tasks and cannot be safely rewound and replayed by this runner. Fix the feedback and create an outcome with another ID; aeh answer cannot resume this run."
+			default:
+				question += "Resolve the review failure; aeh answer followed by aeh run retries the missing review."
+			}
+			ru.state.Status, ru.state.Question = StatusBlocked, question
+		}
+		recordErr := writePrivateJSON(filepath.Join(runDir, "gates.json"), gates)
+		if err := errors.Join(recordErr, saveState(r, ru.state)); err != nil {
+			return false, "", err
+		}
+		if !g.Passed {
+			return false, question, nil
+		}
+	}
+	return true, "", nil
+}
+
 // finalCheck runs the gates once more on the integrated branch: accepted means proven there.
 func (ru *runner) finalCheck(ctx context.Context) (bool, string, error) {
 	o, r := ru.outcome, ru.repo
+	for i := range ru.state.Tasks {
+		task := &ru.state.Tasks[i]
+		if task.Status != StatusDone {
+			return false, fmt.Sprintf("Task %s has no accepted candidate", task.ID), nil
+		}
+		for _, role := range missingReviewRoles(acceptedAttempt(task), requiredRoles(ru.state.EffectiveRoute, ru.state.Roles)) {
+			return false, fmt.Sprintf("Task %s is missing required %s approval on its accepted SHA", task.ID, role), nil
+		}
+	}
 	head, ok := branchCommit(r.Root, IntegrationBranch(o.ID))
 	if !ok || head != ru.state.Head {
 		return false, "", fmt.Errorf("integration branch %s changed", IntegrationBranch(o.ID))
@@ -594,6 +836,9 @@ func (ru *runner) block(question string) error {
 	if strings.HasPrefix(ru.outcome.ID, "DO-") {
 		hint = "Refine the request and run `aeh do` again, or turn it into an outcome."
 	}
+	if ru.state.RestartRequired {
+		hint = "Prepare the requirements and create an outcome with another ID."
+	}
 	ru.logf("%s blocked:\n%s\n%s", ru.outcome.ID, question, hint)
 	ru.notify("blocked", "Outcome blocked. See the local report for details.")
 	return nil
@@ -613,27 +858,40 @@ func (ru *runner) logf(format string, args ...any) {
 }
 
 // preflight fails fast when a profile's CLI is not installed, before anything is created.
-func preflight(cfg Config, o Outcome) error {
-	names := append([]string{}, cfg.Ladder...)
-	if o.Level >= 2 {
-		if cfg.Reviewer == "" {
-			return errors.New("level 2 requires a reviewer profile")
+func preflight(cfg Config, o Outcome, route string, added ...string) error {
+	needsTriage := route == "" && o.Route == "" && cfg.Triage.Profile != ""
+	if route == "" {
+		route = o.Route
+		if route == "" {
+			route = RouteChange
 		}
-		for _, task := range o.Tasks {
-			first := task.Start
-			if first == "" {
-				first = cfg.Ladder[0]
-			}
-			if cfg.Reviewer == first || cfg.Reviewer == cfg.escalate(first) {
-				return fmt.Errorf("task %s requires a reviewer profile separate from its implementation profiles", task.ID)
-			}
-		}
-		names = append(names, cfg.Reviewer)
 	}
-	for _, t := range o.Tasks {
-		if t.Start != "" {
-			names = append(names, t.Start)
+	roles := requiredRoles(route, o.Reviewers, added)
+	// A rejected candidate can touch paths outside the declared scope. Account for
+	// every rule, even ones not predicted by task paths, before starting an agent.
+	for _, rule := range cfg.Triage.Rules {
+		route = maxRoute(route, rule.Route)
+		roles = requiredRoles(route, roles, rule.Reviewers)
+	}
+	var authors []string
+	for _, task := range o.Tasks {
+		authors = append(authors, cfg.reachableAuthors(task)...)
+	}
+	if err := cfg.checkIndependence(authors, roles); err != nil {
+		return fmt.Errorf("reviewer profile configuration: %w", err)
+	}
+	names := append([]string{}, authors...)
+	for _, author := range authors {
+		for _, role := range roles {
+			n, err := cfg.reviewerFor(role, author)
+			if err != nil {
+				return err
+			}
+			names = append(names, n)
 		}
+	}
+	if needsTriage {
+		names = append(names, cfg.Triage.Profile)
 	}
 	for _, n := range names {
 		if err := cfg.checkProfile(n); err != nil {
@@ -645,6 +903,132 @@ func preflight(cfg Config, o Outcome) error {
 		}
 	}
 	return nil
+}
+
+const changeDefaultWarning = "warning: no triage profile configured; defaulting to change"
+
+// observeRules persists the maximum policy seen across all candidates and tasks.
+func (ru *runner) observeRules(hit []TriageRule) {
+	s := ru.state
+	s.EffectiveRoute, s.Roles = applyRules(s.EffectiveRoute, s.Roles, hit)
+	s.Roles = requiredRoles(s.EffectiveRoute, s.Roles, ru.outcome.Reviewers)
+	for _, name := range ruleNames(hit) {
+		found := false
+		for _, have := range s.RulesHit {
+			if have == name {
+				found = true
+			}
+		}
+		if !found {
+			s.RulesHit = append(s.RulesHit, name)
+		}
+	}
+}
+
+// triage writes a conservative result before launching the model. A crash anywhere
+// thereafter resumes with that result (new), never a second model invocation.
+func (ru *runner) triage(ctx context.Context) error {
+	s, o := ru.state, ru.outcome
+	if s.InitialRoute != "" {
+		if s.TriageSource == "fallback-none" {
+			ru.logf("%s", changeDefaultWarning)
+		}
+		return nil
+	}
+	s.InitialRoute, s.TriageSource = o.Route, "declared"
+	if o.Route == "" {
+		if ru.cfg.Triage.Profile == "" {
+			s.InitialRoute, s.TriageSource = RouteChange, "fallback-none"
+			ru.logf("%s", changeDefaultWarning)
+		} else {
+			s.InitialRoute, s.TriageSource = RouteNew, "fallback-failed"
+		}
+	}
+	s.EffectiveRoute = maxRoute(s.EffectiveRoute, s.InitialRoute)
+	ru.observeRules(rulesForTasks(ru.cfg.Triage.Rules, o.Tasks))
+	if err := saveState(ru.repo, s); err != nil {
+		return err
+	}
+	if o.Route != "" || ru.cfg.Triage.Profile == "" {
+		return nil
+	}
+	prompt, err := renderPrompt("triage.md", ru.triagePrompt, promptData{Outcome: o, Features: featureIndexBlock(ru.memory)})
+	if err != nil {
+		return err
+	}
+	base, err := headCommit(ru.repo.Root)
+	if err != nil {
+		return err
+	}
+	wt := ru.repo.WorktreePath(o.ID + "-triage")
+	if err := addWorktreeDetached(ru.repo.Root, wt, base); err != nil {
+		return err
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			removeWorktree(ru.repo.Root, wt)
+		}
+	}()
+	if err := verifyCheckout(wt, base); err != nil {
+		return err
+	}
+	runDir := ru.repo.RunDir(o.ID, "triage")
+	outPath, runErr := runAgent(ctx, ru.cfg.Profiles[ru.cfg.Triage.Profile], ru.cfg.PassEnv, wt, prompt, runDir, "triage")
+	out, readErr := os.ReadFile(outPath)
+	s.TriageOutput = string(out)
+	checkoutErr := verifyCheckout(wt, base)
+	parsed := parseRoute(string(out))
+	if runErr == nil && readErr == nil && checkoutErr == nil && parsed != "" {
+		s.InitialRoute, s.TriageSource = parsed, "model"
+		// The provisional new route was a crash fallback, not an observation.
+		s.EffectiveRoute, s.Roles = parsed, nil
+		ru.observeRules(rulesForTasks(ru.cfg.Triage.Rules, o.Tasks))
+	}
+	if uncertainExit(runErr) {
+		keep = true
+		s.TriageWorktree = wt
+	}
+	if err := writePrivateJSON(filepath.Join(runDir, "result.json"), map[string]any{
+		"parsed_route": parsed, "initial_route": s.InitialRoute, "source": s.TriageSource,
+		"error": fmt.Sprint(errors.Join(runErr, readErr, checkoutErr)),
+	}); err != nil {
+		return err
+	}
+	if err := saveState(ru.repo, s); err != nil {
+		return err
+	}
+	if s.TriageSource == "fallback-failed" {
+		ru.logf("warning: triage failed or gave no valid ROUTE; using new")
+	}
+	return ctx.Err()
+}
+
+func (ru *runner) newRequirements() string {
+	if ru.state.EffectiveRoute != RouteNew {
+		return ""
+	}
+	var missing []string
+	spec, exists := ru.memory.Spec(ru.outcome.Feature)
+	if ru.outcome.Feature == "" || !exists {
+		missing = append(missing, "a declared feature with a spec in product memory")
+	} else if !spec.Approved() {
+		missing = append(missing, "owner approval of the current spec (aeh memory approve "+ru.outcome.Feature+")")
+	}
+	if ru.outcome.Level < 2 {
+		missing = append(missing, "level 2")
+	}
+	if ru.seal == nil {
+		missing = append(missing, "approved, unchanged sealed acceptance tests (aeh tests approve <ID>)")
+	}
+	if len(missing) == 0 {
+		return ""
+	}
+	question := "Route new is blocked. Missing: " + strings.Join(missing, "; ") + ". The owner must prepare these requirements and create an outcome with another ID. aeh answer cannot resume this run because the contract changes."
+	if strings.HasPrefix(ru.outcome.ID, "DO-") {
+		question += " Turn this change into aeh/outcomes/<another-ID>.yaml with feature, change, changelog, level: 2, criteria, acceptance paths and tasks; approve the spec and seal the tests, then run aeh run <another-ID>."
+	}
+	return question
 }
 
 // verifySeal checks that the committed acceptance tests are exactly the ones approved.
