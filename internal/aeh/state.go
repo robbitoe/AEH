@@ -22,15 +22,28 @@ const (
 
 // Attempt is one try of a task with one profile.
 type Attempt struct {
-	N          int       `json:"n"`
-	Profile    string    `json:"profile"`
-	Passed     bool      `json:"passed"`
-	FailedGate string    `json:"failed_gate,omitempty"`
-	RunDir     string    `json:"run_dir"`
-	Commit     string    `json:"commit,omitempty"`
-	Worktree   string    `json:"retained_worktree,omitempty"`
-	StartedAt  time.Time `json:"started_at"`
-	Seconds    float64   `json:"seconds"`
+	Reviews     []ReviewVerdict `json:"reviews,omitempty"`
+	RolesNotRun []string        `json:"roles_not_run,omitempty"`
+	N           int             `json:"n"`
+	Profile     string          `json:"profile"`
+	Passed      bool            `json:"passed"`
+	FailedGate  string          `json:"failed_gate,omitempty"`
+	RunDir      string          `json:"run_dir"`
+	Base        string          `json:"base,omitempty"`
+	Commit      string          `json:"commit,omitempty"`
+	Worktree    string          `json:"retained_worktree,omitempty"`
+	StartedAt   time.Time       `json:"started_at"`
+	Seconds     float64         `json:"seconds"`
+}
+
+// ReviewVerdict binds a role's decision to the exact candidate and selected reviewer.
+type ReviewVerdict struct {
+	Role         string `json:"role"`
+	Profile      string `json:"profile"`
+	Provider     string `json:"provider"`
+	SHA          string `json:"sha"`
+	Verdict      string `json:"verdict"`
+	PromptSource string `json:"prompt_source"`
 }
 
 // TaskState tracks one task across runs.
@@ -42,21 +55,30 @@ type TaskState struct {
 
 // State is the local, ignored record of an outcome's execution.
 type State struct {
-	ID            string      `json:"id"`
-	Title         string      `json:"title"`
-	Status        string      `json:"status"`
-	Base          string      `json:"base"`
-	Head          string      `json:"verified_head"`
-	Contract      string      `json:"contract_sha256"`
-	FinalRun      string      `json:"final_run,omitempty"`
-	MemoryVersion string      `json:"memory_version,omitempty"`
-	MemoryCommit  string      `json:"memory_commit,omitempty"`
-	MemoryError   string      `json:"memory_error,omitempty"`
-	Branch        string      `json:"branch"`
-	Tasks         []TaskState `json:"tasks"`
-	Question      string      `json:"question,omitempty"`
-	Answers       []string    `json:"answers,omitempty"`
-	UpdatedAt     time.Time   `json:"updated_at"`
+	Version         int         `json:"version"`
+	InitialRoute    string      `json:"initial_route"`
+	EffectiveRoute  string      `json:"effective_route"`
+	Roles           []string    `json:"roles"`
+	TriageSource    string      `json:"triage_source"`
+	TriageOutput    string      `json:"triage_output"`
+	TriageWorktree  string      `json:"triage_worktree,omitempty"`
+	RulesHit        []string    `json:"rules_hit"`
+	RestartRequired bool        `json:"restart_required,omitempty"`
+	ID              string      `json:"id"`
+	Title           string      `json:"title"`
+	Status          string      `json:"status"`
+	Base            string      `json:"base"`
+	Head            string      `json:"verified_head"`
+	Contract        string      `json:"contract_sha256"`
+	FinalRun        string      `json:"final_run,omitempty"`
+	MemoryVersion   string      `json:"memory_version,omitempty"`
+	MemoryCommit    string      `json:"memory_commit,omitempty"`
+	MemoryError     string      `json:"memory_error,omitempty"`
+	Branch          string      `json:"branch"`
+	Tasks           []TaskState `json:"tasks"`
+	Question        string      `json:"question,omitempty"`
+	Answers         []string    `json:"answers,omitempty"`
+	UpdatedAt       time.Time   `json:"updated_at"`
 }
 
 func (s *State) task(id string) *TaskState {
@@ -76,7 +98,7 @@ func loadState(r Repo, id string) (State, error) {
 	}
 	b, err := os.ReadFile(r.StatePath(id))
 	if errors.Is(err, os.ErrNotExist) {
-		return State{ID: id, Status: StatusPending}, nil
+		return State{Version: 2, ID: id, Status: StatusPending}, nil
 	}
 	if err != nil {
 		return s, err
@@ -147,6 +169,12 @@ func Answer(r Repo, id, text string) error {
 	s, err := loadState(r, id)
 	if err != nil {
 		return err
+	}
+	if s.Version != 2 {
+		return errors.New("pre-stage-2 state cannot resume; relaunch with another outcome ID")
+	}
+	if s.RestartRequired {
+		return errors.New(s.Question)
 	}
 	if s.Status != StatusBlocked {
 		return errors.New("outcome " + id + " is not blocked (status: " + s.Status + ")")

@@ -28,9 +28,10 @@ Definition
 
 Execution
   aeh run <ID>                      run an outcome until it is accepted or blocked
-  aeh do "<change>" [flags]         level 1: one agent, gates only, no sealed tests
+  aeh do "<change>" [flags]         level 1: gates and route-based reviews, no sealed tests
         --paths a/,b/               restrict the change to these paths
         --profile <name>            start with this profile
+        --route trivial|change|new   declare the route instead of model triage
         --feature <f> --change patch|minor|major --note "..."
                                     the feature this change modifies; recorded in memory
   aeh answer <ID> "<text>"          answer a blocked outcome so it can run again
@@ -117,6 +118,7 @@ func dispatch(ctx context.Context, args []string) (int, error) {
 		fs := flag.NewFlagSet("do", flag.ContinueOnError)
 		paths := fs.String("paths", "", "comma-separated paths the change may touch")
 		profile := fs.String("profile", "", "profile to start with")
+		route := fs.String("route", "", "trivial, change or new (otherwise triage)")
 		feature := fs.String("feature", "", "feature this change modifies")
 		change := fs.String("change", "", "patch, minor or major")
 		note := fs.String("note", "", "changelog line")
@@ -125,7 +127,7 @@ func dispatch(ctx context.Context, args []string) (int, error) {
 		}
 		text := strings.Join(fs.Args(), " ")
 		link := aeh.MemoryLink{Feature: *feature, Change: *change, Note: *note}
-		st, err := aeh.Do(ctx, repo, text, splitList(*paths), *profile, link, os.Stdout)
+		st, err := aeh.Do(ctx, repo, text, splitList(*paths), *profile, link, os.Stdout, *route)
 		return exitCode(st), err
 
 	case "memory":

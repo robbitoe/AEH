@@ -16,6 +16,13 @@ func (ru *runner) writeReport() string {
 	fmt.Fprintf(&b, "# %s: %s\n\n", o.ID, o.Title)
 	fmt.Fprintf(&b, "Status: **%s** · Branch: `%s` · Base: `%s`\n\n", st.Status, st.Branch, short(st.Base))
 	fmt.Fprintf(&b, "Recorded branch head: `%s` · Contract SHA-256: `%s`\n\n", st.Head, st.Contract)
+	fmt.Fprintf(&b, "Route: initial **%s**, effective **%s** · Source: `%s`\n\nRules hit: %s\n\nRequired roles: %s\n\n", st.InitialRoute, st.EffectiveRoute, st.TriageSource, strings.Join(st.RulesHit, ", "), strings.Join(st.Roles, ", "))
+	if st.TriageSource == "fallback-none" {
+		fmt.Fprintf(&b, "%s\n\n", changeDefaultWarning)
+	}
+	if st.TriageWorktree != "" {
+		fmt.Fprintf(&b, "Retained triage worktree: `%s`\n\n", st.TriageWorktree)
+	}
 	if o.Feature != "" {
 		fmt.Fprintf(&b, "Declared feature: `%s` · Change: `%s`\n\n", o.Feature, o.Change)
 		if result := ru.memoryRecordSummary(); result != "" {
@@ -51,6 +58,12 @@ func (ru *runner) writeReport() string {
 	}
 	for _, task := range st.Tasks {
 		for _, attempt := range task.Attempts {
+			for _, v := range attempt.Reviews {
+				fmt.Fprintf(&b, "\n%s attempt %d: review **%s** · Profile: `%s` · Provider: `%s` · SHA: `%s` · Verdict: **%s** · Prompt: `%s`\n", task.ID, attempt.N, v.Role, v.Profile, v.Provider, v.SHA, v.Verdict, v.PromptSource)
+			}
+			if len(attempt.RolesNotRun) > 0 {
+				fmt.Fprintf(&b, "\n%s attempt %d: roles not run: %s\n", task.ID, attempt.N, strings.Join(attempt.RolesNotRun, ", "))
+			}
 			writeDriftEvidence(&b, r.Root, attempt.RunDir, fmt.Sprintf("%s attempt %d", task.ID, attempt.N))
 		}
 	}
