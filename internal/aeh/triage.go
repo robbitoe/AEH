@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Routes decide who reviews a change. Levels decide whether acceptance tests are sealed.
@@ -140,8 +142,8 @@ func (rule TriageRule) validate() error {
 		return errors.New("needs at least one path")
 	}
 	for _, p := range rule.Paths {
-		if strings.TrimSpace(p) == "" {
-			return errors.New("has an empty path")
+		if len(ruleSegments(p)) == 0 {
+			return fmt.Errorf("path %q names no directory or file; use \"**\" to match everything", p)
 		}
 		for _, seg := range ruleSegments(p) {
 			if _, err := path.Match(seg, ""); err != nil {
@@ -312,6 +314,30 @@ type ReviewerPolicy struct {
 	QA           []string `yaml:"qa"`
 	Security     []string `yaml:"security"`
 	DBA          []string `yaml:"dba"`
+	// declared is true when the config has a reviewers section, even an empty one: then the
+	// legacy single reviewer no longer applies.
+	declared bool
+}
+
+// UnmarshalYAML marks the section as declared and rejects unknown keys, so a misspelled
+// role cannot silently drop a review.
+func (p *ReviewerPolicy) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind != yaml.MappingNode {
+		return fmt.Errorf("reviewers must be a mapping of independence and roles")
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		switch k := n.Content[i].Value; k {
+		case "independence", RoleQA, RoleSecurity, RoleDBA:
+		default:
+			return fmt.Errorf("reviewers: unknown key %q (expected independence, qa, security or dba)", k)
+		}
+	}
+	type plain ReviewerPolicy
+	if err := n.Decode((*plain)(p)); err != nil {
+		return err
+	}
+	p.declared = true
+	return nil
 }
 
 func (p ReviewerPolicy) list(role string) []string {
@@ -326,14 +352,10 @@ func (p ReviewerPolicy) list(role string) []string {
 	return nil
 }
 
-func (p ReviewerPolicy) empty() bool {
-	return len(p.QA) == 0 && len(p.Security) == 0 && len(p.DBA) == 0
-}
-
 // reviewerCandidates returns the profiles that may review a role. Without a reviewers
 // section, the legacy single reviewer covers every role.
 func (c Config) reviewerCandidates(role string) []string {
-	if c.Reviewers.empty() {
+	if !c.Reviewers.declared {
 		if c.Reviewer != "" {
 			return []string{c.Reviewer}
 		}

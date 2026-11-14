@@ -143,7 +143,7 @@ func independenceConfig(policy string) Config {
 		"codex-review":  {Provider: "openai", Command: []string{"codex"}},
 		"claude-review": {Provider: "anthropic", Command: []string{"claude"}},
 	}}
-	c.Reviewers = ReviewerPolicy{Independence: policy,
+	c.Reviewers = ReviewerPolicy{Independence: policy, declared: true,
 		QA:       []string{"claude-review", "codex-review"},
 		Security: []string{"codex-review", "claude-review"},
 	}
@@ -272,6 +272,13 @@ func TestConfigValidatesStage2Fields(t *testing.T) {
 		"api transport":     "  c: {transport: api, command: [x]}\n",
 		"unknown transport": "  c: {transport: grpc, command: [x]}\n",
 		"spaced provider":   "  c: {provider: \"open ai\", command: [x]}\n",
+		"nbsp provider":     "  c: {provider: \"\u00a0\", command: [x]}\n",
+		"em space provider": "  c: {provider: \"\u2003\", command: [x]}\n",
+		"control provider":  "  c: {provider: \"a\\x01\", command: [x]}\n",
+		"unknown role key":  "reviewers: {qa: [b], ops: [b]}\n",
+		"reviewers list":    "reviewers: [b]\n",
+		"root rule path":    "triage: {rules: [{name: x, paths: [\"./\"], route: new}]}\n",
+		"dot rule path":     "triage: {rules: [{name: x, paths: [\".\"], route: new}]}\n",
 		"policy":            "reviewers: {independence: none}\n",
 		"unknown reviewer":  "reviewers: {qa: [missing]}\n",
 		"triage profile":    "triage: {profile: missing}\n",
@@ -297,6 +304,24 @@ func TestConfigValidatesStage2Fields(t *testing.T) {
 	good := baseConfig + "reviewers: {independence: profile, qa: [b], dba: [b]}\ntriage: {profile: b, rules: [{name: data, paths: [\"**/*.sql\"], reviewers: [dba]}]}\n"
 	if _, err := writeConfig(t, good); err != nil {
 		t.Errorf("valid stage 2 config rejected: %v", err)
+	}
+}
+
+// An explicit reviewers section replaces the legacy reviewer, even when it is empty.
+func TestDeclaredReviewersReplaceLegacy(t *testing.T) {
+	cfg, err := writeConfig(t, baseConfig+"reviewer: b\nreviewers: {}\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := cfg.reviewerFor(RoleQA, "a"); err == nil {
+		t.Errorf("empty reviewers section must not fall back to the legacy reviewer, got %q", got)
+	}
+	cfg, err = writeConfig(t, baseConfig+"reviewer: b\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := cfg.reviewerFor(RoleSecurity, "a"); err != nil || got != "b" {
+		t.Errorf("legacy reviewer without a reviewers section: %q %v", got, err)
 	}
 }
 

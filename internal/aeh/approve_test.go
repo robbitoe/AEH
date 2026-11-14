@@ -134,6 +134,8 @@ func TestInvalidApprovalFileIsRejected(t *testing.T) {
 		"version: 0.1.0\ncontent_sha256: abc\ndate: x\n",
 		"version: one\ncontent_sha256: " + strings.Repeat("a", 64) + "\n",
 		"version: 0.1.0\ncontent_sha256: " + strings.Repeat("a", 64) + "\napproved_by: me\n",
+		"version: 0.1.0\ncontent_sha256: " + strings.Repeat("a", 64) + "\n---\napproved_by: me\n",
+		"version: 0.1.0\ncontent_sha256: " + strings.Repeat("a", 64) + "\n---\n: [broken\n",
 	} {
 		if err := os.WriteFile(p, []byte(bad), 0o644); err != nil {
 			t.Fatal(err)
@@ -148,5 +150,37 @@ func TestSpecTextStopsAtChangelog(t *testing.T) {
 	body := "# X\n\nText.\n\n```\n## Changelog\n```\n\n## Changelog\n- 0.1.0 created\n"
 	if got := specText(body); got != "# X\n\nText.\n\n```\n## Changelog\n```\n\n" {
 		t.Errorf("specText = %q", got)
+	}
+	// A three-backtick line inside a four-backtick fence is content, not the end of the fence,
+	// so the heading after it is not the cut and the requirement below it stays covered.
+	nested := "# X\n\n````md\n```\n## Changelog\nRequirement A.\n````\n\n## Changelog\n- 0.1.0 created\n"
+	if got, want := specText(nested), strings.TrimSuffix(nested, "## Changelog\n- 0.1.0 created\n"); got != want {
+		t.Errorf("nested fence: specText = %q, want %q", got, want)
+	}
+	tilde := "# X\n~~~\n```\n## Changelog\n~~~\n## Changelog\n"
+	if got := specText(tilde); got != "# X\n~~~\n```\n## Changelog\n~~~\n" {
+		t.Errorf("tilde fence: %q", got)
+	}
+	if err := checkChangelog("# X\n````\n```\n## Changelog\n````\n## Notes\n"); err == nil {
+		t.Error("a changelog heading inside a fence must not satisfy checkChangelog")
+	}
+}
+
+func TestApproveRefusesDirtyMemoryEvenWhenApproved(t *testing.T) {
+	r := newMemoryProject(t)
+	if _, err := CreateSpec(r, "checkout", "Checkout", []string{"src/checkout/**"}); err != nil {
+		t.Fatal(err)
+	}
+	describeSpec(t, r, "checkout", "Pay once.")
+	snap, _ := LoadMemory(r)
+	spec, _ := snap.Spec("checkout")
+	// A hand-written, uncommitted approval with the right digest.
+	body := "version: 0.1.0\ncontent_sha256: " + specContentHash(spec) + "\ndate: 2026-11-13\n"
+	p := filepath.Join(memDir(t, r), "wiki", "features", "checkout", approvalFile)
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ApproveSpec(r, "checkout"); err == nil || !strings.Contains(err.Error(), "commit your spec edits") {
+		t.Fatalf("uncommitted approval must be refused: %v", err)
 	}
 }

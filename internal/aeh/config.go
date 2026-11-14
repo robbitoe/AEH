@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
@@ -166,12 +167,23 @@ func (c *Config) validate() error {
 		default:
 			return fmt.Errorf("config: profile %q: transport %q must be cli", name, p.Transport)
 		}
-		if strings.ContainsAny(p.Provider, " \t\r\n") {
-			return fmt.Errorf("config: profile %q: provider must be one word without spaces", name)
+		if !validProvider(p.Provider) {
+			return fmt.Errorf("config: profile %q: provider must be one word of printable characters without spaces", name)
 		}
 		c.Profiles[name] = p
 	}
 	return nil
+}
+
+// validProvider accepts an empty provider (not declared) or one word of printable,
+// non-space characters.
+func validProvider(s string) bool {
+	for _, r := range s {
+		if unicode.IsSpace(r) || !unicode.IsPrint(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // Transports a profile can use. Validation lets only cli through, and runAgent launches it;

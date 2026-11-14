@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -95,22 +96,61 @@ func specContentHash(s Spec) string {
 
 // specText is the body without its final "## Changelog" section.
 func specText(body string) string {
-	cut := -1
-	inFence := false
+	if text, at := lastHeading(body); text == "## Changelog" {
+		return body[:at]
+	}
+	return body
+}
+
+// lastHeading returns the last second-level heading outside fenced code and its offset.
+func lastHeading(body string) (string, int) {
+	last, at := "", -1
+	var f codeFence
 	offset := 0
 	for _, l := range strings.SplitAfter(body, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(l), "```") {
-			inFence = !inFence
-		}
-		if !inFence && strings.TrimSpace(l) == "## Changelog" && strings.HasPrefix(l, "## ") {
-			cut = offset
+		if !f.step(l) && strings.HasPrefix(l, "## ") {
+			last, at = strings.TrimSpace(l), offset
 		}
 		offset += len(l)
 	}
-	if cut < 0 {
-		return body
+	return last, at
+}
+
+// codeFence follows Markdown fenced code blocks: a run of three or more backticks or tildes,
+// indented at most three spaces, opens a block that only a run of the same character at least
+// as long closes. A shorter or different run inside the block is content.
+type codeFence struct {
+	char byte
+	n    int
+}
+
+// step reports whether the line belongs to a fenced block (its fences included).
+func (f *codeFence) step(line string) bool {
+	t := strings.TrimRight(line, "\r\n")
+	trimmed := strings.TrimLeft(t, " ")
+	if len(t)-len(trimmed) > 3 || trimmed == "" {
+		return f.n > 0
 	}
-	return body[:cut]
+	c := trimmed[0]
+	if c != '`' && c != '~' {
+		return f.n > 0
+	}
+	n := len(trimmed) - len(strings.TrimLeft(trimmed, string(c)))
+	if n < 3 {
+		return f.n > 0
+	}
+	rest := trimmed[n:]
+	if f.n == 0 {
+		if c == '`' && strings.Contains(rest, "`") {
+			return false // an inline code span, not a fence
+		}
+		f.char, f.n = c, n
+		return true
+	}
+	if c == f.char && n >= f.n && strings.TrimSpace(rest) == "" {
+		f.n = 0
+	}
+	return true
 }
 
 // MemorySnapshot is what a run reads from memory. Fingerprint covers everything the drift
@@ -524,6 +564,9 @@ func readApproval(p string) (*SpecApproval, error) {
 	if err := dec.Decode(&a); err != nil {
 		return nil, fmt.Errorf("%s: %w", approvalFile, err)
 	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%s: must hold exactly one YAML document", approvalFile)
+	}
 	if _, err := parseSemver(a.Version); err != nil {
 		return nil, fmt.Errorf("%s: %w", approvalFile, err)
 	}
@@ -552,11 +595,11 @@ func ApproveSpec(r Repo, feature string) (Spec, bool, error) {
 	if !ok {
 		return Spec{}, false, fmt.Errorf("feature %q does not exist in memory", feature)
 	}
-	if spec.Approved() {
-		return spec, false, nil
-	}
 	if err := memoryClean(snap.Dir); err != nil {
 		return Spec{}, false, fmt.Errorf("approve %s: %w; commit your spec edits in the memory repository first", feature, err)
+	}
+	if spec.Approved() {
+		return spec, false, nil
 	}
 	if strings.Contains(spec.Body, specPlaceholder) {
 		return Spec{}, false, fmt.Errorf("approve %s: the spec still has the placeholder text; describe the feature first", feature)
@@ -933,17 +976,7 @@ func parseSpec(text string) (Spec, error) {
 
 // checkChangelog requires "## Changelog" as the last second-level heading, so records append at the end.
 func checkChangelog(body string) error {
-	last := ""
-	inFence := false
-	for _, l := range strings.Split(body, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(l), "```") {
-			inFence = !inFence
-		}
-		if !inFence && strings.HasPrefix(l, "## ") {
-			last = strings.TrimSpace(l)
-		}
-	}
-	if last != "## Changelog" {
+	if last, _ := lastHeading(body); last != "## Changelog" {
 		return errors.New(`spec must end with a "## Changelog" section`)
 	}
 	return nil
