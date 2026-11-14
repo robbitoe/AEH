@@ -139,9 +139,21 @@ func normalizeCriterion(text string) string {
 
 // isCriteriaHeadingText reports text that reads as "Acceptance criteria" once markers are
 // removed, in any case: a second, differently written section the owner would take as real.
+// Any white space between or around the words counts (two spaces, NBSP, tabs).
 func isCriteriaHeadingText(line string) bool {
-	return strings.EqualFold(strings.Trim(line, "#>-*+=_ \t"), strings.TrimPrefix(criteriaHeading, "## "))
+	words := strings.Fields(strings.Map(func(r rune) rune {
+		if strings.ContainsRune("#>-*+=_:", r) {
+			return ' '
+		}
+		return r
+	}, line))
+	return strings.EqualFold(strings.Join(words, " "), strings.TrimPrefix(criteriaHeading, "## "))
 }
+
+// refDefinition matches a link reference definition. Definitions resolve references anywhere
+// in the document, so a criterion could change meaning without its own text changing; and a
+// multiline title can swallow lines. A spec with criteria may not have them.
+var refDefinition = regexp.MustCompile(`^ {0,3}\[[^\]]*\]:`)
 
 func isASCIIBlank(line string) bool { return strings.Trim(line, " \t") == "" }
 
@@ -185,6 +197,9 @@ func parseCriteria(body string) (crit []SpecCriterion, present bool, err error) 
 		if strings.Contains(line, "<") {
 			note(n, `"<" is not allowed outside fences in a spec with acceptance criteria, because raw HTML can hide text; write it in a fence or in words`)
 		}
+		if refDefinition.MatchString(line) {
+			note(n, "link reference definitions are not allowed in a spec with acceptance criteria; write links inline as [text](target)")
+		}
 		if level, text := headingAt0(line); level > 0 {
 			if isCriteriaHeadingText(text) && (level != 2 || text != strings.TrimPrefix(criteriaHeading, "## ")) {
 				note(n, fmt.Sprintf("the criteria heading must read exactly %q", criteriaHeading))
@@ -203,7 +218,7 @@ func parseCriteria(body string) (crit []SpecCriterion, present bool, err error) 
 		if !in {
 			if strayLine.MatchString(line) {
 				note(n, fmt.Sprintf(`"AC-<n>:" outside the %q section would not be planned; move the criterion into the section, or refer to it as AC-<n> without a colon`, criteriaHeading))
-				attempted = attempted || criterionLine.MatchString(line)
+				attempted = true // any shape: "* AC-1:", "1. AC-1:", "> - AC-1:", "Also AC-1:"
 			}
 			if isCriteriaHeadingText(line) {
 				note(n, fmt.Sprintf("only the heading %q starts the criteria section; rename this line", criteriaHeading))
