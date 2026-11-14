@@ -28,6 +28,14 @@ func TestInitTemplateLoadsAndPipesPrompts(t *testing.T) {
 	if cfg.Triage.Profile == "" || len(cfg.Triage.Rules) == 0 {
 		t.Error("template should enable triage with example rules")
 	}
+	for _, example := range []string{"# plan:", "#   ladder: []", "#   acceptance_dir: tests/acceptance", "#   max_diff_lines: 400", "#   max_files: 20", "#   max_bytes: 262144", `# acceptance: 'node scripts/acceptance.js --manifest "{{manifest}}"'`} {
+		if !strings.Contains(configTemplate, example) {
+			t.Errorf("template missing plan example %q", example)
+		}
+	}
+	if cfg.Commands.Acceptance != "" || cfg.plan().AcceptanceDir != "tests/acceptance" {
+		t.Error("commented plan settings should retain defaults and optional acceptance command")
+	}
 	for name, p := range cfg.Profiles {
 		if !p.Stdin {
 			t.Errorf("profile %s does not read the prompt from stdin", name)

@@ -32,6 +32,7 @@ type Config struct {
 	Commands struct {
 		Build          string `yaml:"build"`
 		Test           string `yaml:"test"`
+		Acceptance     string `yaml:"acceptance"`
 		TimeoutMinutes int    `yaml:"timeout_minutes"`
 	} `yaml:"commands"`
 	PassEnv   []string `yaml:"pass_env"`
@@ -40,6 +41,7 @@ type Config struct {
 		MaxDiffLines int `yaml:"max_diff_lines"`
 	} `yaml:"limits"`
 	Ladder    []string       `yaml:"ladder"`
+	Plan      PlanConfig     `yaml:"plan"`
 	Reviewer  string         `yaml:"reviewer"` // legacy: one reviewer for every role
 	Reviewers ReviewerPolicy `yaml:"reviewers"`
 	Triage    struct {
@@ -50,6 +52,81 @@ type Config struct {
 		Webhook string `yaml:"webhook"`
 	} `yaml:"notify"`
 	Profiles map[string]Profile `yaml:"profiles"`
+}
+
+// PlanConfig limits the test author's proposal, independently of implementation limits.
+type PlanConfig struct {
+	Ladder        []string `yaml:"ladder"`
+	AcceptanceDir string   `yaml:"acceptance_dir"`
+	MaxDiffLines  int      `yaml:"max_diff_lines"`
+	MaxFiles      int      `yaml:"max_files"`
+	MaxBytes      int      `yaml:"max_bytes"`
+}
+
+// UnmarshalYAML rejects misspelled plan settings, as ReviewerPolicy does for roles.
+func (p *PlanConfig) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind != yaml.MappingNode {
+		return errors.New("plan must be a mapping of ladder, acceptance_dir and limits")
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		switch k := n.Content[i].Value; k {
+		case "ladder", "acceptance_dir", "max_diff_lines", "max_files", "max_bytes":
+		default:
+			return fmt.Errorf("plan: unknown key %q", k)
+		}
+	}
+	type plain PlanConfig
+	return n.Decode((*plain)(p))
+}
+
+// plan applies defaults in one place, including for callers constructing Config in memory.
+// Zero limits mean omitted; negative limits remain invalid.
+func (c Config) plan() PlanConfig {
+	p := c.Plan
+	if len(p.Ladder) == 0 {
+		p.Ladder = c.Ladder
+	}
+	if p.AcceptanceDir == "" {
+		p.AcceptanceDir = "tests/acceptance"
+	}
+	if p.MaxDiffLines == 0 {
+		p.MaxDiffLines = 400
+	}
+	if p.MaxFiles == 0 {
+		p.MaxFiles = 20
+	}
+	if p.MaxBytes == 0 {
+		p.MaxBytes = 262144
+	}
+	return p
+}
+
+func (c Config) validatePlanConfig() error {
+	if c.Commands.Acceptance != "" && strings.Count(c.Commands.Acceptance, "{{manifest}}") != 1 {
+		return errors.New("config: commands.acceptance must contain {{manifest}} exactly once")
+	}
+	p := c.plan()
+	if err := checkPlanTestPath(p.AcceptanceDir); err != nil {
+		return fmt.Errorf("config: plan.acceptance_dir %q: %w", p.AcceptanceDir, err)
+	}
+	first := strings.Split(p.AcceptanceDir, "/")[0]
+	if strings.EqualFold(first, "aeh") || strings.EqualFold(first, ".aeh") {
+		return fmt.Errorf("config: plan.acceptance_dir %q must be outside aeh/ and .aeh/", p.AcceptanceDir)
+	}
+	if p.MaxDiffLines <= 0 || p.MaxFiles <= 0 || p.MaxBytes <= 0 {
+		return errors.New("config: plan.max_diff_lines, plan.max_files and plan.max_bytes must be positive")
+	}
+	seen := map[string]bool{}
+	for _, name := range p.Ladder {
+		if seen[name] {
+			return fmt.Errorf("config: profile %q appears twice in the plan ladder", name)
+		}
+		seen[name] = true
+		if err := c.checkProfile(name); err != nil {
+			return fmt.Errorf("config: plan ladder: %w", err)
+		}
+	}
+	return nil
 }
 
 // Criterion is one given/when/then scenario of an outcome.
@@ -159,6 +236,9 @@ func checkConfigYAML(b []byte) (reviewersDeclared bool, err error) {
 }
 
 func (c *Config) validate() error {
+	if err := c.validatePlanConfig(); err != nil {
+		return err
+	}
 	if strings.TrimSpace(c.Commands.Test) == "" {
 		return errors.New("config: commands.test is required")
 	}
