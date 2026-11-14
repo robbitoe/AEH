@@ -62,6 +62,55 @@ type Spec struct {
 	Version string
 	Paths   []string
 	Body    string
+	// Approval is the owner's last approval of this spec, or nil. It stays valid while the
+	// title, paths and text before the changelog are unchanged; see Approved.
+	Approval *SpecApproval
+}
+
+// SpecApproval records that the owner approved one exact content of a spec. Transitional
+// until stage 3, where approving a feature becomes part of the spec flow.
+type SpecApproval struct {
+	Version string `yaml:"version"`
+	Content string `yaml:"content_sha256"`
+	Date    string `yaml:"date"`
+}
+
+// Approved reports whether the owner approved the spec as it reads now. Recording an accepted
+// change (version bump, changelog line) keeps the approval; editing the spec voids it.
+func (s Spec) Approved() bool {
+	return s.Approval != nil && s.Approval.Content == specContentHash(s)
+}
+
+// specContentHash covers what the owner approves: title, paths and the text before the changelog.
+func specContentHash(s Spec) string {
+	v := struct {
+		Title string
+		Paths []string
+		Text  string
+	}{s.Title, s.Paths, specText(s.Body)}
+	b, _ := json.Marshal(v)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// specText is the body without its final "## Changelog" section.
+func specText(body string) string {
+	cut := -1
+	inFence := false
+	offset := 0
+	for _, l := range strings.SplitAfter(body, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(l), "```") {
+			inFence = !inFence
+		}
+		if !inFence && strings.TrimSpace(l) == "## Changelog" && strings.HasPrefix(l, "## ") {
+			cut = offset
+		}
+		offset += len(l)
+	}
+	if cut < 0 {
+		return body
+	}
+	return body[:cut]
 }
 
 // MemorySnapshot is what a run reads from memory. Fingerprint covers everything the drift
@@ -345,6 +394,9 @@ func loadMemoryDir(dir string) (MemorySnapshot, error) {
 		if s.Feature != e.Name() {
 			return snap, fmt.Errorf("memory: feature %s: spec declares feature %q", e.Name(), s.Feature)
 		}
+		if s.Approval, err = readApproval(filepath.Join(featuresDir, e.Name(), approvalFile)); err != nil {
+			return snap, fmt.Errorf("memory: feature %s: %w", e.Name(), err)
+		}
 		snap.Specs = append(snap.Specs, s)
 	}
 	sort.Slice(snap.Specs, func(i, j int) bool { return snap.Specs[i].Feature < snap.Specs[j].Feature })
@@ -379,12 +431,13 @@ func (m MemorySnapshot) ContractFingerprint(declared string) string {
 		Paths   []string
 	}
 	v := struct {
-		Present         bool
-		Owners          []owner
-		Declared        string
-		DeclaredTitle   string
-		DeclaredVersion string
-		DeclaredBody    string
+		Present          bool
+		Owners           []owner
+		Declared         string
+		DeclaredTitle    string
+		DeclaredVersion  string
+		DeclaredBody     string
+		DeclaredApproved bool
 	}{Present: m.Present, Declared: declared}
 	for _, s := range m.Specs {
 		v.Owners = append(v.Owners, owner{s.Feature, s.Paths})
@@ -392,6 +445,7 @@ func (m MemorySnapshot) ContractFingerprint(declared string) string {
 			v.DeclaredTitle, v.DeclaredVersion = s.Title, s.Version
 			sum := sha256.Sum256([]byte(s.Body))
 			v.DeclaredBody = hex.EncodeToString(sum[:])
+			v.DeclaredApproved = s.Approved()
 		}
 	}
 	b, _ := json.Marshal(v)
@@ -432,7 +486,7 @@ func CreateSpec(r Repo, feature, title string, paths []string) (Spec, error) {
 	}
 	today := memoryNow().UTC().Format("2006-01-02")
 	text := "---\n" + string(fm) + "---\n# " + front.Title + "\n\n" +
-		"Describe the behavior, acceptance criteria, data and risks of this feature.\n\n" +
+		specPlaceholder + "\n\n" +
 		"## Changelog\n- 0.1.0 (" + today + ") created; not implemented yet.\n"
 	spec, err := parseSpec(text)
 	if err != nil {
@@ -450,6 +504,82 @@ func CreateSpec(r Repo, feature, title string, paths []string) (Spec, error) {
 		return Spec{}, w.restore(snap.Dir, err)
 	}
 	return spec, nil
+}
+
+const approvalFile = "approval.yaml"
+
+func approvalRel(feature string) string { return "wiki/features/" + feature + "/" + approvalFile }
+
+func readApproval(p string) (*SpecApproval, error) {
+	b, err := os.ReadFile(p)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var a SpecApproval
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true)
+	if err := dec.Decode(&a); err != nil {
+		return nil, fmt.Errorf("%s: %w", approvalFile, err)
+	}
+	if _, err := parseSemver(a.Version); err != nil {
+		return nil, fmt.Errorf("%s: %w", approvalFile, err)
+	}
+	if len(a.Content) != 64 || strings.Trim(a.Content, "0123456789abcdef") != "" {
+		return nil, fmt.Errorf("%s: content_sha256 must be a sha256 in hex", approvalFile)
+	}
+	return &a, nil
+}
+
+// ApproveSpec records the owner's approval of a feature's spec as it reads now, in one memory
+// commit. Approving an unchanged, already approved spec does nothing and returns false.
+func ApproveSpec(r Repo, feature string) (Spec, bool, error) {
+	unlock, err := lockProject(r)
+	if err != nil {
+		return Spec{}, false, err
+	}
+	defer unlock()
+	snap, err := LoadMemory(r)
+	if err != nil {
+		return Spec{}, false, err
+	}
+	if !snap.Present {
+		return Spec{}, false, errors.New("memory is not initialized; run: aeh memory init")
+	}
+	spec, ok := snap.Spec(feature)
+	if !ok {
+		return Spec{}, false, fmt.Errorf("feature %q does not exist in memory", feature)
+	}
+	if spec.Approved() {
+		return spec, false, nil
+	}
+	if err := memoryClean(snap.Dir); err != nil {
+		return Spec{}, false, fmt.Errorf("approve %s: %w; commit your spec edits in the memory repository first", feature, err)
+	}
+	if strings.Contains(spec.Body, specPlaceholder) {
+		return Spec{}, false, fmt.Errorf("approve %s: the spec still has the placeholder text; describe the feature first", feature)
+	}
+	today := memoryNow().UTC().Format("2006-01-02")
+	a := SpecApproval{Version: spec.Version, Content: specContentHash(spec), Date: today}
+	b, err := yaml.Marshal(a)
+	if err != nil {
+		return Spec{}, false, err
+	}
+	w := memoryWrites{}
+	err = w.write(snap.Dir, approvalRel(feature), b)
+	if err == nil {
+		err = appendLog(snap.Dir, w, "["+today+"] approve | "+feature+" "+spec.Version) // the index does not show approvals
+	}
+	if err == nil {
+		err = w.commit(snap.Dir, "approve "+feature+" "+spec.Version)
+	}
+	if err != nil {
+		return Spec{}, false, w.restore(snap.Dir, err)
+	}
+	spec.Approval = &a
+	return spec, true, nil
 }
 
 // RecordChange writes an accepted change into memory: it bumps the feature's version, adds a
@@ -716,6 +846,11 @@ func LintMemory(r Repo) (errs, warnings []string, err error) {
 			}
 		}
 	}
+	for _, s := range snap.Specs {
+		if s.Approval != nil && !s.Approved() {
+			warnings = append(warnings, fmt.Sprintf("feature %s was edited after its approval of %s; approve it again with: aeh memory approve %s", s.Feature, s.Approval.Version, s.Feature))
+		}
+	}
 	if b, err := os.ReadFile(filepath.Join(snap.Dir, "wiki", "index.md")); err != nil || string(b) != renderIndex(snap.Specs) {
 		warnings = append(warnings, "wiki/index.md is out of date; aeh regenerates it on the next write")
 	}
@@ -933,6 +1068,8 @@ func isFullSHA(s string) bool {
 	return true
 }
 
+const specPlaceholder = "Describe the behavior, acceptance criteria, data and risks of this feature."
+
 func specRel(feature string) string { return "wiki/features/" + feature + "/spec.md" }
 
 // --- files and git ---
@@ -964,6 +1101,11 @@ func writeIndexAndLog(dir string, w memoryWrites, logEntry string) error {
 	if err := w.write(dir, "wiki/index.md", []byte(renderIndex(snap.Specs))); err != nil {
 		return err
 	}
+	return appendLog(dir, w, logEntry)
+}
+
+// appendLog adds one entry to wiki/log.md.
+func appendLog(dir string, w memoryWrites, logEntry string) error {
 	logPath := filepath.Join(dir, "wiki", "log.md")
 	b, err := os.ReadFile(logPath)
 	if err != nil {
@@ -1220,6 +1362,9 @@ aeh never publishes it. A private backup is the owner's choice.
 - wiki/index.md: generated by aeh; one row per feature with its version and last accepted change.
 - wiki/log.md: append-only; one "## [date] operation | subject" entry per change.
 - wiki/features/<feature>/spec.md: one spec per feature.
+- wiki/features/<feature>/approval.yaml: written by "aeh memory approve <feature>"; the owner
+  approved the spec's title, paths and text (before the changelog) as they read then. Editing
+  any of them voids the approval; recording an accepted change does not.
 
 ## Spec format
 

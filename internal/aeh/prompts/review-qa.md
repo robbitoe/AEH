@@ -1,4 +1,4 @@
-You are reviewing a change written by another agent. Do not modify any file.
+You are the QA reviewer of a change written by another agent. Do not modify any file.
 
 # Outcome {{.Outcome.ID}}: {{.Outcome.Title}}
 {{- if .Outcome.Criteria}}

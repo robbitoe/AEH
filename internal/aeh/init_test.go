@@ -16,10 +16,17 @@ func TestInitTemplateLoadsAndPipesPrompts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("template config does not load: %v", err)
 	}
-	for _, name := range append(append([]string{}, cfg.Ladder...), cfg.Reviewer) {
+	for _, name := range cfg.Ladder {
 		if err := cfg.checkProfile(name); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// Every author on the ladder gets an independent reviewer for every role, and triage is on.
+	if err := cfg.checkIndependence(cfg.reachableAuthors(Task{}), roleOrder); err != nil {
+		t.Errorf("template reviewers: %v", err)
+	}
+	if cfg.Triage.Profile == "" || len(cfg.Triage.Rules) == 0 {
+		t.Error("template should enable triage with example rules")
 	}
 	for name, p := range cfg.Profiles {
 		if !p.Stdin {

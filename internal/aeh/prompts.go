@@ -27,6 +27,7 @@ type promptData struct {
 	Feedback   string
 	Diff       string
 	MemorySpec string
+	Features   string // triage only: slug, title and paths of every feature
 }
 
 // memorySpecBlock exposes only the declared feature as reference data.
@@ -48,6 +49,29 @@ func loadPrompt(r Repo, name string) (string, error) {
 		text, err = defaultPrompts.ReadFile("prompts/" + name)
 	}
 	return string(text), err
+}
+
+// loadReviewPrompt returns the prompt of a reviewer role and where it came from. A project
+// override of the pre-roles review.md still applies to QA.
+func loadReviewPrompt(r Repo, role string) (text, source string, err error) {
+	if !validRole(role) {
+		return "", "", fmt.Errorf("unknown reviewer role %q", role)
+	}
+	name := "review-" + role + ".md"
+	for _, n := range []string{name, "review.md"} {
+		if n == "review.md" && role != RoleQA {
+			break
+		}
+		b, err := os.ReadFile(r.PromptOverride(n))
+		if err == nil {
+			return string(b), "aeh/prompts/" + n, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", "", err
+		}
+	}
+	b, err := defaultPrompts.ReadFile("prompts/" + name)
+	return string(b), "default " + name, err
 }
 
 func renderPrompt(name, text string, data promptData) (string, error) {

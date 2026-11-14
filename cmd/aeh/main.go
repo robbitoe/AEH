@@ -39,7 +39,8 @@ Memory (local, private: .aeh/memory/ of the main checkout, never published by ae
   aeh memory init                   create the memory repository
   aeh memory new <feature> --title "..." --paths a/**,b/**
                                     add a feature spec at version 0.1.0
-  aeh memory status                 features, versions and pending records
+  aeh memory approve <feature>      approve the spec as it reads now (required by route new)
+  aeh memory status                 features, versions, approvals and pending records
   aeh memory lint                   check memory and its privacy settings
   aeh memory record <ID>            retry a pending memory record of an accepted outcome
 
@@ -158,7 +159,7 @@ func dispatch(ctx context.Context, args []string) (int, error) {
 
 func memoryCommand(repo aeh.Repo, args []string) (int, error) {
 	if len(args) == 0 {
-		return 2, errors.New("usage: aeh memory init|new|status|lint|record")
+		return 2, errors.New("usage: aeh memory init|new|approve|status|lint|record")
 	}
 	switch args[0] {
 	case "init":
@@ -191,6 +192,21 @@ func memoryCommand(repo aeh.Repo, args []string) (int, error) {
 		fmt.Printf("created %s %s; describe it in wiki/features/%s/spec.md and commit it in the memory repository\n", s.Feature, s.Version, s.Feature)
 		return 0, nil
 
+	case "approve":
+		if len(args) != 2 {
+			return 2, errors.New("usage: aeh memory approve <feature>")
+		}
+		s, changed, err := aeh.ApproveSpec(repo, args[1])
+		if err != nil {
+			return 1, err
+		}
+		if changed {
+			fmt.Printf("approved %s %s; editing its title, paths or text voids the approval\n", s.Feature, s.Version)
+		} else {
+			fmt.Printf("%s %s is already approved as it reads now\n", s.Feature, s.Version)
+		}
+		return 0, nil
+
 	case "status":
 		st, err := aeh.ReadMemoryStatus(repo)
 		if err != nil {
@@ -213,7 +229,14 @@ func memoryCommand(repo aeh.Repo, args []string) (int, error) {
 			if last == "" {
 				last = "not implemented yet"
 			}
-			fmt.Printf("%-24s %-9s %s\n", s.Feature, s.Version, last)
+			approval := "not approved"
+			switch {
+			case s.Approved():
+				approval = "approved " + s.Approval.Date
+			case s.Approval != nil:
+				approval = "edited after approval of " + s.Approval.Version
+			}
+			fmt.Printf("%-24s %-9s %-28s %s\n", s.Feature, s.Version, approval, last)
 		}
 		for _, p := range st.Pending {
 			fmt.Printf("pending record: %s -> %s (%s); retry with: aeh memory record %s\n", p.OutcomeID, p.Feature, p.Change, p.OutcomeID)
