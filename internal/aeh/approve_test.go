@@ -146,31 +146,49 @@ func TestInvalidApprovalFileIsRejected(t *testing.T) {
 	}
 }
 
-func TestSpecTextStopsAtChangelog(t *testing.T) {
-	body := "# X\n\nText.\n\n```\n## Changelog\n```\n\n## Changelog\n- 0.1.0 created\n"
-	if got := specText(body); got != "# X\n\nText.\n\n```\n## Changelog\n```\n\n" {
-		t.Errorf("specText = %q", got)
+func TestChangelogHeadingOutsideFences(t *testing.T) {
+	for _, body := range []string{
+		"# X\n````\n```\n## Changelog\n````\n## Notes\n",
+		"# X\n```md\n```\u00a0\n## Changelog\n```\n## Notes\n",
+		"# X\n~~~\n## Changelog\n~~~\n",
+	} {
+		if err := checkChangelog(body); err == nil {
+			t.Errorf("a changelog heading inside a fence must not count: %q", body)
+		}
 	}
-	// A three-backtick line inside a four-backtick fence is content, not the end of the fence,
-	// so the heading after it is not the cut and the requirement below it stays covered.
-	nested := "# X\n\n````md\n```\n## Changelog\nRequirement A.\n````\n\n## Changelog\n- 0.1.0 created\n"
-	if got, want := specText(nested), strings.TrimSuffix(nested, "## Changelog\n- 0.1.0 created\n"); got != want {
-		t.Errorf("nested fence: specText = %q, want %q", got, want)
+	if err := checkChangelog("# X\n```\nA\n``` \t\n## Changelog\n"); err != nil {
+		t.Errorf("spaces and tabs may follow a closing fence: %v", err)
 	}
-	tilde := "# X\n~~~\n```\n## Changelog\n~~~\n## Changelog\n"
-	if got := specText(tilde); got != "# X\n~~~\n```\n## Changelog\n~~~\n" {
-		t.Errorf("tilde fence: %q", got)
+}
+
+// The approval digest covers the whole body: no Markdown or HTML construct can hide text.
+func TestApprovalCoversTheWholeBody(t *testing.T) {
+	body := "# Checkout\n<pre>\n## Changelog\nRequirement A.\n</pre>\n\n## Changelog\n- 0.1.0 (2026-11-13) created; not implemented yet.\n"
+	s := Spec{Title: "Checkout", Paths: []string{"src/checkout/**"}, Body: body}
+	s.Approval = &SpecApproval{Version: "0.1.0", Content: approvalDigest(s.Title, s.Paths, s.Body)}
+	if !s.Approved() {
+		t.Fatal("approval of the same content")
 	}
-	// Only spaces or tabs may follow a closing fence; a non-breaking space does not close it.
-	nbsp := "# X\n```md\n```\u00a0\n## Changelog\nRequirement A.\n```\n## Changelog\n"
-	if got, want := specText(nbsp), strings.TrimSuffix(nbsp, "## Changelog\n"); got != want {
-		t.Errorf("nbsp after fence: specText = %q, want %q", got, want)
+	edited := s
+	edited.Body = strings.Replace(body, "Requirement A.", "Requirement B.", 1)
+	if edited.Approved() {
+		t.Error("text inside <pre> must stay covered")
 	}
-	if got := specText("# X\n```\nA\n``` \t\n## Changelog\n"); got != "# X\n```\nA\n``` \t\n" {
-		t.Errorf("spaces and tabs after a closing fence: %q", got)
+	edited.Body = strings.Replace(body, "created; not implemented yet.", "created.", 1)
+	if edited.Approved() {
+		t.Error("a hand edit of the changelog voids the approval")
 	}
-	if err := checkChangelog("# X\n````\n```\n## Changelog\n````\n## Notes\n"); err == nil {
-		t.Error("a changelog heading inside a fence must not satisfy checkChangelog")
+	// Records append changelog lines in aeh's format: still approved, also without a final newline.
+	rec := s
+	rec.Body = strings.TrimSuffix(body, "\n") + "\n- 0.1.1 (2026-11-14) OUT-1 accepted on aeh/OUT-1 @ abc1234: Pay once.\n- 0.2.0 (2026-11-15) OUT-2 accepted on aeh/OUT-2 @ def5678: Pay twice.\n"
+	if !rec.Approved() {
+		t.Error("appended record lines keep the approval")
+	}
+	// A record-looking line in the middle does not.
+	mid := s
+	mid.Body = strings.Replace(body, "Requirement A.", "Requirement A.\n- 0.1.1 (2026-11-14) OUT-1 accepted on aeh/OUT-1 @ abc1234: x", 1)
+	if mid.Approved() {
+		t.Error("only trailing record lines are ignored")
 	}
 }
 
@@ -183,7 +201,7 @@ func TestApproveRefusesDirtyMemoryEvenWhenApproved(t *testing.T) {
 	snap, _ := LoadMemory(r)
 	spec, _ := snap.Spec("checkout")
 	// A hand-written, uncommitted approval with the right digest.
-	body := "version: 0.1.0\ncontent_sha256: " + specContentHash(spec) + "\ndate: 2026-11-13\n"
+	body := "version: 0.1.0\ncontent_sha256: " + approvalDigest(spec.Title, spec.Paths, spec.Body) + "\ndate: 2026-11-13\n"
 	p := filepath.Join(memDir(t, r), "wiki", "features", "checkout", approvalFile)
 	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
 		t.Fatal(err)

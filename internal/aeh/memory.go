@@ -63,8 +63,7 @@ type Spec struct {
 	Version string
 	Paths   []string
 	Body    string
-	// Approval is the owner's last approval of this spec, or nil. It stays valid while the
-	// title, paths and text before the changelog are unchanged; see Approved.
+	// Approval is the owner's last approval of this spec, or nil; see Approved.
 	Approval *SpecApproval
 }
 
@@ -76,30 +75,38 @@ type SpecApproval struct {
 	Date    string `yaml:"date"`
 }
 
-// Approved reports whether the owner approved the spec as it reads now. Recording an accepted
-// change (version bump, changelog line) keeps the approval; editing the spec voids it.
+// Approved reports whether the owner approved the spec as it reads now. The approval covers
+// the title, the paths and the whole body. It survives only what recording accepted changes
+// adds: a version bump in the frontmatter and changelog lines appended at the end in the exact
+// format aeh writes. Any other edit voids it. No Markdown is interpreted, so no construct can
+// hide approved text from the digest.
 func (s Spec) Approved() bool {
-	return s.Approval != nil && s.Approval.Content == specContentHash(s)
+	if s.Approval == nil {
+		return false
+	}
+	body := strings.TrimRight(s.Body, "\n")
+	for {
+		if approvalDigest(s.Title, s.Paths, body) == s.Approval.Content {
+			return true
+		}
+		i := strings.LastIndex(body, "\n")
+		if i < 0 || !acceptedLine.MatchString(body[i+1:]) {
+			return false
+		}
+		body = strings.TrimRight(body[:i], "\n")
+	}
 }
 
-// specContentHash covers what the owner approves: title, paths and the text before the changelog.
-func specContentHash(s Spec) string {
+// approvalDigest hashes what the owner approves: title, paths and body text.
+func approvalDigest(title string, paths []string, body string) string {
 	v := struct {
 		Title string
 		Paths []string
-		Text  string
-	}{s.Title, s.Paths, specText(s.Body)}
+		Body  string
+	}{title, paths, strings.TrimRight(body, "\n")}
 	b, _ := json.Marshal(v)
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
-}
-
-// specText is the body without its final "## Changelog" section.
-func specText(body string) string {
-	if text, at := lastHeading(body); text == "## Changelog" {
-		return body[:at]
-	}
-	return body
 }
 
 // lastHeading returns the last second-level heading outside fenced code and its offset.
@@ -605,7 +612,7 @@ func ApproveSpec(r Repo, feature string) (Spec, bool, error) {
 		return Spec{}, false, fmt.Errorf("approve %s: the spec still has the placeholder text; describe the feature first", feature)
 	}
 	today := memoryNow().UTC().Format("2006-01-02")
-	a := SpecApproval{Version: spec.Version, Content: specContentHash(spec), Date: today}
+	a := SpecApproval{Version: spec.Version, Content: approvalDigest(spec.Title, spec.Paths, spec.Body), Date: today}
 	b, err := yaml.Marshal(a)
 	if err != nil {
 		return Spec{}, false, err
@@ -1396,8 +1403,8 @@ aeh never publishes it. A private backup is the owner's choice.
 - wiki/log.md: append-only; one "## [date] operation | subject" entry per change.
 - wiki/features/<feature>/spec.md: one spec per feature.
 - wiki/features/<feature>/approval.yaml: written by "aeh memory approve <feature>"; the owner
-  approved the spec's title, paths and text (before the changelog) as they read then. Editing
-  any of them voids the approval; recording an accepted change does not.
+  approved the spec's title, paths and text as they read then. Editing any of them voids the
+  approval; recording an accepted change (version bump, changelog line appended by aeh) does not.
 
 ## Spec format
 

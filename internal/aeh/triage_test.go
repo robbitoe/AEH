@@ -280,6 +280,8 @@ func TestConfigValidatesStage2Fields(t *testing.T) {
 		"reviewers bare":    "reviewer: b\nreviewers:\n",
 		"reviewers tilde":   "reviewer: b\nreviewers: ~\n",
 		"reviewers null":    "reviewer: b\nreviewers: null\n",
+		"merge key":         "reviewer: b\n<<: {reviewers: null}\n",
+		"anchor and alias":  "x: &roles {qa: [b]}\nreviewers: *roles\n",
 		"root rule path":    "triage: {rules: [{name: x, paths: [\"./\"], route: new}]}\n",
 		"dot rule path":     "triage: {rules: [{name: x, paths: [\".\"], route: new}]}\n",
 		"policy":            "reviewers: {independence: none}\n",

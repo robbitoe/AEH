@@ -98,19 +98,42 @@ func (r Repo) LoadConfig() (Config, error) {
 	if err := yaml.Unmarshal(b, &c); err != nil {
 		return c, fmt.Errorf("parse config: %w", err)
 	}
-	if err := checkReviewersSection(b); err != nil {
+	if err := checkConfigYAML(b); err != nil {
 		return c, err
 	}
 	return c, c.validate()
 }
 
-// checkReviewersSection rejects a reviewers key whose value is not a mapping. yaml.v3 does not
-// call UnmarshalYAML for null, so "reviewers:", "reviewers: ~" and "reviewers: null" would
-// otherwise leave the legacy reviewer in charge of every role.
-func checkReviewersSection(b []byte) error {
+// checkConfigYAML rejects anchors, aliases and merge keys, and a reviewers key whose value is
+// not a mapping. The config decides who reviews; it must read the same to the owner and to aeh.
+// yaml.v3 does not call UnmarshalYAML for null, so "reviewers:", "reviewers: ~" and
+// "reviewers: null" would otherwise leave the legacy reviewer in charge of every role.
+func checkConfigYAML(b []byte) error {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(b, &doc); err != nil {
 		return fmt.Errorf("parse config: %w", err)
+	}
+	var walk func(n *yaml.Node) error
+	walk = func(n *yaml.Node) error {
+		if n.Kind == yaml.AliasNode || n.Anchor != "" {
+			return fmt.Errorf("config: line %d: YAML anchors and aliases are not supported", n.Line)
+		}
+		if n.Kind == yaml.MappingNode {
+			for i := 0; i+1 < len(n.Content); i += 2 {
+				if n.Content[i].Value == "<<" && n.Content[i].Tag == "!!merge" {
+					return fmt.Errorf("config: line %d: YAML merge keys are not supported", n.Content[i].Line)
+				}
+			}
+		}
+		for _, c := range n.Content {
+			if err := walk(c); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walk(&doc); err != nil {
+		return err
 	}
 	if len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
 		return nil
