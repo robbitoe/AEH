@@ -15,6 +15,8 @@ project: my-project
 commands:
   build: ""            # e.g. "dotnet build -warnaserror" or "npm run build && npm run lint"
   test: "echo set commands.test && exit 1"   # e.g. "dotnet test" or "npm test"
+  # Required for aeh plan: run only the repository-relative test paths in the manifest.
+  # acceptance: 'node scripts/acceptance.js --manifest "{{manifest}}"'
   timeout_minutes: 20
 
 # Agents and build/test commands inherit only OS and tool-discovery variables
@@ -30,6 +32,14 @@ limits:
 # Escalation order. A task starts at the first profile (or its own "start"),
 # retries once with feedback, then tries the next profile, then blocks.
 ladder: [medio, fuerte]
+
+# Plan author settings. Empty ladder uses the main ladder; limits include plan.yaml.
+# plan:
+#   ladder: []
+#   acceptance_dir: tests/acceptance
+#   max_diff_lines: 400
+#   max_files: 20
+#   max_bytes: 262144
 
 # Triage classifies each outcome before any agent runs. The route decides who reviews:
 #   trivial -> qa;  change and new -> qa + security.  Rules may raise the route or add
