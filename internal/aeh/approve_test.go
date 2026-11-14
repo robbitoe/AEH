@@ -178,17 +178,51 @@ func TestApprovalCoversTheWholeBody(t *testing.T) {
 	if edited.Approved() {
 		t.Error("a hand edit of the changelog voids the approval")
 	}
-	// Records append changelog lines in aeh's format: still approved, also without a final newline.
-	rec := s
-	rec.Body = strings.TrimSuffix(body, "\n") + "\n- 0.1.1 (2026-11-14) OUT-1 accepted on aeh/OUT-1 @ abc1234: Pay once.\n- 0.2.0 (2026-11-15) OUT-2 accepted on aeh/OUT-2 @ def5678: Pay twice.\n"
-	if !rec.Approved() {
-		t.Error("appended record lines keep the approval")
+	// Nothing is exempt: a hand-appended line voids it, even in the exact record format.
+	for _, line := range []string{
+		"- 0.1.1 (2026-11-14) OUT-1 accepted on aeh/OUT-1 @ abc1234: Pay once.",
+		"- NOT-A-VERSION (2026-11-13) OUT-1 accepted on unrelated @ a: Added requirement: skip authorization.",
+	} {
+		rec := s
+		rec.Body = body + line + "\n"
+		if rec.Approved() {
+			t.Errorf("hand-appended %q must void the approval", line)
+		}
 	}
-	// A record-looking line in the middle does not.
-	mid := s
-	mid.Body = strings.Replace(body, "Requirement A.", "Requirement A.\n- 0.1.1 (2026-11-14) OUT-1 accepted on aeh/OUT-1 @ abc1234: x", 1)
-	if mid.Approved() {
-		t.Error("only trailing record lines are ignored")
+}
+
+// RecordChange carries a valid approval forward; it never revives a voided one.
+func TestRecordCarriesOnlyValidApprovals(t *testing.T) {
+	r := newMemoryProject(t)
+	if _, err := CreateSpec(r, "checkout", "Checkout", []string{"src/checkout/**"}); err != nil {
+		t.Fatal(err)
+	}
+	describeSpec(t, r, "checkout", "Pay once.")
+	if _, _, err := ApproveSpec(r, "checkout"); err != nil {
+		t.Fatal(err)
+	}
+	dir := memDir(t, r)
+	// The owner edits and commits the spec after approving it: the approval is void.
+	sp := filepath.Join(dir, "wiki", "features", "checkout", "spec.md")
+	if err := os.WriteFile(sp, []byte(strings.Replace(readFile(t, sp), "Pay once.", "Pay twice.", 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "edit after approval")
+	before := readFile(t, filepath.Join(dir, "wiki", "features", "checkout", approvalFile))
+	snap, _ := LoadMemory(r)
+	p := PendingRecord{OutcomeID: "OUT-1", Feature: "checkout", Change: "patch", Note: "x.", Commit: fakeSHA('c')}
+	if _, _, err := RecordChange(r, p, snap.Fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	snap, _ = LoadMemory(r)
+	if spec, _ := snap.Spec("checkout"); spec.Approved() {
+		t.Error("a record must not revive a voided approval")
+	}
+	if after := readFile(t, filepath.Join(dir, "wiki", "features", "checkout", approvalFile)); after != before {
+		t.Error("a voided approval file must stay as it was")
+	}
+	if err := memoryClean(dir); err != nil {
+		t.Fatal(err)
 	}
 }
 

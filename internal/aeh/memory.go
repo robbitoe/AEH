@@ -75,26 +75,12 @@ type SpecApproval struct {
 	Date    string `yaml:"date"`
 }
 
-// Approved reports whether the owner approved the spec as it reads now. The approval covers
-// the title, the paths and the whole body. It survives only what recording accepted changes
-// adds: a version bump in the frontmatter and changelog lines appended at the end in the exact
-// format aeh writes. Any other edit voids it. No Markdown is interpreted, so no construct can
-// hide approved text from the digest.
+// Approved reports whether the owner approved the spec as it reads now: the digest of its
+// title, paths and whole body equals the approved one. No Markdown is interpreted and nothing
+// is exempt, so any edit voids it. Recording an accepted change carries a valid approval
+// forward in the same memory commit (see RecordChange); a hand edit never does.
 func (s Spec) Approved() bool {
-	if s.Approval == nil {
-		return false
-	}
-	body := strings.TrimRight(s.Body, "\n")
-	for {
-		if approvalDigest(s.Title, s.Paths, body) == s.Approval.Content {
-			return true
-		}
-		i := strings.LastIndex(body, "\n")
-		if i < 0 || !acceptedLine.MatchString(body[i+1:]) {
-			return false
-		}
-		body = strings.TrimRight(body[:i], "\n")
-	}
+	return s.Approval != nil && s.Approval.Content == approvalDigest(s.Title, s.Paths, s.Body)
 }
 
 // approvalDigest hashes what the owner approves: title, paths and body text.
@@ -696,11 +682,22 @@ func RecordChange(r Repo, p PendingRecord, expectedFingerprint string) (version,
 		text += "\n"
 	}
 	text += line
-	if _, err := parseSpec(text); err != nil {
+	updated, err := parseSpec(text)
+	if err != nil {
 		return "", "", fmt.Errorf("record %s: updated spec is invalid: %w", p.OutcomeID, err)
 	}
 	w := memoryWrites{}
 	err = w.write(dir, rel, []byte(text))
+	if err == nil && spec.Approved() {
+		// The owner approved the spec as it read before this record; aeh only bumped the
+		// version and appended its own changelog line, so the approval carries forward.
+		a := *spec.Approval
+		a.Content = approvalDigest(updated.Title, updated.Paths, updated.Body)
+		var b []byte
+		if b, err = yaml.Marshal(a); err == nil {
+			err = w.write(dir, approvalRel(p.Feature), b)
+		}
+	}
 	if err == nil {
 		err = writeIndexAndLog(dir, w, fmt.Sprintf("[%s] record | %s %s | %s @ %s", today, p.Feature, version, p.OutcomeID, short))
 	}
@@ -1403,8 +1400,8 @@ aeh never publishes it. A private backup is the owner's choice.
 - wiki/log.md: append-only; one "## [date] operation | subject" entry per change.
 - wiki/features/<feature>/spec.md: one spec per feature.
 - wiki/features/<feature>/approval.yaml: written by "aeh memory approve <feature>"; the owner
-  approved the spec's title, paths and text as they read then. Editing any of them voids the
-  approval; recording an accepted change (version bump, changelog line appended by aeh) does not.
+  approved the spec's title, paths and text as they read then. Editing any of them by hand voids
+  the approval. Recording an accepted change carries a valid approval forward in the same commit.
 
 ## Spec format
 
