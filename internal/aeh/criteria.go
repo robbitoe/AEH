@@ -157,6 +157,10 @@ func isCriteriaHeadingText(line string) bool {
 // multiline title can swallow lines. A spec with criteria may not have "]:" outside fences.
 const refDefinitionMark = "]:"
 
+// entityRef matches an HTML entity or numeric character reference, which Markdown renders as
+// another character ("Acceptance&nbsp;criteria" reads as a heading aeh would not recognize).
+var entityRef = regexp.MustCompile(`&(?:[A-Za-z][A-Za-z0-9]{0,31}|#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6});`)
+
 func isASCIIBlank(line string) bool { return strings.Trim(line, " \t") == "" }
 
 // parseCriteria reads the "## Acceptance criteria" section of a spec body. present is false
@@ -198,6 +202,12 @@ func parseCriteria(body string) (crit []SpecCriterion, present bool, err error) 
 		}
 		if strings.Contains(line, "<") {
 			note(n, `"<" is not allowed outside fences in a spec with acceptance criteria, because raw HTML can hide text; write it in a fence or in words`)
+		}
+		if entityRef.MatchString(line) {
+			note(n, `character references such as "&nbsp;" or "&#65;" are not allowed outside fences in a spec with acceptance criteria; they render as other text than aeh reads, so type the character itself`)
+			if isCriteriaHeadingText(entityRef.ReplaceAllString(line, " ")) {
+				attempted = true // "## Acceptance&nbsp;criteria" reads as a criteria heading
+			}
 		}
 		if strings.Contains(line, refDefinitionMark) {
 			note(n, `"]:" (a link reference definition) is not allowed outside fences in a spec with acceptance criteria; write links inline as [text](target)`)
