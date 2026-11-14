@@ -137,23 +137,25 @@ func normalizeCriterion(text string) string {
 	return b.String()
 }
 
-// isCriteriaHeadingText reports text that reads as "Acceptance criteria" once markers are
-// removed, in any case: a second, differently written section the owner would take as real.
-// Any white space between or around the words counts (two spaces, NBSP, tabs).
+// isCriteriaHeadingText reports a line whose letters start with "acceptance criteria", in any
+// case, whatever the spacing, punctuation or markers ("## Acceptance criteria.", "1. Acceptance
+// Criteria:", "Acceptance  criteria"): a second, differently written section the owner would
+// take as real. Only the exact heading starts the section.
 func isCriteriaHeadingText(line string) bool {
-	words := strings.Fields(strings.Map(func(r rune) rune {
-		if strings.ContainsRune("#>-*+=_:", r) {
-			return ' '
+	var b strings.Builder
+	for _, r := range strings.ToLower(line) {
+		if unicode.IsLetter(r) {
+			b.WriteRune(r)
 		}
-		return r
-	}, line))
-	return strings.EqualFold(strings.Join(words, " "), strings.TrimPrefix(criteriaHeading, "## "))
+	}
+	return strings.HasPrefix(b.String(), "acceptancecriteria")
 }
 
-// refDefinition matches a link reference definition. Definitions resolve references anywhere
-// in the document, so a criterion could change meaning without its own text changing; and a
-// multiline title can swallow lines. A spec with criteria may not have them.
-var refDefinition = regexp.MustCompile(`^ {0,3}\[[^\]]*\]:`)
+// refDefinitionMark is the "]:" that ends a link reference definition's label, also when the
+// label wraps lines or sits in a quote or list. Definitions resolve references anywhere in the
+// document, so a criterion could change meaning without its own text changing, and a
+// multiline title can swallow lines. A spec with criteria may not have "]:" outside fences.
+const refDefinitionMark = "]:"
 
 func isASCIIBlank(line string) bool { return strings.Trim(line, " \t") == "" }
 
@@ -197,8 +199,12 @@ func parseCriteria(body string) (crit []SpecCriterion, present bool, err error) 
 		if strings.Contains(line, "<") {
 			note(n, `"<" is not allowed outside fences in a spec with acceptance criteria, because raw HTML can hide text; write it in a fence or in words`)
 		}
-		if refDefinition.MatchString(line) {
-			note(n, "link reference definitions are not allowed in a spec with acceptance criteria; write links inline as [text](target)")
+		if strings.Contains(line, refDefinitionMark) {
+			note(n, `"]:" (a link reference definition) is not allowed outside fences in a spec with acceptance criteria; write links inline as [text](target)`)
+		}
+		if strayLine.MatchString(line) && !(in && criterionLine.MatchString(line)) {
+			note(n, fmt.Sprintf(`"AC-<n>:" outside a criterion line of the %q section would not be planned; move the criterion into the section, or refer to it as AC-<n> without a colon`, criteriaHeading))
+			attempted = true // any shape: "* AC-1:", "1. AC-1:", "> - AC-1:", "## AC-1:", "Also AC-1:"
 		}
 		if level, text := headingAt0(line); level > 0 {
 			if isCriteriaHeadingText(text) && (level != 2 || text != strings.TrimPrefix(criteriaHeading, "## ")) {
@@ -216,10 +222,6 @@ func parseCriteria(body string) (crit []SpecCriterion, present bool, err error) 
 			continue
 		}
 		if !in {
-			if strayLine.MatchString(line) {
-				note(n, fmt.Sprintf(`"AC-<n>:" outside the %q section would not be planned; move the criterion into the section, or refer to it as AC-<n> without a colon`, criteriaHeading))
-				attempted = true // any shape: "* AC-1:", "1. AC-1:", "> - AC-1:", "Also AC-1:"
-			}
 			if isCriteriaHeadingText(line) {
 				note(n, fmt.Sprintf("only the heading %q starts the criteria section; rename this line", criteriaHeading))
 				attempted = true
