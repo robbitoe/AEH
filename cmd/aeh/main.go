@@ -25,6 +25,8 @@ Setup
 
 Definition
   aeh tests approve <ID>            seal the outcome's acceptance tests
+  aeh plan <feature>                write, check, review and seal acceptance tests and one task
+                                    for the approved spec's new criteria, on branch aeh/<ID>
 
 Execution
   aeh run <ID>                      run an outcome until it is accepted or blocked
@@ -133,6 +135,19 @@ func dispatch(ctx context.Context, args []string) (int, error) {
 	case "memory":
 		return memoryCommand(repo, args[1:])
 
+	case "plan":
+		if len(args) != 2 {
+			return 2, errors.New("usage: aeh plan <feature>")
+		}
+		st, err := aeh.PlanFeature(ctx, repo, args[1], os.Stdout)
+		if err != nil {
+			return 1, err
+		}
+		if st.Status == aeh.StatusBlocked {
+			return 3, nil
+		}
+		return 0, nil
+
 	case "answer":
 		if len(args) < 3 {
 			return 2, errors.New(`usage: aeh answer <ID> "<text>"`)
@@ -140,7 +155,7 @@ func dispatch(ctx context.Context, args []string) (int, error) {
 		if err := aeh.Answer(repo, args[1], strings.Join(args[2:], " ")); err != nil {
 			return 1, err
 		}
-		fmt.Printf("answer recorded; run it again with: aeh run %s\n", args[1])
+		fmt.Printf("answer recorded; run it again with: aeh run %s (or aeh plan <feature> for a blocked plan)\n", args[1])
 		return 0, nil
 
 	case "status":

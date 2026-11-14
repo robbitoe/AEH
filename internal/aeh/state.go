@@ -167,6 +167,14 @@ func Answer(r Repo, id, text string) error {
 		return err
 	}
 	defer unlock()
+	// A blocked plan has no run state yet; its answer goes to the plan state.
+	if _, err := os.Stat(r.StatePath(id)); errors.Is(err, os.ErrNotExist) {
+		if ps, ok, err := LoadPlanState(r, id); err != nil {
+			return err
+		} else if ok {
+			return answerPlan(r, ps, text)
+		}
+	}
 	s, err := loadState(r, id)
 	if err != nil {
 		return err

@@ -533,6 +533,8 @@ func TestPlanReviewPromptFences(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			// A Windows checkout with core.autocrlf embeds the template with CRLF endings.
+			out = strings.ReplaceAll(out, "\r\n", "\n")
 			planBlock := "## Candidate plan.yaml\n\n" + tc.planFence + "yaml\n" + tc.plan + "\n" + tc.planFence + "\n\n## Test diff"
 			diffBlock := "## Test diff\n\n" + tc.diffFence + "diff\n" + tc.diff + "\n" + tc.diffFence + "\n\nCheck all of the following:"
 			if !strings.Contains(out, planBlock) || !strings.Contains(out, diffBlock) {
