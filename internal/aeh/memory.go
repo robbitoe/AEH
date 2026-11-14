@@ -65,14 +65,22 @@ type Spec struct {
 	Body    string
 	// Approval is the owner's last approval of this spec, or nil; see Approved.
 	Approval *SpecApproval
+	// Implemented lists the accepted implementations of approved contents, oldest first.
+	Implemented []Implementation
 }
 
-// SpecApproval records that the owner approved one exact content of a spec. Transitional
-// until stage 3, where approving a feature becomes part of the spec flow.
+// Criteria parses the spec's acceptance criteria; see parseCriteria.
+func (s Spec) Criteria() ([]SpecCriterion, bool, error) { return parseCriteria(s.Body) }
+
+// SpecApproval records that the owner approved one exact content of a spec.
 type SpecApproval struct {
 	Version string `yaml:"version"`
 	Content string `yaml:"content_sha256"`
 	Date    string `yaml:"date"`
+	// Criteria are the criterion IDs the approved content had; MaxCriterion is the highest ID
+	// ever approved for the feature, so a removed criterion's number stays retired.
+	Criteria     []int `yaml:"criteria,omitempty,flow"`
+	MaxCriterion int   `yaml:"max_criterion,omitempty"`
 }
 
 // Approved reports whether the owner approved the spec as it reads now: the digest of its
@@ -199,6 +207,9 @@ type PendingRecord struct {
 	Change    string
 	Note      string
 	Commit    string // verified head of the integration branch
+	// Implementation, for an outcome generated from an approved spec, is written in the same
+	// memory commit. RecordChange sets its MaxCriterion.
+	Implementation *Implementation `json:",omitempty"`
 }
 
 // MemoryDir is the memory of the project's main checkout, also from linked worktrees.
@@ -430,6 +441,9 @@ func loadMemoryDir(dir string) (MemorySnapshot, error) {
 		if s.Approval, err = readApproval(filepath.Join(featuresDir, e.Name(), approvalFile)); err != nil {
 			return snap, fmt.Errorf("memory: feature %s: %w", e.Name(), err)
 		}
+		if s.Implemented, err = readImplementations(filepath.Join(featuresDir, e.Name(), implementedFile)); err != nil {
+			return snap, fmt.Errorf("memory: feature %s: %w", e.Name(), err)
+		}
 		snap.Specs = append(snap.Specs, s)
 	}
 	sort.Slice(snap.Specs, func(i, j int) bool { return snap.Specs[i].Feature < snap.Specs[j].Feature })
@@ -563,8 +577,16 @@ func readApproval(p string) (*SpecApproval, error) {
 	if _, err := parseSemver(a.Version); err != nil {
 		return nil, fmt.Errorf("%s: %w", approvalFile, err)
 	}
-	if len(a.Content) != 64 || strings.Trim(a.Content, "0123456789abcdef") != "" {
+	if !isSHA256Hex(a.Content) {
 		return nil, fmt.Errorf("%s: content_sha256 must be a sha256 in hex", approvalFile)
+	}
+	for i, id := range a.Criteria {
+		if id < 1 || id > a.MaxCriterion || (i > 0 && id <= a.Criteria[i-1]) {
+			return nil, fmt.Errorf("%s: criteria must be positive, sorted, unique and at most max_criterion", approvalFile)
+		}
+	}
+	if a.MaxCriterion < 0 {
+		return nil, fmt.Errorf("%s: max_criterion must not be negative", approvalFile)
 	}
 	return &a, nil
 }
@@ -591,6 +613,12 @@ func ApproveSpec(r Repo, feature string) (Spec, bool, error) {
 	if err := memoryClean(snap.Dir); err != nil {
 		return Spec{}, false, fmt.Errorf("approve %s: %w; commit your spec edits in the memory repository first", feature, err)
 	}
+	// Criteria are checked before the already-approved shortcut, so an approval never stands
+	// for criteria aeh cannot plan from.
+	crit, ident, err := checkSpecCriteria(snap.Dir, spec)
+	if err != nil {
+		return Spec{}, false, fmt.Errorf("approve %s: acceptance criteria: %w", feature, err)
+	}
 	if spec.Approved() {
 		return spec, false, nil
 	}
@@ -598,7 +626,14 @@ func ApproveSpec(r Repo, feature string) (Spec, bool, error) {
 		return Spec{}, false, fmt.Errorf("approve %s: the spec still has the placeholder text; describe the feature first", feature)
 	}
 	today := memoryNow().UTC().Format("2006-01-02")
-	a := SpecApproval{Version: spec.Version, Content: approvalDigest(spec.Title, spec.Paths, spec.Body), Date: today}
+	a := SpecApproval{Version: spec.Version, Content: approvalDigest(spec.Title, spec.Paths, spec.Body), Date: today, MaxCriterion: ident.High}
+	for _, c := range crit {
+		a.Criteria = append(a.Criteria, c.ID)
+		if c.ID > a.MaxCriterion {
+			a.MaxCriterion = c.ID
+		}
+	}
+	sort.Ints(a.Criteria)
 	b, err := yaml.Marshal(a)
 	if err != nil {
 		return Spec{}, false, err
@@ -686,8 +721,23 @@ func RecordChange(r Repo, p PendingRecord, expectedFingerprint string) (version,
 	if err != nil {
 		return "", "", fmt.Errorf("record %s: updated spec is invalid: %w", p.OutcomeID, err)
 	}
+	if _, _, before := spec.Criteria(); before == nil {
+		// aeh's own changelog line must not make valid criteria unreadable.
+		if _, _, after := updated.Criteria(); after != nil {
+			return "", "", fmt.Errorf("record %s: the changelog line would invalidate the acceptance criteria: %w", p.OutcomeID, after)
+		}
+	}
+	var implemented []byte
+	if p.Implementation != nil {
+		if implemented, err = implementationRecord(dir, spec, p); err != nil {
+			return "", "", fmt.Errorf("record %s: %w", p.OutcomeID, err)
+		}
+	}
 	w := memoryWrites{}
 	err = w.write(dir, rel, []byte(text))
+	if err == nil && implemented != nil {
+		err = w.write(dir, implementedRel(p.Feature), implemented)
+	}
 	if err == nil && spec.Approved() {
 		// The owner approved the spec as it read before this record; aeh only bumped the
 		// version and appended its own changelog line, so the approval carries forward.
@@ -709,6 +759,43 @@ func RecordChange(r Repo, p PendingRecord, expectedFingerprint string) (version,
 	}
 	memoryCommit, err = git(dir, "rev-parse", "HEAD")
 	return version, memoryCommit, err
+}
+
+// implementationRecord checks an implementation against the spec it claims to implement and
+// returns the feature's implementation file with it appended. The spec must still read as the
+// owner approved it and planned it, and the criteria must be exactly the spec's.
+func implementationRecord(dir string, spec Spec, p PendingRecord) ([]byte, error) {
+	im := *p.Implementation
+	if im.Outcome != p.OutcomeID || im.Code != p.Commit {
+		return nil, errors.New("implementation does not match the recorded outcome and commit")
+	}
+	if !spec.Approved() || spec.Approval.Content != im.Approval {
+		return nil, fmt.Errorf("feature %s no longer reads as the approved spec that was planned", spec.Feature)
+	}
+	crit, ident, err := checkSpecCriteria(dir, spec)
+	if err != nil {
+		return nil, fmt.Errorf("feature %s: acceptance criteria: %w", spec.Feature, err)
+	}
+	if len(crit) == 0 {
+		return nil, fmt.Errorf("feature %s has no acceptance criteria to implement", spec.Feature)
+	}
+	sort.Slice(crit, func(i, j int) bool { return crit[i].ID < crit[j].ID })
+	if len(crit) != len(im.Criteria) {
+		return nil, fmt.Errorf("implementation lists %d criteria; the approved spec has %d", len(im.Criteria), len(crit))
+	}
+	for i, c := range crit {
+		if im.Criteria[i].ID != c.ID || im.Criteria[i].Text != c.Text {
+			return nil, fmt.Errorf("implementation criterion %d differs from the approved AC-%d", im.Criteria[i].ID, c.ID)
+		}
+	}
+	im.MaxCriterion = ident.High
+	if n := crit[len(crit)-1].ID; n > im.MaxCriterion {
+		im.MaxCriterion = n
+	}
+	if err := im.validate(); err != nil {
+		return nil, fmt.Errorf("implementation: %w", err)
+	}
+	return yaml.Marshal(append(append([]Implementation{}, spec.Implemented...), im))
 }
 
 // findRecord looks for an earlier memory commit with the same record marker.
@@ -894,6 +981,9 @@ func LintMemory(r Repo) (errs, warnings []string, err error) {
 		}
 	}
 	for _, s := range snap.Specs {
+		if _, _, cerr := checkSpecCriteria(snap.Dir, s); cerr != nil {
+			errs = append(errs, fmt.Sprintf("feature %s: acceptance criteria: %v", s.Feature, cerr))
+		}
 		if s.Approval != nil && !s.Approved() {
 			warnings = append(warnings, fmt.Sprintf("feature %s was edited after its approval of %s; approve it again with: aeh memory approve %s", s.Feature, s.Approval.Version, s.Feature))
 		}
@@ -1402,6 +1492,9 @@ aeh never publishes it. A private backup is the owner's choice.
 - wiki/features/<feature>/approval.yaml: written by "aeh memory approve <feature>"; the owner
   approved the spec's title, paths and text as they read then. Editing any of them by hand voids
   the approval. Recording an accepted change carries a valid approval forward in the same commit.
+- wiki/features/<feature>/implemented.yaml: written by aeh when an outcome generated from an
+  approved spec is accepted: the approved content, the accepted commit, and each criterion with
+  its sealed tests. Never edit it.
 
 ## Spec format
 
@@ -1412,13 +1505,24 @@ aeh never publishes it. A private backup is the owner's choice.
     paths: [src/checkout/**]       # code this feature owns
     ---
     # Checkout
-    Behavior, acceptance criteria, data and risks.
+    Behavior, data and risks.
+
+    ## Acceptance criteria
+    - AC-1: Given a cart with items, when the user pays, then one order is created.
+    - AC-2: Given a failed payment, when the user retries, then no second charge is made.
 
     ## Changelog
     - 1.3.1 (2026-11-13) OUT-007 accepted on aeh/OUT-007 @ a1b2c3d: Pay button reads "Confirm payment".
 
 "## Changelog" must be the last section. A changelog entry records the verified branch and
 commit; it does not mean the change was merged.
+
+Acceptance criteria are what aeh plans and tests from. The section starts at the column-0
+heading "## Acceptance criteria" and holds only lines "- AC-<n>: <text>" and blank lines; put
+prose before the heading. A changed criterion keeps its number; a new one takes a number above
+every number used before; a number removed in an approved version is never reused. In a spec
+with criteria, fences start at column 0, "<" appears only inside fences, and "AC-<n>:" only
+in the section.
 
 ## Rules
 
