@@ -913,14 +913,20 @@ func (ru *runner) observeRules(hit []TriageRule) {
 	s.EffectiveRoute, s.Roles = applyRules(s.EffectiveRoute, s.Roles, hit)
 	s.Roles = requiredRoles(s.EffectiveRoute, s.Roles, ru.outcome.Reviewers)
 	for _, name := range ruleNames(hit) {
-		found := false
-		for _, have := range s.RulesHit {
-			if have == name {
-				found = true
-			}
-		}
-		if !found {
+		if !containsString(s.RulesHit, name) {
 			s.RulesHit = append(s.RulesHit, name)
+		}
+	}
+}
+
+// observeTaskRules applies the rules the declared task paths predict and records the ones
+// left to the candidate's files.
+func (ru *runner) observeTaskRules() {
+	rules, tasks := ru.cfg.Triage.Rules, ru.outcome.Tasks
+	ru.observeRules(rulesForTasks(rules, tasks))
+	for _, name := range ruleNames(rulesDeferred(rules, tasks)) {
+		if !containsString(ru.state.RulesDeferred, name) {
+			ru.state.RulesDeferred = append(ru.state.RulesDeferred, name)
 		}
 	}
 }
@@ -945,7 +951,7 @@ func (ru *runner) triage(ctx context.Context) error {
 		}
 	}
 	s.EffectiveRoute = maxRoute(s.EffectiveRoute, s.InitialRoute)
-	ru.observeRules(rulesForTasks(ru.cfg.Triage.Rules, o.Tasks))
+	ru.observeTaskRules()
 	if err := saveState(ru.repo, s); err != nil {
 		return err
 	}
@@ -983,7 +989,7 @@ func (ru *runner) triage(ctx context.Context) error {
 		s.InitialRoute, s.TriageSource = parsed, "model"
 		// The provisional new route was a crash fallback, not an observation.
 		s.EffectiveRoute, s.Roles = parsed, nil
-		ru.observeRules(rulesForTasks(ru.cfg.Triage.Rules, o.Tasks))
+		ru.observeTaskRules()
 	}
 	if uncertainExit(runErr) {
 		keep = true

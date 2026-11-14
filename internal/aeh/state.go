@@ -63,6 +63,7 @@ type State struct {
 	TriageOutput    string      `json:"triage_output"`
 	TriageWorktree  string      `json:"triage_worktree,omitempty"`
 	RulesHit        []string    `json:"rules_hit"`
+	RulesDeferred   []string    `json:"rules_deferred,omitempty"` // may match below a broad task path; the candidate's files decide
 	RestartRequired bool        `json:"restart_required,omitempty"`
 	ID              string      `json:"id"`
 	Title           string      `json:"title"`

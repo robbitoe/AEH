@@ -17,6 +17,9 @@ func (ru *runner) writeReport() string {
 	fmt.Fprintf(&b, "Status: **%s** · Branch: `%s` · Base: `%s`\n\n", st.Status, st.Branch, short(st.Base))
 	fmt.Fprintf(&b, "Recorded branch head: `%s` · Contract SHA-256: `%s`\n\n", st.Head, st.Contract)
 	fmt.Fprintf(&b, "Route: initial **%s**, effective **%s** · Source: `%s`\n\nRules hit: %s\n\nRequired roles: %s\n\n", st.InitialRoute, st.EffectiveRoute, st.TriageSource, strings.Join(st.RulesHit, ", "), strings.Join(st.Roles, ", "))
+	if len(st.RulesDeferred) > 0 {
+		fmt.Fprintf(&b, "Rules deferred to the changed files (they may match below a broad task path): %s\n\n", strings.Join(st.RulesDeferred, ", "))
+	}
 	if st.TriageSource == "fallback-none" {
 		fmt.Fprintf(&b, "%s\n\n", changeDefaultWarning)
 	}

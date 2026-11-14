@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -66,18 +67,82 @@ func TestRuleMayTouchTaskPaths(t *testing.T) {
 	}
 }
 
+func TestRulePredictedTaskPaths(t *testing.T) {
+	cases := []struct {
+		pattern, task       string
+		predicted, deferred bool
+	}{
+		{"**/auth", "src/", false, true},              // broad: left to the changed files
+		{"**/auth", "src/slug.js", false, true},       // a file path never holds an auth directory, but the matcher cannot tell
+		{"**/auth", "src/auth/", true, false},         // the task declares the area
+		{"**/auth", "src/auth/login.go", true, false}, // inside the area
+		{"**/migrations", "db/migrations/", true, false},
+		{"**/*.sql", "db/001.sql", true, false},
+		{"**/*.sql", "src/fees/x.go", false, true},
+		{"db", "db/migrations/", true, false}, // inside db
+		{"db", "db", true, false},
+		{"db", "src/", false, false},               // outside
+		{"src/auth", "src/", true, false},          // literal area below the task path
+		{"src/auth/**", "src/", true, false},       // literal prefix src/auth below src/
+		{"src/auth", "src/billing/", false, false}, // sibling
+		{"src/**/migrations", "src/fees/", false, true},
+		{"src/**/migrations", "src/", true, false}, // literal prefix src equals the task path
+		{"src/**/migrations", "lib/", false, false},
+		{"db", "*.go", true, false}, // nothing literal: anything is possible
+		{"db", ".", true, false},
+		{"db", "", true, false},
+		{"DB/Migrations", "db/", true, false}, // case follows the filesystem (lowered on Windows and macOS) only if insensitive
+		// Wildcards in the task path that name the area predict it.
+		{"**/*.sql", "db/*.sql", true, false},
+		{"**/*.sql", "db/00[12].sql", true, false},
+		{"**/auth", "src/*/auth/*.go", true, false},
+		{"**/auth", "src/[a]uth/*.go", true, false},
+		{"src/**/auth", "src/services/*/auth/*.go", true, false},
+		{"**/auth", "src/**/auth/x.go", true, false},
+		{"**/auth", "src/*/x.go", true, false}, // "*" may be auth: conservative
+		{"**/auth", "src/**", false, true},     // trailing "**" is "everything below", like src/
+		{"**/auth", "src/*.go", false, true},   // a file name pattern is not a directory named auth
+		{"db", "src/*.sql", false, false},
+	}
+	for _, c := range cases {
+		if c.pattern == "DB/Migrations" && runtime.GOOS != "windows" && runtime.GOOS != "darwin" {
+			c.predicted = false
+		}
+		if got := rulePredicted(c.pattern, c.task); got != c.predicted {
+			t.Errorf("rulePredicted(%q, %q) = %v, want %v", c.pattern, c.task, got, c.predicted)
+		}
+		if got := ruleDeferred(c.pattern, c.task); got != c.deferred {
+			t.Errorf("ruleDeferred(%q, %q) = %v, want %v", c.pattern, c.task, got, c.deferred)
+		}
+	}
+}
+
 func TestRulesForTasksAndFiles(t *testing.T) {
 	rules := []TriageRule{
 		{Name: "data", Paths: []string{"**/migrations", "**/*.sql"}, Route: RouteNew, Reviewers: []string{RoleDBA}},
 		{Name: "auth", Paths: []string{"**/auth"}, Route: RouteNew, Reviewers: []string{RoleSecurity}},
 	}
-	got := ruleNames(rulesForTasks(rules, []Task{{ID: "T1", Paths: []string{"web/billing/"}}}))
-	// web/billing/ may hold a migrations directory or an .sql file below it, and an auth directory.
-	if !reflect.DeepEqual(got, []string{"data", "auth"}) {
-		t.Errorf("broad task path: %v", got)
+	broad := []Task{{ID: "T1", Paths: []string{"web/billing/"}}}
+	// web/billing/ may hold a migrations directory or an .sql file below it, and an auth
+	// directory, but the task does not declare them: the candidate's files decide.
+	if got := ruleNames(rulesForTasks(rules, broad)); len(got) != 0 {
+		t.Errorf("broad task path predicted %v", got)
+	}
+	if got := ruleNames(rulesDeferred(rules, broad)); !reflect.DeepEqual(got, []string{"data", "auth"}) {
+		t.Errorf("broad task path deferred %v", got)
+	}
+	declared := []Task{{ID: "T1", Paths: []string{"web/billing/"}}, {ID: "T2", Paths: []string{"web/auth/"}}}
+	if got := ruleNames(rulesForTasks(rules, declared)); !reflect.DeepEqual(got, []string{"auth"}) {
+		t.Errorf("declared area: %v", got)
+	}
+	if got := ruleNames(rulesDeferred(rules, declared)); !reflect.DeepEqual(got, []string{"data"}) {
+		t.Errorf("a predicted rule is not also deferred: %v", got)
 	}
 	if got := ruleNames(rulesForTasks(rules, []Task{{ID: "T1"}})); len(got) != 2 {
 		t.Errorf("a task without paths must trigger every rule, got %v", got)
+	}
+	if got := ruleNames(rulesDeferred(rules, []Task{{ID: "T1"}})); len(got) != 0 {
+		t.Errorf("a task without paths defers nothing, got %v", got)
 	}
 	files := []string{"src/fees/fee.go", "src/fees/migrations/002_fees.go"}
 	if got := ruleNames(rulesForFiles(rules, files)); !reflect.DeepEqual(got, []string{"data"}) {
