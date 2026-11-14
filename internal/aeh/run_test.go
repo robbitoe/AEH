@@ -958,6 +958,64 @@ func TestNewRequirementsBeforeAgentsAndAfterCandidate(t *testing.T) {
 	}
 }
 
+// A rule that only may match below a broad task path is left to the candidate's files:
+// untouched, it adds nothing; touched, it raises the policy on that same attempt.
+func TestBroadTaskPathDefersRulesToCandidateFiles(t *testing.T) {
+	touchAuth := agentGood + `; mkdir -p src/auth && echo token > src/auth/token.txt`
+	for _, tc := range []struct {
+		name, agent, rule string
+		status            string
+		route, roles, hit string
+	}{
+		{"untouched", agentGood, "route: change\n      reviewers: [dba]", StatusAccepted, RouteTrivial, "qa", ""},
+		{"touched", touchAuth, "route: change\n      reviewers: [dba]", StatusAccepted, RouteChange, "qa,security,dba", "auth"},
+		{"touched-new", touchAuth, "route: new", StatusBlocked, RouteNew, "qa,security", "auth"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, map[string]string{"author": tc.agent}, []string{"author"}, "")
+			f.outcomeText("route: trivial\n")
+			f.configText("triage:\n  rules:\n    - name: auth\n      paths: [\"**/auth\"]\n      " + tc.rule + "\n")
+			st, _ := f.run()
+			if st.Status != tc.status || st.EffectiveRoute != tc.route || strings.Join(st.Roles, ",") != tc.roles || strings.Join(st.RulesHit, ",") != tc.hit {
+				t.Fatalf("wrong policy: %+v", st)
+			}
+			if strings.Join(st.RulesDeferred, ",") != "auth" {
+				t.Fatalf("deferred rule not recorded: %v", st.RulesDeferred)
+			}
+			if !strings.Contains(readFile(t, f.repo.ReportPath(st.ID)), "Rules deferred to the changed files") {
+				t.Fatal("report omits deferred rules")
+			}
+			a := st.Tasks[0].Attempts[0]
+			switch tc.status {
+			case StatusAccepted:
+				if reviewRoles(a) != tc.roles {
+					t.Fatalf("reviews %q, want %q", reviewRoles(a), tc.roles)
+				}
+			case StatusBlocked:
+				if !st.RestartRequired || st.Head != st.Base || a.FailedGate != "requirements" || len(a.Reviews) != 0 {
+					t.Fatalf("new raised by files must block without integrating: %+v", st)
+				}
+			}
+		})
+	}
+}
+
+// Declaring a path inside a rule's area still predicts the rule before any agent runs.
+func TestDeclaredRuleAreaPredictsBeforeAgents(t *testing.T) {
+	f := newFixture(t, map[string]string{"author": `echo called >> "$AEH_COUNTER"`}, []string{"author"}, "")
+	f.outcomeText("route: trivial\n")
+	path := f.repo.OutcomePath("OUT-001")
+	write(t, f.dir, "aeh/outcomes/OUT-001.yaml", strings.Replace(readFile(t, path), "    paths: [src/]", "    paths: [src/auth/]", 1))
+	f.configText("triage:\n  rules:\n    - name: auth\n      paths: [\"**/auth\"]\n      route: new\n")
+	st, _ := f.run()
+	if st.Status != StatusBlocked || st.EffectiveRoute != RouteNew || len(st.Tasks) != 0 || len(st.RulesDeferred) != 0 {
+		t.Fatalf("declared area not predicted: %+v", st)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(f.scriptPath("author")), "author.count")); !os.IsNotExist(err) {
+		t.Fatal("agent ran before the predicted new route blocked")
+	}
+}
+
 func TestDoRouteAndLevelOneReviews(t *testing.T) {
 	for _, route := range []string{"", RouteTrivial, RouteChange, RouteNew, "invalid"} {
 		t.Run(route, func(t *testing.T) {

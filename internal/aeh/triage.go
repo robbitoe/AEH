@@ -215,18 +215,57 @@ func matchSegments(pat, file []string) bool {
 	return len(file) == 0
 }
 
-// ruleMayTouch reports whether a rule pattern can match something inside a task's declared
-// path. It compares the pattern with the literal prefix of the task path (up to its first
-// wildcard); anything the prefix cannot rule out counts as a possible match.
-func ruleMayTouch(pattern, taskPath string) bool {
+// literalPrefix returns the segments of a path or pattern before its first wildcard.
+func literalPrefix(p string) []string {
 	var base []string
-	for _, s := range ruleSegments(taskPath) {
+	for _, s := range ruleSegments(p) {
 		if strings.ContainsAny(s, "*?[") {
 			break
 		}
 		base = append(base, s)
 	}
-	return prefixCompatible(ruleSegments(pattern), base)
+	return base
+}
+
+// rulePredicted is the pre-code predictor: it reports whether a task's declared path says the
+// task works in a rule's area, before any code exists. That holds when the task path lies
+// inside the area ("**/auth" and "src/auth/"), or when the rule names a literal area below the
+// task path ("src/auth" and "src/"). A task path whose literal prefix is empty (".", "*.go")
+// says nothing and predicts every rule. A rule that only may match somewhere below a broad
+// task path ("**/auth" and "src/") is not predicted: see ruleDeferred. Rules on the
+// candidate's real files (rulesForFiles) stay authoritative.
+func rulePredicted(pattern, taskPath string) bool {
+	base := literalPrefix(taskPath)
+	if len(base) == 0 {
+		return true
+	}
+	if ruleMatch(pattern, strings.Join(base, "/")) {
+		return true
+	}
+	lit := literalPrefix(pattern)
+	if len(lit) < len(base) {
+		return false
+	}
+	for i := range base {
+		if base[i] != lit[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// ruleDeferred reports a rule that may match something below a task path but is not
+// predicted from it. It is uncertainty for the report, not evidence that the rule applies or
+// not; the candidate's files decide.
+func ruleDeferred(pattern, taskPath string) bool {
+	return !rulePredicted(pattern, taskPath) && ruleMayTouch(pattern, taskPath)
+}
+
+// ruleMayTouch reports whether a rule pattern can match something inside a task's declared
+// path. It compares the pattern with the literal prefix of the task path (up to its first
+// wildcard); anything the prefix cannot rule out counts as a possible match.
+func ruleMayTouch(pattern, taskPath string) bool {
+	return prefixCompatible(ruleSegments(pattern), literalPrefix(taskPath))
 }
 
 func prefixCompatible(pat, base []string) bool {
@@ -243,29 +282,58 @@ func prefixCompatible(pat, base []string) bool {
 	return prefixCompatible(pat[1:], base[1:])
 }
 
-// rulesForTasks returns the rules that a task may trigger before any code exists.
-// A task without paths may touch anything, so it triggers every rule.
+// rulesForTasks returns the rules the tasks' declared paths predict before any code exists
+// (see rulePredicted). A task without paths may touch anything, so it predicts every rule.
 func rulesForTasks(rules []TriageRule, tasks []Task) []TriageRule {
+	return rulesWhere(rules, tasks, true, rulePredicted)
+}
+
+// rulesDeferred returns the rules that are not predicted but may still match below a task
+// path. The report lists them; the rules on the candidate's files decide.
+func rulesDeferred(rules []TriageRule, tasks []Task) []TriageRule {
+	var out []TriageRule
+	predicted := ruleNames(rulesForTasks(rules, tasks))
+	for _, rule := range rulesWhere(rules, tasks, false, ruleDeferred) {
+		if !containsString(predicted, rule.Name) {
+			out = append(out, rule)
+		}
+	}
+	return out
+}
+
+func rulesWhere(rules []TriageRule, tasks []Task, noPaths bool, test func(pattern, taskPath string) bool) []TriageRule {
 	var hit []TriageRule
 	for _, rule := range rules {
-		if rulesTouchTasks(rule, tasks) {
+		if ruleHitsTasks(rule, tasks, noPaths, test) {
 			hit = append(hit, rule)
 		}
 	}
 	return hit
 }
 
-func rulesTouchTasks(rule TriageRule, tasks []Task) bool {
+func ruleHitsTasks(rule TriageRule, tasks []Task, noPaths bool, test func(pattern, taskPath string) bool) bool {
 	for _, t := range tasks {
 		if len(t.Paths) == 0 {
-			return true
+			if noPaths {
+				return true
+			}
+			continue
 		}
 		for _, tp := range t.Paths {
 			for _, rp := range rule.Paths {
-				if ruleMayTouch(rp, tp) {
+				if test(rp, tp) {
 					return true
 				}
 			}
+		}
+	}
+	return false
+}
+
+func containsString(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
 		}
 	}
 	return false
