@@ -92,6 +92,17 @@ func TestRulePredictedTaskPaths(t *testing.T) {
 		{"db", ".", true, false},
 		{"db", "", true, false},
 		{"DB/Migrations", "db/", true, false}, // case follows the filesystem (lowered on Windows and macOS) only if insensitive
+		// Wildcards in the task path that name the area predict it.
+		{"**/*.sql", "db/*.sql", true, false},
+		{"**/*.sql", "db/00[12].sql", true, false},
+		{"**/auth", "src/*/auth/*.go", true, false},
+		{"**/auth", "src/[a]uth/*.go", true, false},
+		{"src/**/auth", "src/services/*/auth/*.go", true, false},
+		{"**/auth", "src/**/auth/x.go", true, false},
+		{"**/auth", "src/*/x.go", true, false}, // "*" may be auth: conservative
+		{"**/auth", "src/**", false, true},     // trailing "**" is "everything below", like src/
+		{"**/auth", "src/*.go", false, true},   // a file name pattern is not a directory named auth
+		{"db", "src/*.sql", false, false},
 	}
 	for _, c := range cases {
 		if c.pattern == "DB/Migrations" && runtime.GOOS != "windows" && runtime.GOOS != "darwin" {

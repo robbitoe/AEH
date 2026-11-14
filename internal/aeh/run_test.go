@@ -1000,19 +1000,28 @@ func TestBroadTaskPathDefersRulesToCandidateFiles(t *testing.T) {
 	}
 }
 
-// Declaring a path inside a rule's area still predicts the rule before any agent runs.
+// Declaring a path inside a rule's area, literally or with wildcards, still predicts the rule
+// before any agent runs.
 func TestDeclaredRuleAreaPredictsBeforeAgents(t *testing.T) {
-	f := newFixture(t, map[string]string{"author": `echo called >> "$AEH_COUNTER"`}, []string{"author"}, "")
-	f.outcomeText("route: trivial\n")
-	path := f.repo.OutcomePath("OUT-001")
-	write(t, f.dir, "aeh/outcomes/OUT-001.yaml", strings.Replace(readFile(t, path), "    paths: [src/]", "    paths: [src/auth/]", 1))
-	f.configText("triage:\n  rules:\n    - name: auth\n      paths: [\"**/auth\"]\n      route: new\n")
-	st, _ := f.run()
-	if st.Status != StatusBlocked || st.EffectiveRoute != RouteNew || len(st.Tasks) != 0 || len(st.RulesDeferred) != 0 {
-		t.Fatalf("declared area not predicted: %+v", st)
-	}
-	if _, err := os.Stat(filepath.Join(filepath.Dir(f.scriptPath("author")), "author.count")); !os.IsNotExist(err) {
-		t.Fatal("agent ran before the predicted new route blocked")
+	for _, tc := range []struct{ rule, task string }{
+		{"**/auth", "src/auth/"},
+		{"**/auth", "src/*/auth/*.go"},
+		{"**/*.sql", "db/00[12].sql"},
+	} {
+		t.Run(tc.task, func(t *testing.T) {
+			f := newFixture(t, map[string]string{"author": `echo called >> "$AEH_COUNTER"`}, []string{"author"}, "")
+			f.outcomeText("route: trivial\n")
+			path := f.repo.OutcomePath("OUT-001")
+			write(t, f.dir, "aeh/outcomes/OUT-001.yaml", strings.Replace(readFile(t, path), "    paths: [src/]", "    paths: [\""+tc.task+"\"]", 1))
+			f.configText("triage:\n  rules:\n    - name: sensitive\n      paths: [\"" + tc.rule + "\"]\n      route: new\n")
+			st, _ := f.run()
+			if st.Status != StatusBlocked || st.EffectiveRoute != RouteNew || len(st.Tasks) != 0 || len(st.RulesDeferred) != 0 || !st.RestartRequired {
+				t.Fatalf("declared area not predicted: %+v", st)
+			}
+			if _, err := os.Stat(filepath.Join(filepath.Dir(f.scriptPath("author")), "author.count")); !os.IsNotExist(err) {
+				t.Fatal("agent ran before the predicted new route blocked")
+			}
+		})
 	}
 }
 

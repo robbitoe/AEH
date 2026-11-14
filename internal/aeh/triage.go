@@ -228,18 +228,25 @@ func literalPrefix(p string) []string {
 }
 
 // rulePredicted is the pre-code predictor: it reports whether a task's declared path says the
-// task works in a rule's area, before any code exists. That holds when the task path lies
-// inside the area ("**/auth" and "src/auth/"), or when the rule names a literal area below the
-// task path ("src/auth" and "src/"). A task path whose literal prefix is empty (".", "*.go")
-// says nothing and predicts every rule. A rule that only may match somewhere below a broad
-// task path ("**/auth" and "src/") is not predicted: see ruleDeferred. Rules on the
-// candidate's real files (rulesForFiles) stay authoritative.
+// task works in a rule's area, before any code exists. That holds when some path the task
+// pattern itself names lies inside the area ("**/auth" and "src/auth/", "src/*/auth/*.go";
+// "**/*.sql" and "db/*.sql"), or when the rule names a literal area below the task path
+// ("src/auth" and "src/"). Wildcards in a task path count as possibly naming the area, so they
+// predict conservatively; a trailing "**" only means "everything below", like a trailing
+// slash. A task path whose literal prefix is empty (".", "*.go") says nothing and predicts
+// every rule. A rule that only may match somewhere below a broad task path ("**/auth" and
+// "src/") is not predicted: see ruleDeferred. Rules on the candidate's real files
+// (rulesForFiles) stay authoritative.
 func rulePredicted(pattern, taskPath string) bool {
 	base := literalPrefix(taskPath)
 	if len(base) == 0 {
 		return true
 	}
-	if ruleMatch(pattern, strings.Join(base, "/")) {
+	task := ruleSegments(taskPath)
+	for len(task) > 0 && task[len(task)-1] == "**" {
+		task = task[:len(task)-1]
+	}
+	if namesArea(task, ruleSegments(pattern)) {
 		return true
 	}
 	lit := literalPrefix(pattern)
@@ -252,6 +259,47 @@ func rulePredicted(pattern, taskPath string) bool {
 		}
 	}
 	return true
+}
+
+// namesArea reports whether some path matched by the task pattern has a prefix matched by the
+// rule pattern. The task pattern is taken as written, without implicit descendants: "src"
+// names src itself, not src/auth. "**" in either pattern matches any number of segments.
+func namesArea(task, rule []string) bool {
+	if len(rule) == 0 {
+		return true // the rule matched a prefix; the area covers the rest
+	}
+	if rule[0] == "**" {
+		if namesArea(task, rule[1:]) {
+			return true
+		}
+		return len(task) > 0 && namesArea(task[1:], rule)
+	}
+	if len(task) == 0 {
+		return false
+	}
+	if task[0] == "**" {
+		// Zero segments, or one segment that may equal the rule's next one.
+		return namesArea(task[1:], rule) || namesArea(task, rule[1:])
+	}
+	return segmentsOverlap(task[0], rule[0]) && namesArea(task[1:], rule[1:])
+}
+
+// segmentsOverlap reports whether one name can match both segments. Two wildcard segments, or
+// a malformed one, count as overlapping: the predictor errs toward the rule.
+func segmentsOverlap(task, rule string) bool {
+	tw, rw := strings.ContainsAny(task, "*?[\\"), strings.ContainsAny(rule, "*?[\\")
+	switch {
+	case !tw && !rw:
+		return task == rule
+	case tw && rw:
+		return true
+	case tw:
+		ok, err := path.Match(task, rule)
+		return ok || err != nil
+	default:
+		ok, err := path.Match(rule, task)
+		return ok || err != nil
+	}
 }
 
 // ruleDeferred reports a rule that may match something below a task path but is not
