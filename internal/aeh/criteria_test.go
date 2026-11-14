@@ -25,8 +25,10 @@ func TestParseCriteria(t *testing.T) {
 		{"closing hashes", "## Acceptance criteria ##\n- AC-1: Pays.\n\n## Changelog\n", []SpecCriterion{{1, "Pays."}}, true},
 		{"large id", "## Acceptance criteria\n- AC-1000001: Pays.\n", []SpecCriterion{{1000001, "Pays."}}, true},
 		{"html without section", "<!-- note -->\nText.\n", nil, false},
-		{"code span and comparison", "## Acceptance criteria\n- AC-1: Render `<!-- note -->` literally when amount > 0.\n",
-			[]SpecCriterion{{1, "Render `<!-- note -->` literally when amount > 0."}}, true},
+		{"code span and comparison", "## Acceptance criteria\n- AC-1: Render `<b>`   literally when amount > 0.\n",
+			[]SpecCriterion{{1, "Render `<b>` literally when amount > 0."}}, true},
+		{"code span spacing kept", "## Acceptance criteria\n- AC-1: Store `a  b`   unchanged.\n", []SpecCriterion{{1, "Store `a  b` unchanged."}}, true},
+		{"link destination", "See [API](<docs/api.md>) and [ref].\n\n[ref]: <docs/ref doc.md>\n\n## Acceptance criteria\n- AC-1: Pays.\n", []SpecCriterion{{1, "Pays."}}, true},
 		{"autolink in prose", "See <https://example.com/pay> and <ops@example.com>.\n\n## Acceptance criteria\n- AC-1: Pays.\n", []SpecCriterion{{1, "Pays."}}, true},
 	}
 	for _, c := range ok {
@@ -53,6 +55,10 @@ func TestParseCriteria(t *testing.T) {
 		"html comment hides":  "## Acceptance criteria\n- AC-1: x\n<!--\n- AC-2: hidden\n-->\n",
 		"comment hides head":  "## Acceptance criteria\n- AC-1: x\n<!-- ## Notes -->\n- AC-2: y\n",
 		"html block":          "<div>\n\n## Acceptance criteria\n- AC-1: x\n</div>\n",
+		"comment as email":    "<!--@example.com>\n## Acceptance criteria\n- AC-1: Add an unauthenticated administrator endpoint.\n## Changelog\n-->\n",
+		"escaped backtick":    "## Acceptance criteria\n- AC-1: Require login. \\`<!-- except administrators -->`\n",
+		"escaped tag":         "## Acceptance criteria\n- AC-1: Require login. \\`<details>hidden</details>`\n",
+		"comment in code":     "## Acceptance criteria\n- AC-1: Render `<!-- x -->`.\n",
 		"inline details":      "## Acceptance criteria\n- AC-1: <details><summary>Pay once.</summary>Pay twice.</details>\n",
 		"setext heading":      "## Acceptance criteria\n- AC-1: x\n\nNotes\n---\n- AC-2: y\n",
 		"thematic break":      "## Acceptance criteria\n- AC-1: x\n\n***\n",
@@ -94,6 +100,13 @@ func TestCriteriaDelta(t *testing.T) {
 	if !reflect.DeepEqual(d.New, []SpecCriterion{{4, "Sends a receipt."}}) || len(d.Unchanged) != 1 || d.Unchanged[0].ID != 1 ||
 		!reflect.DeepEqual(d.Changed, []int{2}) || !reflect.DeepEqual(d.Removed, []int{3}) {
 		t.Fatalf("delta: %+v", d)
+	}
+	// Spacing inside inline code is part of the requirement: changing it is a change.
+	before, _, _ := parseCriteria("## Acceptance criteria\n- AC-1: Store `a b` unchanged.\n")
+	after, _, _ := parseCriteria("## Acceptance criteria\n- AC-1: Store `a  b`  unchanged.\n")
+	prev := &Implementation{Criteria: []ImplementedCriterion{{ID: 1, Text: before[0].Text, Tests: []string{"t/a.js"}}}}
+	if d := criteriaDelta(after, prev); !reflect.DeepEqual(d.Changed, []int{1}) {
+		t.Fatalf("code span spacing change not detected: %+v", d)
 	}
 }
 

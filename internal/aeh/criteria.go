@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
@@ -19,7 +20,8 @@ import (
 const criteriaHeading = "## Acceptance criteria"
 
 // SpecCriterion is one acceptance criterion of a spec: "- AC-<ID>: <Text>". Text is normalized
-// (runs of white space become one space) so versions compare by meaning, not layout.
+// (runs of white space outside inline code become one space) so versions compare by meaning,
+// not layout; inline code keeps its exact spacing.
 type SpecCriterion struct {
 	ID   int    `yaml:"id"`
 	Text string `yaml:"text"`
@@ -29,8 +31,10 @@ var (
 	criterionLine = regexp.MustCompile(`^- AC-([1-9][0-9]*): (.*)$`)
 	observedLine  = regexp.MustCompile(`^- AC-[0-9]+ \(observed\):`)
 	strayLine     = regexp.MustCompile(`(?i)^\s*(?:>\s*)*(?:[-*+]|[0-9]+[.)])\s+AC-[0-9]`)
-	htmlStart     = regexp.MustCompile(`<!--|<[A-Za-z/!?]`)
-	autolink      = regexp.MustCompile(`<[A-Za-z][A-Za-z0-9+.\-]{1,31}:[^\s<>]*>|<[^\s<>@]+@[^\s<>]+>`)
+	htmlStart     = regexp.MustCompile(`<[A-Za-z/!?]`)
+	// A URI or email autolink, or an angle-bracketed link destination: Markdown, not HTML.
+	// "<!--" is rejected before this exemption applies, so "<!--@x>" cannot pass as an email.
+	notHTML = regexp.MustCompile(`<[A-Za-z][A-Za-z0-9+.\-]{1,31}:[^\s<>]*>|<[A-Za-z0-9][A-Za-z0-9.+_\-]*@[A-Za-z0-9.\-]+>|\]\(<[^<>\n]*>|^\[[^\]]+\]:[ \t]*<[^<>\n]*>`)
 )
 
 // headingAt0 returns a column-0 ATX heading as its level and text (closing hashes removed),
@@ -49,13 +53,30 @@ func headingAt0(line string) (int, string) {
 	return n, text
 }
 
-// stripCodeSpans removes inline code spans (a backtick run up to the next run of the same
-// length on the line), whose content Markdown shows literally.
-func stripCodeSpans(line string) string {
+// codeSegment is a piece of one line: inline code (shown literally) or other text.
+type codeSegment struct {
+	text string
+	code bool
+}
+
+// splitCodeSpans splits a line into inline code spans and the text around them. A span opens
+// at an unescaped backtick run and closes at the next run of the same length; a backtick
+// escaped with a backslash is literal text, as in CommonMark.
+func splitCodeSpans(line string) []codeSegment {
+	var out []codeSegment
 	var b strings.Builder
+	flush := func() {
+		if b.Len() > 0 {
+			out = append(out, codeSegment{text: b.String()})
+			b.Reset()
+		}
+	}
+	escaped := false
 	for i := 0; i < len(line); {
-		if line[i] != '`' {
-			b.WriteByte(line[i])
+		c := line[i]
+		if c != '`' || escaped {
+			escaped = c == '\\' && !escaped
+			b.WriteByte(c)
 			i++
 			continue
 		}
@@ -63,7 +84,6 @@ func stripCodeSpans(line string) string {
 		for j < len(line) && line[j] == '`' {
 			j++
 		}
-		run := line[i:j]
 		end := -1
 		for k := j; k < len(line); {
 			if line[k] != '`' {
@@ -74,20 +94,65 @@ func stripCodeSpans(line string) string {
 			for m < len(line) && line[m] == '`' {
 				m++
 			}
-			if m-k == len(run) {
+			if m-k == j-i {
 				end = m
 				break
 			}
 			k = m
 		}
 		if end < 0 {
-			b.WriteString(run)
+			b.WriteString(line[i:j])
 			i = j
 			continue
 		}
+		flush()
+		out = append(out, codeSegment{text: line[i:end], code: true})
 		i = end
 	}
+	flush()
+	return out
+}
+
+// normalizeCriterion collapses runs of white space outside inline code and trims the ends.
+// Code spans stay byte for byte: their spacing can be the requirement.
+func normalizeCriterion(text string) string {
+	var b strings.Builder
+	space := false
+	put := func(s string) {
+		if space && b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		space = false
+		b.WriteString(s)
+	}
+	for _, seg := range splitCodeSpans(text) {
+		if seg.code {
+			put(seg.text)
+			continue
+		}
+		for _, r := range seg.text {
+			if unicode.IsSpace(r) {
+				space = true
+				continue
+			}
+			put(string(r))
+		}
+	}
 	return b.String()
+}
+
+// hasRawHTML reports raw HTML outside inline code. "<!--" counts anywhere, code spans
+// included, because it is checked before any exemption.
+func hasRawHTML(line string) bool {
+	if strings.Contains(line, "<!--") {
+		return true
+	}
+	for _, seg := range splitCodeSpans(line) {
+		if !seg.code && htmlStart.MatchString(notHTML.ReplaceAllString(seg.text, "")) {
+			return true
+		}
+	}
+	return false
 }
 
 func isASCIIBlank(line string) bool { return strings.Trim(line, " \t") == "" }
@@ -125,8 +190,8 @@ func parseCriteria(body string) (crit []SpecCriterion, present bool, err error) 
 		if f.step(line) {
 			continue
 		}
-		if m := htmlStart.FindString(autolink.ReplaceAllString(stripCodeSpans(line), "")); m != "" {
-			note(n, "raw HTML and HTML comments are not allowed in a spec with acceptance criteria; they can hide text (use a code span or a fence)")
+		if hasRawHTML(line) {
+			note(n, "raw HTML and HTML comments are not allowed in a spec with acceptance criteria, even in code spans for comments; they can hide text (write it in a fence)")
 		}
 		if level, text := headingAt0(line); level > 0 {
 			if level <= 2 {
@@ -162,7 +227,7 @@ func parseCriteria(body string) (crit []SpecCriterion, present bool, err error) 
 			note(n, fmt.Sprintf("AC-%s is too large", m[1]))
 			continue
 		}
-		text := strings.Join(strings.Fields(m[2]), " ")
+		text := normalizeCriterion(m[2])
 		switch {
 		case text == "":
 			note(n, fmt.Sprintf("AC-%d has no text", id))
@@ -265,7 +330,7 @@ func (im Implementation) validate() error {
 		if c.ID > im.MaxCriterion {
 			return fmt.Errorf("AC-%d is above max_criterion %d", c.ID, im.MaxCriterion)
 		}
-		if c.Text == "" || c.Text != strings.Join(strings.Fields(c.Text), " ") {
+		if c.Text == "" || c.Text != normalizeCriterion(c.Text) {
 			return fmt.Errorf("AC-%d: text must be non-empty and normalized", c.ID)
 		}
 		if len(c.Tests) == 0 {
