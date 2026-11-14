@@ -721,6 +721,12 @@ func RecordChange(r Repo, p PendingRecord, expectedFingerprint string) (version,
 	if err != nil {
 		return "", "", fmt.Errorf("record %s: updated spec is invalid: %w", p.OutcomeID, err)
 	}
+	if _, _, before := spec.Criteria(); before == nil {
+		// aeh's own changelog line must not make valid criteria unreadable.
+		if _, _, after := updated.Criteria(); after != nil {
+			return "", "", fmt.Errorf("record %s: the changelog line would invalidate the acceptance criteria: %w", p.OutcomeID, after)
+		}
+	}
 	var implemented []byte
 	if p.Implementation != nil {
 		if implemented, err = implementationRecord(dir, spec, p); err != nil {
@@ -1511,9 +1517,11 @@ aeh never publishes it. A private backup is the owner's choice.
 "## Changelog" must be the last section. A changelog entry records the verified branch and
 commit; it does not mean the change was merged.
 
-Acceptance criteria are what aeh plans and tests from. Each is one line "- AC-<n>: <text>".
-A changed criterion keeps its number; a new one takes a number above every number used before;
-a removed criterion's number is never reused. Prose and fenced examples may sit between them.
+Acceptance criteria are what aeh plans and tests from. The section starts at the column-0
+heading "## Acceptance criteria" and holds only lines "- AC-<n>: <text>" and blank lines; put
+prose before the heading. A changed criterion keeps its number; a new one takes a number above
+every number used before; a number removed in an approved version is never reused. In a spec
+with criteria, fences start at column 0 and raw HTML is not allowed outside code spans.
 
 ## Rules
 

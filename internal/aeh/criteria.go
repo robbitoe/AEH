@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"regexp"
 	"sort"
 	"strconv"
@@ -27,144 +28,158 @@ type SpecCriterion struct {
 var (
 	criterionLine = regexp.MustCompile(`^- AC-([1-9][0-9]*): (.*)$`)
 	observedLine  = regexp.MustCompile(`^- AC-[0-9]+ \(observed\):`)
-	listItem      = regexp.MustCompile(`^(?:[-*+]|[0-9]+[.)])(?:\s|$)`)
-	mentionsAC    = regexp.MustCompile(`(?i)\bAC-[0-9]`)
-	htmlLine      = regexp.MustCompile(`^ {0,3}<[A-Za-z/!?]`)
+	strayLine     = regexp.MustCompile(`(?i)^\s*(?:>\s*)*(?:[-*+]|[0-9]+[.)])\s+AC-[0-9]`)
+	htmlStart     = regexp.MustCompile(`<!--|<[A-Za-z/!?]`)
+	autolink      = regexp.MustCompile(`<[A-Za-z][A-Za-z0-9+.\-]{1,31}:[^\s<>]*>|<[^\s<>@]+@[^\s<>]+>`)
 )
 
-// maxCriterionID bounds criterion numbers so they stay plain integers everywhere.
-const maxCriterionID = 1_000_000
-
-// headingOf returns an ATX heading line as "## Text" (up to three leading spaces and closing
-// hashes removed), or "" when the line is not a heading.
-func headingOf(line string) string {
-	t := strings.TrimLeft(line, " ")
-	if len(line)-len(t) > 3 || !strings.HasPrefix(t, "#") {
-		return ""
+// headingAt0 returns a column-0 ATX heading as its level and text (closing hashes removed),
+// or level 0 when the line is not one.
+func headingAt0(line string) (int, string) {
+	n := len(line) - len(strings.TrimLeft(line, "#"))
+	if n == 0 || n > 6 || (len(line) > n && line[n] != ' ' && line[n] != '\t') {
+		return 0, ""
 	}
-	n := len(t) - len(strings.TrimLeft(t, "#"))
-	if n > 6 || (len(t) > n && t[n] != ' ' && t[n] != '\t') {
-		return ""
-	}
-	text := strings.TrimSpace(t[n:])
+	text := strings.TrimSpace(line[n:])
 	if strings.Trim(text, "#") == "" {
 		text = ""
 	} else if i := strings.LastIndexAny(text, " \t"); i >= 0 && strings.Trim(text[i+1:], "#") == "" {
 		text = strings.TrimSpace(text[:i])
 	}
-	return strings.Repeat("#", n) + " " + text
+	return n, text
 }
 
-// isBreakLine reports a setext underline or thematic break: only one of - = * _ and blanks.
-func isBreakLine(line string) bool {
-	t := strings.TrimSpace(line)
-	if t == "" || strings.Trim(t, "-=*_ \t") != "" {
-		return false
-	}
-	c := strings.TrimLeft(t, " \t")[0]
-	return strings.Trim(t, string(c)+" \t") == ""
-}
-
-// parseCriteria reads the "## Acceptance criteria" section of a spec body. present is false
-// when the section is absent: such a spec can be approved, not planned. Inside the section,
-// outside fenced code, each criterion is one line "- AC-<n>: <text>" with n a positive integer
-// without leading zeros. What aeh plans must be exactly what the owner reads, so anything that
-// Markdown could render differently is an error: other list items, indented or lazy
-// continuation lines, quotes, setext headings and thematic breaks, sub-headings, other lines
-// that mention a criterion, and, anywhere in a spec that has the section, criterion lines
-// outside it and raw HTML or HTML comments (they can hide text or headings). Prose separated by blank lines and fenced
-// examples are allowed.
-func parseCriteria(body string) (crit []SpecCriterion, present bool, err error) {
-	var f codeFence
-	in, sections, htmlAt, strayAt := false, 0, 0, 0
-	afterCriterion := false
-	seen := map[int]bool{}
-	fail := func(n int, format string, a ...any) ([]SpecCriterion, bool, error) {
-		return nil, true, fmt.Errorf("acceptance criteria line %d: "+format, append([]any{n}, a...)...)
-	}
-	for i, raw := range strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n") {
-		n := i + 1
-		if f.step(raw) {
-			afterCriterion = false
+// stripCodeSpans removes inline code spans (a backtick run up to the next run of the same
+// length on the line), whose content Markdown shows literally.
+func stripCodeSpans(line string) string {
+	var b strings.Builder
+	for i := 0; i < len(line); {
+		if line[i] != '`' {
+			b.WriteByte(line[i])
+			i++
 			continue
 		}
-		line := strings.TrimRight(raw, " \t")
-		if htmlAt == 0 && (htmlLine.MatchString(line) || strings.Contains(line, "<!--") || strings.Contains(line, "-->")) {
-			htmlAt = n
+		j := i
+		for j < len(line) && line[j] == '`' {
+			j++
 		}
-		if h := headingOf(line); h != "" {
-			wasIn := in
-			if strings.HasPrefix(h, "## ") || strings.HasPrefix(h, "# ") {
-				in = h == criteriaHeading
+		run := line[i:j]
+		end := -1
+		for k := j; k < len(line); {
+			if line[k] != '`' {
+				k++
+				continue
+			}
+			m := k
+			for m < len(line) && line[m] == '`' {
+				m++
+			}
+			if m-k == len(run) {
+				end = m
+				break
+			}
+			k = m
+		}
+		if end < 0 {
+			b.WriteString(run)
+			i = j
+			continue
+		}
+		i = end
+	}
+	return b.String()
+}
+
+func isASCIIBlank(line string) bool { return strings.Trim(line, " \t") == "" }
+
+// parseCriteria reads the "## Acceptance criteria" section of a spec body. present is false
+// when the section is absent: such a spec can be approved, not planned.
+//
+// The section has a closed grammar, so what aeh plans is exactly what the owner reads in any
+// Markdown renderer: it starts at the column-0 heading "## Acceptance criteria", ends at the
+// next column-0 heading of level 1 or 2, and holds only criterion lines "- AC-<n>: <text>"
+// (n a positive integer without leading zeros) and blank lines. Prose, quotes, nested or
+// indented lines, sub-headings and fences belong outside it. In a spec that has the section,
+// these are errors anywhere: a criterion-like list item outside the section, a fence that is
+// not at column 0 (it could belong to a list item), raw HTML or an HTML comment outside code
+// spans (it can hide text), and a lone carriage return (Markdown reads it as a line break).
+func parseCriteria(body string) (crit []SpecCriterion, present bool, err error) {
+	var f codeFence
+	in, sections := false, 0
+	issue, issueAt := "", 0
+	note := func(n int, msg string) {
+		if issueAt == 0 {
+			issue, issueAt = msg, n
+		}
+	}
+	seen := map[int]bool{}
+	for i, line := range strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n") {
+		n := i + 1
+		if strings.Contains(line, "\r") {
+			note(n, "a lone carriage return is a line break in Markdown; use LF or CRLF line endings")
+		}
+		trimmed := strings.TrimLeft(line, " \t")
+		if trimmed != line && (strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~")) {
+			note(n, "fences must start at column 0 in a spec with acceptance criteria")
+		}
+		if f.step(line) {
+			continue
+		}
+		if m := htmlStart.FindString(autolink.ReplaceAllString(stripCodeSpans(line), "")); m != "" {
+			note(n, "raw HTML and HTML comments are not allowed in a spec with acceptance criteria; they can hide text (use a code span or a fence)")
+		}
+		if level, text := headingAt0(line); level > 0 {
+			if level <= 2 {
+				in = level == 2 && text == strings.TrimPrefix(criteriaHeading, "## ")
 				if in {
 					sections++
 				}
+			} else if in {
+				note(n, "sub-headings are not allowed in the acceptance criteria section")
 			}
-			if wasIn && !strings.HasPrefix(h, "# ") && !strings.HasPrefix(h, "## ") {
-				return fail(n, "sub-headings inside the section are not allowed")
-			}
-			afterCriterion = false
 			continue
 		}
 		if !in {
-			if strayAt == 0 && (criterionLine.MatchString(line) || observedLine.MatchString(line)) {
-				strayAt = n
+			if strayLine.MatchString(line) || observedLine.MatchString(line) {
+				note(n, fmt.Sprintf("a criterion outside the %q section would not be planned; move it into the section", criteriaHeading))
 			}
 			continue
 		}
-		if strings.TrimSpace(line) == "" {
-			afterCriterion = false
+		if isASCIIBlank(line) {
 			continue
 		}
-		if line != strings.TrimLeft(line, " \t") {
-			return fail(n, "indented lines are not allowed; write each criterion on one line")
-		}
-		if isBreakLine(line) {
-			return fail(n, "setext headings and thematic breaks are not allowed in the section")
-		}
-		if strings.HasPrefix(line, ">") {
-			return fail(n, "quotes are not allowed in the section")
-		}
 		if observedLine.MatchString(line) {
-			return fail(n, "observed criteria are reserved for adopting existing systems")
+			note(n, "observed criteria are reserved for adopting existing systems")
+			continue
 		}
 		m := criterionLine.FindStringSubmatch(line)
 		if m == nil {
-			if listItem.MatchString(line) {
-				return fail(n, `a list item must read "- AC-<n>: <text>" (n from 1, no leading zeros)`)
-			}
-			if mentionsAC.MatchString(line) {
-				return fail(n, `a line that mentions a criterion must read "- AC-<n>: <text>"`)
-			}
-			if afterCriterion {
-				return fail(n, "this line would continue the criterion above; write each criterion on one line and separate prose with a blank line")
-			}
-			continue // prose
+			note(n, `the acceptance criteria section holds only lines "- AC-<n>: <text>" (n from 1, no leading zeros) and blank lines; put prose before its heading`)
+			continue
 		}
 		id, cerr := strconv.Atoi(m[1])
-		if cerr != nil || id > maxCriterionID {
-			return fail(n, "AC-%s is above the limit of %d", m[1], maxCriterionID)
+		if cerr != nil {
+			note(n, fmt.Sprintf("AC-%s is too large", m[1]))
+			continue
 		}
 		text := strings.Join(strings.Fields(m[2]), " ")
-		if text == "" {
-			return fail(n, "AC-%d has no text", id)
+		switch {
+		case text == "":
+			note(n, fmt.Sprintf("AC-%d has no text", id))
+		case seen[id]:
+			note(n, fmt.Sprintf("AC-%d appears twice", id))
+		default:
+			seen[id] = true
+			crit = append(crit, SpecCriterion{ID: id, Text: text})
 		}
-		if seen[id] {
-			return fail(n, "AC-%d appears twice", id)
-		}
-		seen[id] = true
-		crit = append(crit, SpecCriterion{ID: id, Text: text})
-		afterCriterion = true
 	}
 	switch {
 	case sections == 0:
 		return nil, false, nil
+	case issueAt > 0:
+		return nil, true, fmt.Errorf("acceptance criteria line %d: %s", issueAt, issue)
 	case sections > 1:
 		return nil, true, fmt.Errorf("the spec has %d %q sections; keep one", sections, criteriaHeading)
-	case strayAt > 0:
-		return fail(strayAt, "a criterion outside the %q section would not be planned; move it into the section", criteriaHeading)
-	case htmlAt > 0:
-		return fail(htmlAt, "raw HTML and HTML comments are not allowed in a spec with acceptance criteria; they can hide text")
 	case len(crit) == 0:
 		return nil, true, fmt.Errorf("the %q section has no criteria", criteriaHeading)
 	}
@@ -293,93 +308,106 @@ func (s Spec) LastImplementation() (Implementation, bool) {
 
 // criteriaIdentity is what memory's history says about a feature's criterion numbers.
 type criteriaIdentity struct {
-	Known map[int]bool // IDs of the latest genuine approval: they keep their place
-	High  int          // highest ID ever approved or implemented, retired ones included
+	Latest  map[int]bool // IDs of the newest genuine approval: they keep their place
+	Retired map[int]bool // IDs a genuine approval had and a later genuine approval removed
+	High    int          // highest ID ever approved or implemented
 }
 
-// loadCriteriaIdentity reads the feature's whole memory history, not only the current files:
-// lowering max_criterion or truncating implemented.yaml in a later commit does not free a
-// number. Known comes from the newest commit whose approval.yaml matches the spec next to it,
-// so a hand-edited approval file cannot vouch for an ID either. Implementations only raise
-// High: an ID they had and a later approval removed stays retired.
-func loadCriteriaIdentity(dir string, s Spec) (criteriaIdentity, error) {
-	id := criteriaIdentity{Known: map[int]bool{}}
-	raise := func(n int) {
-		if n > id.High {
-			id.High = n
-		}
+// gitBlob reads a file at a commit byte for byte (git() trims its output).
+func gitBlob(dir, rev, rel string) (string, bool) {
+	cmd := exec.Command("git", append(append([]string{}, gitSafety...), "cat-file", "blob", rev+":"+rel)...)
+	cmd.Dir = dir
+	cmd.Env = commandEnv(nil)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", false
 	}
-	addCurrent := func(a *SpecApproval, impls []Implementation) {
+	return string(out), true
+}
+
+// loadCriteriaIdentity replays the feature's memory history, oldest first. A commit whose
+// approval.yaml matches the spec next to it is a genuine approval; an ID that one genuine
+// approval had and a later one lacks is retired for good, so restoring old files cannot bring
+// it back. Every approval and implementation file ever committed, and the current files,
+// raise the high-water mark, so lowering max_criterion or dropping implemented.yaml by hand
+// frees nothing.
+func loadCriteriaIdentity(dir string, s Spec) (criteriaIdentity, error) {
+	id := criteriaIdentity{Latest: map[int]bool{}, Retired: map[int]bool{}}
+	raise := func(a *SpecApproval, impls []Implementation) {
 		if a != nil {
-			raise(a.MaxCriterion)
+			id.High = max(id.High, a.MaxCriterion)
 			for _, n := range a.Criteria {
-				raise(n)
+				id.High = max(id.High, n)
 			}
 		}
 		for _, im := range impls {
-			raise(im.MaxCriterion)
+			id.High = max(id.High, im.MaxCriterion)
 			for _, c := range im.Criteria {
-				raise(c.ID)
+				id.High = max(id.High, c.ID)
 			}
 		}
 	}
-	addCurrent(s.Approval, s.Implemented)
+	raise(s.Approval, s.Implemented)
 	aRel, iRel, sRel := approvalRel(s.Feature), implementedRel(s.Feature), specRel(s.Feature)
-	log, err := git(dir, "log", "--format=%H", "--", aRel, iRel)
+	log, err := git(dir, "log", "--reverse", "--format=%H", "--", aRel, iRel)
 	if err != nil {
 		return id, fmt.Errorf("criteria history of %s: %w", s.Feature, err)
 	}
-	knownSet := false
+	var prev map[int]bool
 	for _, sha := range strings.Fields(log) {
 		var a *SpecApproval
-		if b, err := git(dir, "show", sha+":"+aRel); err == nil {
+		if b, ok := gitBlob(dir, sha, aRel); ok {
 			var v SpecApproval
 			if yaml.Unmarshal([]byte(b), &v) == nil {
 				a = &v
 			}
 		}
 		var impls []Implementation
-		if b, err := git(dir, "show", sha+":"+iRel); err == nil {
+		if b, ok := gitBlob(dir, sha, iRel); ok {
 			_ = yaml.Unmarshal([]byte(b), &impls)
 		}
-		addCurrent(a, impls)
+		raise(a, impls)
 		if a == nil {
 			continue
 		}
-		text, err := git(dir, "show", sha+":"+sRel)
-		if err != nil {
+		text, ok := gitBlob(dir, sha, sRel)
+		if !ok {
 			continue
 		}
-		sp, err := parseSpec(text + "\n")
-		if err != nil {
+		sp, err := parseSpec(text)
+		if err != nil || approvalDigest(sp.Title, sp.Paths, sp.Body) != a.Content {
 			continue
 		}
 		crit, _, err := sp.Criteria()
 		if err != nil {
 			continue
 		}
-		genuine := approvalDigest(sp.Title, sp.Paths, sp.Body) == a.Content
+		ids := map[int]bool{}
 		for _, c := range crit {
-			if genuine {
-				raise(c.ID) // a genuinely approved content: its IDs were approved
-			}
-			if genuine && !knownSet {
-				id.Known[c.ID] = true
+			ids[c.ID] = true
+			id.High = max(id.High, c.ID)
+		}
+		for n := range prev {
+			if !ids[n] {
+				id.Retired[n] = true
 			}
 		}
-		if genuine {
-			knownSet = true
-		}
+		prev = ids
+	}
+	if prev != nil {
+		id.Latest = prev
 	}
 	return id, nil
 }
 
-// check rejects criterion IDs that reuse a retired number or skip back below the mark. An ID
-// the latest approval had keeps its place, even with new text; any other ID must be above
-// every ID used before.
+// check rejects a retired ID, and a new ID at or below the high-water mark. An ID the newest
+// approval had keeps its place, even with new text.
 func (id criteriaIdentity) check(crit []SpecCriterion) error {
 	for _, c := range crit {
-		if !id.Known[c.ID] && c.ID <= id.High {
+		switch {
+		case id.Retired[c.ID]:
+			return fmt.Errorf("AC-%d was removed in an approved version; its number is retired; new criteria start at AC-%d", c.ID, id.High+1)
+		case !id.Latest[c.ID] && c.ID <= id.High:
 			return fmt.Errorf("AC-%d reuses a retired or skipped number; new criteria start at AC-%d", c.ID, id.High+1)
 		}
 	}

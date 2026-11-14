@@ -17,15 +17,17 @@ func TestParseCriteria(t *testing.T) {
 		{"absent", "# X\nText.\n\n## Changelog\n", nil, false},
 		{"basic", "## Acceptance criteria\n- AC-1: Pays   once.\n- AC-2: Retries\tsafely.\n\n## Changelog\n",
 			[]SpecCriterion{{1, "Pays once."}, {2, "Retries safely."}}, true},
-		{"prose and fences", "## Acceptance criteria\nThe buyer:\n```\n- not a criterion\n## not a heading\n```\n- AC-3: Gets a receipt.\n## Changelog\n",
+		{"prose and fences before the heading", "The buyer:\n```\n- AC-9: an example, not a criterion\n## not a heading\n```\n## Acceptance criteria\n- AC-3: Gets a receipt.\n## Changelog\n",
 			[]SpecCriterion{{3, "Gets a receipt."}}, true},
 		{"fenced heading lookalike", "```\n## Acceptance criteria\n- AC-1: x\n```\n## Changelog\n", nil, false},
 		{"crlf and trailing spaces", "## Acceptance criteria  \r\n- AC-1: Pays.  \r\n## Changelog\r\n", []SpecCriterion{{1, "Pays."}}, true},
 		{"ends at first-level heading", "## Acceptance criteria\n- AC-1: Pays.\n# Appendix\n- anything\n", []SpecCriterion{{1, "Pays."}}, true},
-		{"closing hashes and indent", "  ## Acceptance criteria ##\n- AC-1: Pays.\n\nSome prose.\n## Changelog\n", []SpecCriterion{{1, "Pays."}}, true},
-		{"million", "## Acceptance criteria\n- AC-1000000: Pays.\n", []SpecCriterion{{1000000, "Pays."}}, true},
+		{"closing hashes", "## Acceptance criteria ##\n- AC-1: Pays.\n\n## Changelog\n", []SpecCriterion{{1, "Pays."}}, true},
+		{"large id", "## Acceptance criteria\n- AC-1000001: Pays.\n", []SpecCriterion{{1000001, "Pays."}}, true},
 		{"html without section", "<!-- note -->\nText.\n", nil, false},
-		{"prose after blank", "## Acceptance criteria\n- AC-1: Pays.\n\nThis explains AC rules in general.\n", []SpecCriterion{{1, "Pays."}}, true},
+		{"code span and comparison", "## Acceptance criteria\n- AC-1: Render `<!-- note -->` literally when amount > 0.\n",
+			[]SpecCriterion{{1, "Render `<!-- note -->` literally when amount > 0."}}, true},
+		{"autolink in prose", "See <https://example.com/pay> and <ops@example.com>.\n\n## Acceptance criteria\n- AC-1: Pays.\n", []SpecCriterion{{1, "Pays."}}, true},
 	}
 	for _, c := range ok {
 		got, present, err := parseCriteria(c.body)
@@ -34,33 +36,41 @@ func TestParseCriteria(t *testing.T) {
 		}
 	}
 	bad := map[string]string{
-		"leading zero":       "## Acceptance criteria\n- AC-01: x\n",
-		"zero":               "## Acceptance criteria\n- AC-0: x\n",
-		"duplicate":          "## Acceptance criteria\n- AC-1: x\n- AC-1: y\n",
-		"no text":            "## Acceptance criteria\n- AC-1:   \n",
-		"other bullet":       "## Acceptance criteria\n- AC-1: x\n* AC-2: y\n",
-		"plain bullet":       "## Acceptance criteria\n- AC-1: x\n- also this\n",
-		"numbered":           "## Acceptance criteria\n1. AC-1: x\n",
-		"continuation":       "## Acceptance criteria\n- AC-1: x\n  and more\n",
-		"tab continuation":   "## Acceptance criteria\n- AC-1: x\n\tand more\n",
-		"observed reserved":  "## Acceptance criteria\n- AC-1 (observed): x\n",
-		"empty section":      "## Acceptance criteria\nNothing yet.\n## Changelog\n",
-		"two sections":       "## Acceptance criteria\n- AC-1: x\n## Acceptance criteria\n- AC-2: y\n",
-		"sub heading":        "## Acceptance criteria\n- AC-1: x\n### More\n- AC-2: y\n",
-		"no space":           "## Acceptance criteria\n- AC-1:x\n",
-		"html comment hides": "## Acceptance criteria\n- AC-1: x\n<!--\n- AC-2: hidden\n-->\n",
-		"comment hides head": "## Acceptance criteria\n- AC-1: x\n<!-- ## Notes -->\n- AC-2: y\n",
-		"html block":         "<div>\n\n## Acceptance criteria\n- AC-1: x\n</div>\n",
-		"setext heading":     "## Acceptance criteria\n- AC-1: x\n\nNotes\n---\n- AC-2: y\n",
-		"thematic break":     "## Acceptance criteria\n- AC-1: x\n\n***\n",
-		"lazy continuation":  "## Acceptance criteria\n- AC-1: Reject unauthenticated requests\nexcept requests to /public.\n",
-		"quote":              "## Acceptance criteria\n- AC-1: x\n> - AC-2: y\n",
-		"nbsp bullet":        "## Acceptance criteria\n- AC-1: x\n- AC-2: y\n",
-		"table mention":      "## Acceptance criteria\n- AC-1: x\n\n| AC-2 | y |\n",
-		"indented heading":   "## Acceptance criteria\n- AC-1: x\n   ## Notes\n- AC-2: y\n", // AC-2 lands outside the section
-		"stray criterion":    "- AC-2: y\n\n## Acceptance criteria\n- AC-1: x\n",
-		"huge id":            "## Acceptance criteria\n- AC-99999999999999999999: x\n",
-		"sub heading 4":      "## Acceptance criteria\n- AC-1: x\n#### More\n",
+		"leading zero":        "## Acceptance criteria\n- AC-01: x\n",
+		"zero":                "## Acceptance criteria\n- AC-0: x\n",
+		"duplicate":           "## Acceptance criteria\n- AC-1: x\n- AC-1: y\n",
+		"no text":             "## Acceptance criteria\n- AC-1:   \n",
+		"other bullet":        "## Acceptance criteria\n- AC-1: x\n* AC-2: y\n",
+		"plain bullet":        "## Acceptance criteria\n- AC-1: x\n- also this\n",
+		"numbered":            "## Acceptance criteria\n1. AC-1: x\n",
+		"continuation":        "## Acceptance criteria\n- AC-1: x\n  and more\n",
+		"tab continuation":    "## Acceptance criteria\n- AC-1: x\n\tand more\n",
+		"observed reserved":   "## Acceptance criteria\n- AC-1 (observed): x\n",
+		"empty section":       "## Acceptance criteria\nNothing yet.\n## Changelog\n",
+		"two sections":        "## Acceptance criteria\n- AC-1: x\n## Acceptance criteria\n- AC-2: y\n",
+		"sub heading":         "## Acceptance criteria\n- AC-1: x\n### More\n- AC-2: y\n",
+		"no space":            "## Acceptance criteria\n- AC-1:x\n",
+		"html comment hides":  "## Acceptance criteria\n- AC-1: x\n<!--\n- AC-2: hidden\n-->\n",
+		"comment hides head":  "## Acceptance criteria\n- AC-1: x\n<!-- ## Notes -->\n- AC-2: y\n",
+		"html block":          "<div>\n\n## Acceptance criteria\n- AC-1: x\n</div>\n",
+		"inline details":      "## Acceptance criteria\n- AC-1: <details><summary>Pay once.</summary>Pay twice.</details>\n",
+		"setext heading":      "## Acceptance criteria\n- AC-1: x\n\nNotes\n---\n- AC-2: y\n",
+		"thematic break":      "## Acceptance criteria\n- AC-1: x\n\n***\n",
+		"lazy continuation":   "## Acceptance criteria\n- AC-1: Reject unauthenticated requests\nexcept requests to /public.\n",
+		"prose after blank":   "## Acceptance criteria\n- AC-1: Pays.\n\nThis explains the rules.\n",
+		"nbsp blank line":     "## Acceptance criteria\n- AC-1: Reject unauthenticated requests\n \nexcept requests to /public.\n",
+		"lone CR":             "## Acceptance criteria\n- AC-1: First.\r- AC-2: Second.\n",
+		"quote":               "## Acceptance criteria\n- AC-1: x\n> - AC-2: y\n",
+		"nbsp bullet":         "## Acceptance criteria\n- AC-1: x\n- AC-2: y\n",
+		"table mention":       "## Acceptance criteria\n- AC-1: x\n\n| AC-2 | y |\n",
+		"indented heading":    "## Acceptance criteria\n- AC-1: x\n   ## Notes\n- AC-2: y\n",
+		"nested after head":   "## Acceptance criteria\n- AC-1: x\n\n## Notes\n  - AC-2: y\n",
+		"stray criterion":     "- AC-2: y\n\n## Acceptance criteria\n- AC-1: x\n",
+		"quoted stray":        "> - AC-2: y\n\n## Acceptance criteria\n- AC-1: x\n",
+		"list-item fences":    "## Acceptance criteria\n- AC-1: Require authentication.\n  ```\n- AC-2: Require authorization.\n  ```\n- AC-3: Audit requests.\n",
+		"indented fence away": "- item\n  ```\n  code\n  ```\n\n## Acceptance criteria\n- AC-1: x\n",
+		"huge id":             "## Acceptance criteria\n- AC-99999999999999999999: x\n",
+		"sub heading 4":       "## Acceptance criteria\n- AC-1: x\n#### More\n",
 	}
 	for name, body := range bad {
 		if _, _, err := parseCriteria(body); err == nil {
@@ -88,7 +98,7 @@ func TestCriteriaDelta(t *testing.T) {
 }
 
 func TestCriteriaIdentityCheck(t *testing.T) {
-	id := criteriaIdentity{Known: map[int]bool{1: true, 2: true}, High: 3}
+	id := criteriaIdentity{Latest: map[int]bool{1: true, 2: true}, Retired: map[int]bool{3: true}, High: 3}
 	for _, c := range []struct {
 		ids []int
 		ok  bool
@@ -106,6 +116,11 @@ func TestCriteriaIdentityCheck(t *testing.T) {
 		if err := id.check(crit); (err == nil) != c.ok {
 			t.Errorf("ids %v: err %v, want ok=%v", c.ids, err, c.ok)
 		}
+	}
+	// A number below the mark that no approval had (a skipped one) is not free either.
+	id.High = 6
+	if err := id.check([]SpecCriterion{{5, "x"}}); err == nil {
+		t.Error("a skipped number below the mark was accepted")
 	}
 }
 
@@ -153,7 +168,7 @@ func TestApproveRecordsCriteriaAndRetiresNumbers(t *testing.T) {
 		t.Fatalf("reused number approved: %v", err)
 	}
 	errs, _, err := LintMemory(r)
-	if err != nil || !strings.Contains(strings.Join(errs, "\n"), "reuses a retired") {
+	if err != nil || !strings.Contains(strings.Join(errs, "\n"), "retired") {
 		t.Fatalf("lint must report the reuse: %v %v", errs, err)
 	}
 	// Lowering max_criterion and dropping criteria in a committed hand edit frees nothing:
@@ -345,6 +360,65 @@ func recordImplementation(t *testing.T, r Repo, spec Spec, outcome, sha string) 
 }
 
 // An approved spec without criteria cannot record an implementation, and does not panic.
+// Restoring an old spec and its approval in a new commit does not bring a retired ID back,
+// and history is read byte for byte (trailing spaces included).
+func TestRestoredApprovalKeepsNumbersRetired(t *testing.T) {
+	r := newMemoryProject(t)
+	if _, err := CreateSpec(r, "checkout", "Checkout", []string{"src/checkout/**"}); err != nil {
+		t.Fatal(err)
+	}
+	describeSpec(t, r, "checkout", twoCriteria)
+	// The file ends in blank space that git() would trim; history must read it byte for byte.
+	dir := memDir(t, r)
+	sp := filepath.Join(dir, "wiki", "features", "checkout", "spec.md")
+	if err := os.WriteFile(sp, []byte(readFile(t, sp)+"\n   "), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "trailing space")
+	if _, _, err := ApproveSpec(r, "checkout"); err != nil {
+		t.Fatal(err)
+	}
+	ap := filepath.Join(dir, "wiki", "features", "checkout", approvalFile)
+	oldSpec, oldApproval := readFile(t, sp), readFile(t, ap)
+	editSpec(t, r, "checkout", "- AC-2: Given a failed payment, when retried, then no second charge.\n", "")
+	if _, _, err := ApproveSpec(r, "checkout"); err != nil {
+		t.Fatal(err)
+	}
+	for p, text := range map[string]string{sp: oldSpec, ap: oldApproval} {
+		if err := os.WriteFile(p, []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "restore the old pair")
+	if _, _, err := ApproveSpec(r, "checkout"); err == nil || !strings.Contains(err.Error(), "retired") {
+		t.Fatalf("a restored approval revived AC-2: %v", err)
+	}
+	if errs, _, _ := LintMemory(r); !strings.Contains(strings.Join(errs, "\n"), "AC-2 was removed") {
+		t.Fatalf("lint must report the revived AC-2: %v", errs)
+	}
+}
+
+// aeh's own changelog line must not turn valid criteria invalid.
+func TestRecordRefusesNoteThatBreaksCriteria(t *testing.T) {
+	r := newMemoryProject(t)
+	if _, err := CreateSpec(r, "checkout", "Checkout", []string{"src/checkout/**"}); err != nil {
+		t.Fatal(err)
+	}
+	describeSpec(t, r, "checkout", twoCriteria)
+	if _, _, err := ApproveSpec(r, "checkout"); err != nil {
+		t.Fatal(err)
+	}
+	dir := memDir(t, r)
+	head := mustGit(t, dir, "rev-parse", "HEAD")
+	p := PendingRecord{OutcomeID: "OUT-1", Feature: "checkout", Change: "patch", Note: "Hide <!-- this.", Commit: fakeSHA('c')}
+	if _, _, err := RecordChange(r, p, ""); err == nil {
+		t.Fatal("a note with an HTML comment was recorded")
+	}
+	if got := mustGit(t, dir, "rev-parse", "HEAD"); got != head {
+		t.Fatal("memory changed")
+	}
+}
+
 func TestImplementationNeedsCriteria(t *testing.T) {
 	r := newMemoryProject(t)
 	if _, err := CreateSpec(r, "checkout", "Checkout", []string{"src/checkout/**"}); err != nil {
