@@ -41,6 +41,7 @@ type promptData struct {
 	Round        int
 	MaxQuestions int
 	MaxFeatures  int
+	Book         string // book review: frozen, validated draft files as reference data
 }
 
 // memorySpecBlock exposes only the declared feature as reference data.

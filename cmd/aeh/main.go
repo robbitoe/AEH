@@ -26,10 +26,14 @@ Setup
 Discovery (from an idea to a draft book of specs in memory)
   aeh discover new <slug> "<idea>"  start a discovery session
   aeh discover run <slug>           run one round: the agent asks questions or writes the draft book
-  aeh discover show <slug>          phase, questions and answers
+  aeh discover show <slug>          phase, review, questions and owner actions
   aeh discover answer <slug> <QID> "<text>"
                                     answer a question (again to revise it)
   aeh discover skip <slug> <QID>    skip an optional question
+  aeh discover promote <slug> <feature>
+                                    create an unapproved feature spec from a committed draft
+  aeh discover accept <slug> vision|data
+                                    accept an advisory document (existing documents use .next.md)
 
 Definition
   aeh tests approve <ID>            seal the outcome's acceptance tests
@@ -304,7 +308,7 @@ func memoryCommand(repo aeh.Repo, args []string) (int, error) {
 
 func discoverCommand(ctx context.Context, repo aeh.Repo, args []string) (int, error) {
 	if len(args) < 2 {
-		return 2, errors.New("usage: aeh discover new|run|show|answer|skip <slug> ...")
+		return 2, errors.New("usage: aeh discover new|run|show|answer|skip|promote|accept <slug> ...")
 	}
 	slug := args[1]
 	switch args[0] {
@@ -335,12 +339,9 @@ func discoverCommand(ctx context.Context, repo aeh.Repo, args []string) (int, er
 		if len(args) != 2 {
 			return 2, errors.New("usage: aeh discover show <slug>")
 		}
-		st, ok, err := aeh.LoadDiscovery(repo, slug)
+		st, err := aeh.DiscoverShow(repo, slug)
 		if err != nil {
 			return 1, err
-		}
-		if !ok {
-			return 1, fmt.Errorf("discovery %s does not exist", slug)
 		}
 		printDiscovery(st, true)
 		return 0, nil
@@ -364,6 +365,22 @@ func discoverCommand(ctx context.Context, repo aeh.Repo, args []string) (int, er
 		}
 		fmt.Printf("%s skipped; phase %s\n", args[2], st.Phase)
 		return 0, nil
+	case "promote", "accept":
+		if len(args) != 3 {
+			return 2, fmt.Errorf("usage: aeh discover %s <slug> <feature|vision|data>", args[0])
+		}
+		var st aeh.DiscoveryState
+		var err error
+		if args[0] == "promote" {
+			st, err = aeh.DiscoverPromote(repo, slug, args[2])
+		} else {
+			st, err = aeh.DiscoverAccept(repo, slug, args[2])
+		}
+		if err != nil {
+			return 1, err
+		}
+		printDiscovery(st, true)
+		return 0, nil
 	}
 	return 2, fmt.Errorf("unknown discover command %q", args[0])
 }
@@ -375,13 +392,25 @@ func printDiscovery(st aeh.DiscoveryState, all bool) {
 	if st.Status == aeh.StatusBlocked {
 		fmt.Println("  blocked: " + strings.ReplaceAll(firstLines(st.Question, 4), "\n", "\n           "))
 	}
+	if p := st.Book; p != nil {
+		fmt.Printf("pending book: round %d, author attempt %d\n", p.Round, p.Attempt)
+		if v := p.Review; v != nil {
+			fmt.Printf("  review: Reviewer %s (%s); %s; book SHA-256 %s\n", v.Profile, v.Provider, v.Status, v.Book)
+		}
+	}
 	for i, r := range st.Rounds {
 		if !all && i != len(st.Rounds)-1 {
 			continue
 		}
 		if r.Kind == "book" {
 			fmt.Printf("round %d: draft book with %d file(s) in memory under wiki/discovery/%s/drafts/\n", r.N, len(r.Files), st.Slug)
-			continue
+			if v := r.Review; v != nil {
+				validity := "current"
+				if v.Stale {
+					validity = "stale"
+				}
+				fmt.Printf("  review: Reviewer %s (%s); %s; %s; book SHA-256 %s\n", v.Profile, v.Provider, v.Status, validity, v.Book)
+			}
 		}
 		fmt.Printf("round %d questions:\n", r.N)
 		for _, q := range r.Questions {
@@ -397,6 +426,9 @@ func printDiscovery(st aeh.DiscoveryState, all bool) {
 				state = "skipped"
 			}
 			fmt.Printf("  %s (%s, %s) %s\n      why: %s\n", q.ID, kind, state, q.Text, q.Why)
+			if q.Attribution != "" {
+				fmt.Printf("      %s\n", q.Attribution)
+			}
 			if len(q.Options) > 0 {
 				fmt.Printf("      options: %s\n", strings.Join(q.Options, " | "))
 			}
@@ -404,6 +436,12 @@ func printDiscovery(st aeh.DiscoveryState, all bool) {
 				fmt.Printf("      answer: %s\n", strings.ReplaceAll(firstLines(q.Answers[len(q.Answers)-1].Text, 3), "\n", "\n              "))
 			}
 		}
+	}
+	for _, a := range st.Promotions {
+		fmt.Printf("promoted %s to %s (%s)\n", a.Name, a.Target, a.Date)
+	}
+	for _, a := range st.Acceptances {
+		fmt.Printf("accepted %s to %s (%s)\n", a.Name, a.Target, a.Date)
 	}
 	switch st.Phase {
 	case aeh.DiscoveryAwaiting:

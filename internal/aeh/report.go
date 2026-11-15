@@ -8,6 +8,74 @@ import (
 	"strings"
 )
 
+// reportCommand refreshes the local report while the discovery command still holds its lock.
+func (d *discoverySession) reportCommand(commandErr *error) {
+	if d.state == nil {
+		return
+	}
+	err := d.refreshReview()
+	if err == nil {
+		err = d.writeDiscoveryReport()
+	}
+	if *commandErr == nil && err != nil {
+		*commandErr = err
+	}
+}
+
+func renderBookReview(b *strings.Builder, v *DiscoveryBookReview) {
+	validity := "current"
+	if v.Stale {
+		validity = "stale"
+	}
+	fmt.Fprintf(b, "\n### Advisory book review\n\nReviewer: %s (%s)\n\nStatus: %s; %s\n\nPrompt template SHA-256: %s\n\nBook SHA-256: %s\n",
+		discoveryDiagnostic(v.Profile), discoveryDiagnostic(v.Provider), v.Status, validity, v.Prompt, v.Book)
+	if v.Feedback != "" {
+		fmt.Fprintf(b, "\nFeedback: %s\n", discoveryDiagnostic(v.Feedback))
+	}
+}
+
+func (d *discoverySession) writeDiscoveryReport() error {
+	st := d.state
+	var b strings.Builder
+	fmt.Fprintf(&b, "# Discovery %s\n\nPhase: %s\n\n", st.Slug, st.Phase)
+	b.WriteString("Secret detection is best effort and cannot replace minimizing agent input. Reviews are advisory; promotion and acceptance are owner actions, not feature approvals.\n\n")
+	fmt.Fprintf(&b, "## Idea\n\n%s\n\n", st.Idea)
+	if st.Question != "" {
+		fmt.Fprintf(&b, "## Runner feedback\n\n%s\n\n", discoveryDiagnostic(st.Question))
+	}
+	for _, round := range st.Rounds {
+		b.WriteString(d.renderRound(round))
+		b.WriteString("\n")
+	}
+	if st.Book != nil {
+		fmt.Fprintf(&b, "## Pending book\n\nRound %d; author attempt %d; same saved snapshot will be resumed.\n", st.Book.Round, st.Book.Attempt)
+		if st.Book.Review != nil {
+			renderBookReview(&b, st.Book.Review)
+		}
+	}
+	b.WriteString("\n## Attempts\n\n")
+	for _, a := range st.Attempts {
+		fmt.Fprintf(&b, "- Round %d, attempt %d: profile %s; %s; %.3f seconds. %s\n", a.Round, a.N, discoveryDiagnostic(a.Profile), a.Result, a.Seconds, discoveryDiagnostic(firstLine(a.Feedback)))
+	}
+	for _, group := range []struct {
+		title   string
+		actions []DiscoveryAction
+	}{{"Promotions", st.Promotions}, {"Acceptances", st.Acceptances}} {
+		fmt.Fprintf(&b, "\n## %s\n\n", group.title)
+		for _, a := range group.actions {
+			fmt.Fprintf(&b, "- %s to %s (%s), content SHA-256 %s.\n", a.Name, a.Target, a.Date, a.Content)
+		}
+	}
+	text := b.String()
+	if err := checkNoSecrets("discovery report", []byte(text)); err != nil {
+		return err
+	}
+	if err := checkDisplayMarkdown(text, 8<<20); err != nil {
+		return fmt.Errorf("discovery report: %w", err)
+	}
+	return writeFileAtomic(filepath.Join(d.repo.Root, ".aeh", "reports", "discover-"+st.Slug+".md"), []byte(text))
+}
+
 // writeReport writes .aeh/reports/<id>.md: criteria, sealed tests, every attempt and its gates.
 // It returns the report path relative to the repository.
 func (ru *runner) writeReport() string {

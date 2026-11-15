@@ -41,8 +41,22 @@ Option 2, when you can write the book: write these files and end with the line `
 
 - `vision.md`: the product, its users, the problem, what is in and out of scope.
 - `data.md`: the data model: entities, fields, relations and rules.
-- `features/<feature>.md`: one file per feature (at most {{.MaxFeatures}}), named with lowercase letters, digits and hyphens. Each describes the behavior a user can use, then a section that starts with the line `## Acceptance criteria` and holds only lines `- AC-<n>: Given ..., when ..., then ...` numbered from 1. Each criterion must be testable.
+- `features/<feature>.md`: one file per new feature (at most {{.MaxFeatures}}), named with lowercase letters, digits and hyphens. Do not reuse an existing feature slug. Start with YAML front matter containing exactly `title` (one display line, at most 200 bytes) and `paths` (1-20 repository-relative paths). No unknown fields, YAML anchors, aliases or tags. Paths must not claim the repository root, aeh/, .aeh/, or .git/; paths of different drafts must not overlap. Then describe the behavior and include a present, non-empty `## Acceptance criteria` section holding only lines `- AC-<n>: Given ..., when ..., then ...`, numbered 1 through n without gaps. No observed criteria. Each criterion must be testable.
 - `mockups/<feature>/<screen>.html`: optional, one static screen each, under a feature of this book, at most {{.MaxBytes}} bytes.
+
+Example feature draft:
+
+```markdown
+---
+title: Cart
+paths: [src/cart/**, web/cart/**]
+---
+# Cart
+The cart holds items.
+
+## Acceptance criteria
+- AC-1: Given an empty cart, when the user adds an item, then the cart has one item.
+```
 
 Rules for every Markdown file: no HTML, no `<` outside fenced code blocks that start at column 0, no character references such as `&amp;`, links only to `https://` or to relative paths, images only relative, no reference-style link definitions. Never include secrets, keys, tokens or passwords.
 

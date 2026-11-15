@@ -27,7 +27,7 @@ echo "DISCOVERY: QUESTIONS"`
 	writeBook = `mkdir -p features mockups/cart
 printf '# Vision\n\nA shop for consumers.\n' > vision.md
 printf '# Data\n\n- Cart: items, total.\n' > data.md
-printf '# Cart\n\nThe cart holds items.\n\n## Acceptance criteria\n- AC-1: Given an empty cart, when the user adds an item, then the cart has one item.\n' > features/cart.md
+printf '%s\n' '---' 'title: Cart' 'paths: [src/cart/**, web/cart/**]' '---' '# Cart' '' 'The cart holds items.' '' '## Acceptance criteria' '- AC-1: Given an empty cart, when the user adds an item, then the cart has one item.' > features/cart.md
 printf '<style>.x{color:red}</style><main class="x"><h1>Cart</h1><button>Pay</button></main>\n' > mockups/cart/list.html
 echo "DISCOVERY: READY"`
 
@@ -345,7 +345,7 @@ func TestParseDiscoveryQuestions(t *testing.T) {
 
 func TestBookRejectsOrphanMockupsAndUnsafeDocs(t *testing.T) {
 	d := &discoverySession{dcfg: DiscoveryConfig{MaxFeatures: 2, MaxMockupBytes: 4096}, state: &DiscoveryState{Slug: "shop"}}
-	base := map[string][]byte{"vision.md": []byte("# V\n"), "data.md": []byte("# D\n"), "features/cart.md": []byte("# C\n")}
+	base := map[string][]byte{"vision.md": []byte("# V\n"), "data.md": []byte("# D\n"), "features/cart.md": []byte("---\ntitle: Cart\npaths: [src/cart/**]\n---\n# Cart\n\n## Acceptance criteria\n- AC-1: Works.\n")}
 	with := func(rel, body string) frozenOutput {
 		files := map[string][]byte{}
 		for k, v := range base {

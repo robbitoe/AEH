@@ -29,6 +29,7 @@ const (
 	DiscoveryAwaiting = "awaiting_answers" // blocking questions of the last round are open
 	DiscoveryReady    = "ready_to_run"     // another round can run
 	DiscoveryDraft    = "draft_ready"      // a validated draft book is in memory; not an approval
+	DiscoveryReview   = "pending_review"   // frozen book awaiting advisory review and import
 )
 
 // Agent verdicts: the last non-empty line of the agent's output.
@@ -117,38 +118,43 @@ func (c Config) validateDiscoveryConfig() error {
 // .aeh/discovery/<slug>/state.json. Memory holds the readable record; this file holds what
 // aeh needs to resume.
 type DiscoveryState struct {
-	Version    int                `json:"version"`
-	Slug       string             `json:"slug"`
-	Idea       string             `json:"idea"`
-	Phase      string             `json:"phase"`
-	Status     string             `json:"status,omitempty"` // running or blocked while a run needs attention
-	Question   string             `json:"question,omitempty"`
-	Rounds     []DiscoveryRound   `json:"rounds,omitempty"`
-	Attempts   []DiscoveryAttempt `json:"attempts,omitempty"`
-	LadderFrom int                `json:"ladder_from"`
-	Pending    *pendingImport     `json:"pending,omitempty"` // a memory import that must finish first
-	UpdatedAt  time.Time          `json:"updated_at"`
+	Version     int                `json:"version"`
+	Slug        string             `json:"slug"`
+	Idea        string             `json:"idea"`
+	Phase       string             `json:"phase"`
+	Status      string             `json:"status,omitempty"` // running or blocked while a run needs attention
+	Question    string             `json:"question,omitempty"`
+	Rounds      []DiscoveryRound   `json:"rounds,omitempty"`
+	Attempts    []DiscoveryAttempt `json:"attempts,omitempty"`
+	LadderFrom  int                `json:"ladder_from"`
+	Pending     *pendingImport     `json:"pending,omitempty"` // a memory import that must finish first
+	Book        *pendingBook       `json:"pending_book,omitempty"`
+	Promotions  []DiscoveryAction  `json:"promotions,omitempty"`
+	Acceptances []DiscoveryAction  `json:"acceptances,omitempty"`
+	UpdatedAt   time.Time          `json:"updated_at"`
 }
 
 // DiscoveryRound is one accepted agent round: questions, or the draft book.
 type DiscoveryRound struct {
-	N         int                 `json:"n"`
-	Kind      string              `json:"kind"` // questions or book
-	Profile   string              `json:"profile"`
-	Snapshot  string              `json:"snapshot_sha256"`
-	Questions []DiscoveryQuestion `json:"questions,omitempty"`
-	Files     []string            `json:"files,omitempty"` // book: the draft files in memory
+	N         int                  `json:"n"`
+	Kind      string               `json:"kind"` // questions or book
+	Profile   string               `json:"profile"`
+	Snapshot  string               `json:"snapshot_sha256"`
+	Questions []DiscoveryQuestion  `json:"questions,omitempty"`
+	Files     []string             `json:"files,omitempty"` // book: the draft files in memory
+	Review    *DiscoveryBookReview `json:"review,omitempty"`
 }
 
 // DiscoveryQuestion is one agent question with the owner's answers, latest last.
 type DiscoveryQuestion struct {
-	ID       string            `json:"id"`
-	Text     string            `json:"text"`
-	Why      string            `json:"why"`
-	Blocking bool              `json:"blocking"`
-	Options  []string          `json:"options,omitempty"`
-	Answers  []DiscoveryAnswer `json:"answers,omitempty"`
-	Skipped  bool              `json:"skipped,omitempty"`
+	ID          string            `json:"id"`
+	Text        string            `json:"text"`
+	Why         string            `json:"why"`
+	Blocking    bool              `json:"blocking"`
+	Options     []string          `json:"options,omitempty"`
+	Answers     []DiscoveryAnswer `json:"answers,omitempty"`
+	Skipped     bool              `json:"skipped,omitempty"`
+	Attribution string            `json:"attribution,omitempty"`
 }
 
 // DiscoveryAnswer is one revision of the owner's answer.
@@ -337,7 +343,7 @@ func redactErr(err error) error {
 	if err == nil {
 		return nil
 	}
-	return &redactedError{msg: redactDiagnostic(err.Error()), err: err}
+	return &redactedError{msg: discoveryDiagnostic(err.Error()), err: err}
 }
 
 // DiscoverNew starts a discovery session for an idea and records the idea in memory.
@@ -348,6 +354,7 @@ func DiscoverNew(r Repo, slug, idea string) (_ DiscoveryState, err error) {
 		return DiscoveryState{}, err
 	}
 	defer unlock()
+	defer d.reportCommand(&err)
 	if d.state != nil {
 		return *d.state, fmt.Errorf("discovery %s already exists; continue it with: aeh discover run %s", slug, slug)
 	}
@@ -576,10 +583,15 @@ func DiscoverRun(ctx context.Context, r Repo, slug string, log io.Writer) (_ Dis
 		return DiscoveryState{}, err
 	}
 	defer unlock()
+	defer d.reportCommand(&err)
 	if err := d.resume(); err != nil {
 		return d.snapshot(), err
 	}
 	st := d.state
+	if st.Book != nil {
+		err := d.resumeBook(ctx)
+		return *st, err
+	}
 	switch st.Phase {
 	case DiscoveryAwaiting:
 		return *st, fmt.Errorf("discovery %s waits for answers; see them with: aeh discover show %s", slug, slug)
@@ -630,7 +642,12 @@ func DiscoverRun(ctx context.Context, r Repo, slug string, log io.Writer) (_ Dis
 				return *st, d.save()
 			}
 			if out != nil {
-				return *st, d.accept(round, &st.Attempts[n-1], out)
+				if out.kind == roundBook {
+					err := d.startBook(ctx, round, &st.Attempts[n-1])
+					return *st, err
+				}
+				err := d.accept(round, &st.Attempts[n-1], out)
+				return *st, err
 			}
 			if err := d.save(); err != nil {
 				return *st, err
@@ -665,7 +682,7 @@ type discoveryOutput struct {
 // the session, or neither when the attempt failed with feedback for the next one.
 func (d *discoverySession) attempt(ctx context.Context, a *DiscoveryAttempt, round int, feedback string) (*discoveryOutput, string, error) {
 	fail := func(msg string) (*discoveryOutput, string, error) {
-		a.Result, a.Feedback = "failed", redactDiagnostic(msg)
+		a.Result, a.Feedback = "failed", discoveryDiagnostic(msg)
 		return nil, "", nil
 	}
 	outDir := d.repo.WorktreePath(fmt.Sprintf("discover-%s-a%d", d.state.Slug, a.N))
@@ -690,7 +707,7 @@ func (d *discoverySession) attempt(ctx context.Context, a *DiscoveryAttempt, rou
 			return nil, "", err
 		}
 		if uncertainExit(err) {
-			a.Result, a.Feedback = "failed", redactDiagnostic(err.Error())
+			a.Result, a.Feedback = "failed", discoveryDiagnostic(err.Error())
 			return nil, fmt.Sprintf("The discovery agent %q was interrupted or timed out. Confirm its processes stopped, then run again: aeh discover run %s", a.Profile, d.state.Slug), nil
 		}
 		return fail(err.Error())
@@ -820,6 +837,11 @@ func parseDiscoveryQuestions(b []byte, round, max int) ([]DiscoveryQuestion, err
 // bookFiles validates a draft book and returns its memory files. Every document passes the
 // display policy; every mockup is rebuilt from validated tokens.
 func (d *discoverySession) bookFiles(f frozenOutput) (map[string][]byte, error) {
+	for _, rel := range sortedKeys(f.Files) {
+		if err := checkNoSecrets(rel, f.Files[rel]); err != nil {
+			return nil, err
+		}
+	}
 	features := map[string]bool{}
 	for _, rel := range sortedKeys(f.Files) {
 		if name, ok := strings.CutPrefix(rel, "features/"); ok {
@@ -857,13 +879,20 @@ func (d *discoverySession) bookFiles(f frozenOutput) (map[string][]byte, error) 
 		}
 		files[d.memRel("drafts/"+rel)] = b
 	}
+	if err := d.validateBookFeatures(f); err != nil {
+		return nil, err
+	}
 	return files, nil
 }
 
 // accept records an accepted round in state and memory, in one pending step.
 func (d *discoverySession) accept(round int, a *DiscoveryAttempt, out *discoveryOutput) error {
+	return d.acceptReviewed(round, a, out, nil)
+}
+
+func (d *discoverySession) acceptReviewed(round int, a *DiscoveryAttempt, out *discoveryOutput, review *DiscoveryBookReview) error {
 	st := d.state
-	r := DiscoveryRound{N: round, Kind: out.kind, Profile: a.Profile, Snapshot: out.snapshot.Digest, Questions: out.questions}
+	r := DiscoveryRound{N: round, Kind: out.kind, Profile: a.Profile, Snapshot: out.snapshot.Digest, Questions: out.questions, Review: review}
 	files := map[string][]byte{}
 	subject := fmt.Sprintf("discover %s: round %d questions", st.Slug, round)
 	if out.kind == roundBook {
@@ -914,13 +943,15 @@ func (d *discoverySession) phase() string {
 // pending import can be rebuilt byte for byte.
 func (d *discoverySession) renderRound(r DiscoveryRound) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "# Round %d\n\nGenerated by aeh from the discovery agent (profile %s) and the owner's answers. Do not edit by hand.\n", r.N, r.Profile)
+	fmt.Fprintf(&b, "# Round %d\n\nGenerated by aeh from the discovery agent (profile %s) and the owner's answers. Do not edit by hand.\n", r.N, discoveryDiagnostic(r.Profile))
 	if r.Kind == roundBook {
 		b.WriteString("\nThe agent proposed a draft book in this session's directory. Drafts are not features: they claim no paths until the owner promotes one.\n\n")
 		for _, f := range r.Files {
 			fmt.Fprintf(&b, "- %s\n", f)
 		}
-		return b.String()
+		if r.Review != nil {
+			renderBookReview(&b, r.Review)
+		}
 	}
 	for _, q := range r.Questions {
 		kind := "optional"
@@ -928,6 +959,9 @@ func (d *discoverySession) renderRound(r DiscoveryRound) string {
 			kind = "blocking"
 		}
 		fmt.Fprintf(&b, "\n## %s (%s)\n\n%s\n\nWhy: %s\n", q.ID, kind, q.Text, q.Why)
+		if q.Attribution != "" {
+			fmt.Fprintf(&b, "\n%s\n", q.Attribution)
+		}
 		if len(q.Options) > 0 {
 			b.WriteString("\nOptions:\n\n")
 			for _, o := range q.Options {
@@ -974,6 +1008,7 @@ func DiscoverAnswer(r Repo, slug, qid, text string) (_ DiscoveryState, err error
 		return DiscoveryState{}, err
 	}
 	defer unlock()
+	defer d.reportCommand(&err)
 	if err := d.resume(); err != nil {
 		return d.snapshot(), err
 	}
@@ -998,6 +1033,7 @@ func DiscoverSkip(r Repo, slug, qid string) (_ DiscoveryState, err error) {
 		return DiscoveryState{}, err
 	}
 	defer unlock()
+	defer d.reportCommand(&err)
 	if err := d.resume(); err != nil {
 		return d.snapshot(), err
 	}
