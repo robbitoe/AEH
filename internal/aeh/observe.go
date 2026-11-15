@@ -125,6 +125,12 @@ func checkObservationText(text string) error {
 
 // checkObservationLocation accepts path:line or path:start-end inside the repository.
 func checkObservationLocation(loc string) error {
+	if err := checkNoSecrets("observation location", []byte(loc)); err != nil {
+		return err
+	}
+	if err := checkDisplayLine(loc, 500); err != nil {
+		return fmt.Errorf("observation location: %w", err)
+	}
 	m := observationLocation.FindStringSubmatch(loc)
 	if m == nil {
 		return fmt.Errorf("location %q must be path:line or path:start-end", redactDiagnostic(loc))
@@ -139,7 +145,7 @@ func checkObservationLocation(loc string) error {
 			return errors.New("location range must not end before it starts")
 		}
 	}
-	return checkNoSecrets("observation location", []byte(loc))
+	return nil
 }
 
 // parseObservationLog reads an area's event log: one YAML list, strict.
@@ -229,28 +235,49 @@ func replayObservations(events []observationEvent) (areaIdentity, error) {
 // version of the log extends the one before it. ok is false when the area has no history.
 func loadAreaIdentity(memDir, feature string) (areaIdentity, bool, error) {
 	rel := areaRel(feature, "observations.log.yaml")
-	commits, err := git(memDir, "log", "--format=%H", "--reverse", "--", rel)
+	// Every version of the log reachable from HEAD, on every branch and through every merge
+	// (no history simplification), must be a prefix of the log at HEAD: a version that a merge
+	// or a restore dropped would otherwise revive retired numbers.
+	raw, err := gitRaw(memDir, "log", "HEAD", "--full-history", "-m", "--raw", "--no-abbrev", "--no-renames", "--format=", "--", rel)
 	if err != nil {
 		return areaIdentity{}, false, fmt.Errorf("observation log history: %w", err)
 	}
-	var prev []observationEvent
-	seen := false
-	for _, c := range strings.Fields(commits) {
-		var events []observationEvent
-		if b, ok := gitBlob(memDir, c, rel); ok {
-			if events, err = parseObservationLog([]byte(b)); err != nil {
-				return areaIdentity{}, true, fmt.Errorf("%s at memory commit %s: %w", rel, short(c), err)
-			}
+	versions := map[string]bool{}
+	for _, line := range strings.Split(raw, "\n") {
+		// :<old mode> <new mode> <old oid> <new oid> <status>\t<path>
+		fields := strings.Fields(strings.SplitN(line, "\t", 2)[0])
+		if len(fields) < 5 || !strings.HasPrefix(fields[0], ":") {
+			continue
 		}
-		if len(events) < len(prev) || (len(prev) > 0 && !reflect.DeepEqual(events[:len(prev)], prev)) {
-			return areaIdentity{}, true, fmt.Errorf("%s was rewritten at memory commit %s: the log only grows; restore it from the memory history", rel, short(c))
+		if oid := fields[3]; strings.Trim(oid, "0") != "" {
+			versions[oid] = true
 		}
-		prev, seen = events, true
 	}
-	if !seen {
+	if len(versions) == 0 {
 		return areaIdentity{Obs: map[int]*Observation{}}, false, nil
 	}
-	ident, err := replayObservations(prev)
+	headText, ok := gitBlob(memDir, "HEAD", rel)
+	if !ok {
+		return areaIdentity{}, true, fmt.Errorf("%s is missing at memory HEAD: the log only grows; restore it from the memory history", rel)
+	}
+	head, err := parseObservationLog([]byte(headText))
+	if err != nil {
+		return areaIdentity{}, true, fmt.Errorf("%s: %w", rel, err)
+	}
+	for oid := range versions {
+		b, err := gitRaw(memDir, "cat-file", "blob", oid)
+		if err != nil {
+			return areaIdentity{}, true, fmt.Errorf("observation log history: %w", err)
+		}
+		events, err := parseObservationLog([]byte(b))
+		if err != nil {
+			return areaIdentity{}, true, fmt.Errorf("an earlier version of %s: %w", rel, err)
+		}
+		if len(events) > len(head) || (len(events) > 0 && !reflect.DeepEqual(head[:len(events)], events)) {
+			return areaIdentity{}, true, fmt.Errorf("%s at memory HEAD drops or rewrites events of an earlier version: the log only grows; restore it from the memory history", rel)
+		}
+	}
+	ident, err := replayObservations(head)
 	return ident, true, err
 }
 
@@ -546,7 +573,8 @@ type observationInput struct {
 // recordAreaObservations records observations of an area made at codeSHA. A new area needs a
 // draft; an existing one keeps the owner's front matter and prose. The caller holds the
 // project lock.
-func recordAreaObservations(r Repo, feature string, create *areaDraft, inputs []observationInput, codeSHA string) (areaIdentity, error) {
+func recordAreaObservations(r Repo, feature string, create *areaDraft, inputs []observationInput, codeSHA string) (_ areaIdentity, err error) {
+	defer func() { err = redactErr(err) }()
 	a, err := loadAdoptSession(r, feature)
 	if err != nil {
 		return areaIdentity{}, err

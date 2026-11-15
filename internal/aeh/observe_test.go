@@ -175,15 +175,30 @@ func TestAdoptRejectsHandEditsAndRewrites(t *testing.T) {
 	write(t, mem, logPath, older)
 	write(t, mem, areaPath, edited)
 	commit("revive AC-3")
-	if _, err := LoadAdoptArea(r, "billing"); err == nil || !strings.Contains(err.Error(), "rewritten") {
+	if _, err := LoadAdoptArea(r, "billing"); err == nil || !strings.Contains(err.Error(), "drops or rewrites") {
 		t.Fatalf("a restored older log must be refused: %v", err)
 	}
 	write(t, mem, logPath, full)
 	commit("restore log")
 	mustGit(t, mem, "rm", "-q", logPath)
 	commit("delete log")
-	if _, err := LoadAdoptArea(r, "billing"); err == nil || !strings.Contains(err.Error(), "rewritten") {
+	if _, err := LoadAdoptArea(r, "billing"); err == nil || !strings.Contains(err.Error(), "missing at memory HEAD") {
 		t.Fatalf("a deleted log must be refused: %v", err)
+	}
+}
+
+// A merge that keeps an older log cannot drop the events of the merged branch.
+func TestAdoptRejectsMergeThatDropsEvents(t *testing.T) {
+	r, mem := newAreaProject(t)
+	main := mustGit(t, mem, "rev-parse", "--abbrev-ref", "HEAD")
+	mustGit(t, mem, "checkout", "-q", "-b", "side")
+	if _, err := AdoptConfirm(r, "billing", "AC-3", DecisionDrop, observation(t, r, 3).Token()); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, mem, "checkout", "-q", main)
+	mustGit(t, mem, "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "-s", "ours", "--no-edit", "side")
+	if _, err := LoadAdoptArea(r, "billing"); err == nil || !strings.Contains(err.Error(), "drops or rewrites") {
+		t.Fatalf("a merge that keeps the older log must be refused: %v", err)
 	}
 }
 
@@ -238,9 +253,11 @@ func TestAdoptRejectsUnsafeInput(t *testing.T) {
 		"secret":   {Text: "Uses token " + secret, Locations: []string{"a.go:1"}},
 		"html":     {Text: "<script>x</script>", Locations: []string{"a.go:1"}},
 		"location": {Text: "Fine.", Locations: []string{"/etc/passwd:1"}},
+		"bidi":     {Text: "Fine.", Locations: []string{"src/\u202efee.go:1"}},
+		"leak":     {Text: "Fine.", Locations: []string{"src/" + secret + ".:1"}},
 	} {
 		_, err := recordAreaObservations(r, "billing", draft, []observationInput{in}, obsSHA)
-		if err == nil || strings.Contains(redactErr(err).Error(), secret) {
+		if err == nil || strings.Contains(err.Error(), secret) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
