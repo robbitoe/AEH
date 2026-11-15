@@ -1275,11 +1275,12 @@ func commitMemory(dir string, files []string, subject string, trailers ...string
 	if files[0] == "." {
 		return nil
 	}
-	changed, err := git(dir, "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "HEAD")
+	// NUL-separated, so Git never quotes a name and the comparison is byte for byte.
+	changed, err := git(dir, "diff-tree", "-z", "--no-commit-id", "--name-only", "-r", "--root", "HEAD")
 	if err != nil {
 		return fmt.Errorf("memory commit: %w", err)
 	}
-	got := strings.Split(changed, "\n")
+	got := strings.Split(strings.TrimRight(changed, "\x00"), "\x00")
 	sort.Strings(got)
 	want := append([]string{}, files...)
 	sort.Strings(want)

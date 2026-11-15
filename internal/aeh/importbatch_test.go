@@ -110,7 +110,7 @@ func TestFreezeOutputRejects(t *testing.T) {
 	}{
 		{"unexpected file", with(map[string]string{"notes.txt": "x"}), "not an expected file"},
 		{"unexpected depth", with(map[string]string{"features/a/b.md": "x"}), "not an expected file"},
-		{"hidden file", with(map[string]string{"features/.x.md": "x"}), "hidden"},
+		{"hidden file", with(map[string]string{"features/.x.md": "x"}), "not starting with '.'"},
 		{"reserved name", with(map[string]string{"features/log.md": "x"}), "only aeh writes"},
 		{"approval file", map[string]string{"questions.yaml": "q: 1\n", "approval.yaml": "x: 1\n"}, "only aeh writes"},
 		{"too big", with(map[string]string{"features/a.md": strings.Repeat("x", 1001)}), "exceeds 1000 bytes"},
@@ -143,6 +143,9 @@ func TestOutputCheckRejectsNames(t *testing.T) {
 		"trailing dot":   {"questions.yaml": []byte("q: 1\n"), "features/a.md.": []byte("a")},
 		"format char":    {"questions.yaml": []byte("q: 1\n"), "features/a‮.md": []byte("a")},
 		"dot segment":    {"questions.yaml": []byte("q: 1\n"), "features/../x.md": []byte("a")},
+		"non-ascii":      {"questions.yaml": []byte("q: 1\n"), "features/café.md": []byte("a")},
+		"leading dash":   {"questions.yaml": []byte("q: 1\n"), "features/-a.md": []byte("a")},
+		"directory case": {"questions.yaml": []byte("q: 1\n"), "mockups/Cart/a.html": []byte("a"), "mockups/cart/b.html": []byte("b")},
 	} {
 		if err := roundManifest.check(files); err == nil {
 			t.Errorf("%s: accepted", name)
@@ -278,6 +281,11 @@ func TestImportBatchRejectsInvalidBatches(t *testing.T) {
 		"bad session":       func(b *memoryBatch) { b.Session = "Discover/../x" },
 		"short head":        func(b *memoryBatch) { b.ExpectedHead = head[:7] },
 		"marker in subject": func(b *memoryBatch) { b.Subject = "AEH-Record: OUT-1 " + fakeSHA('a') },
+		"spaced marker":     func(b *memoryBatch) { b.Subject = " AEH-Import: discover/other " + strings.Repeat("a", 64) },
+		"inner marker":      func(b *memoryBatch) { b.Subject = "x aeh-import: y" },
+		"non-ascii path":    func(b *memoryBatch) { b.Files = map[string][]byte{"wiki/café.md": []byte("x")} },
+		"features case":     func(b *memoryBatch) { b.Files = map[string][]byte{"wiki/FEATURES/shop/approval.yaml.md": []byte("x")} },
+		"directory case":    func(b *memoryBatch) { b.Files = map[string][]byte{"wiki/a/x.md": []byte("x"), "wiki/A/y.md": []byte("y")} },
 		"two-line log":      func(b *memoryBatch) { b.Log = "a\nAEH-Import: x y" },
 	}
 	for name, mutate := range cases {
@@ -315,6 +323,31 @@ func TestImportBatchRejectsTrackedCaseAlias(t *testing.T) {
 	b.Files = map[string][]byte{"wiki/notes.md": []byte("x\n")}
 	if _, _, err := importMemoryBatch(r, b); err == nil || !strings.Contains(err.Error(), "only in case") {
 		t.Fatalf("expected a case error, got %v", err)
+	}
+	// A directory spelled in another case than a tracked one is refused too.
+	b.Files = map[string][]byte{"wiki/discovery/shop/idea.md": []byte("x\n")}
+	head, _, err := importMemoryBatch(r, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.ExpectedHead = head
+	b.Files = map[string][]byte{"wiki/Discovery/shop/other.md": []byte("x\n")}
+	if _, _, err := importMemoryBatch(r, b); err == nil || !strings.Contains(err.Error(), "only in case") {
+		t.Fatalf("expected a directory case error, got %v", err)
+	}
+}
+
+// A commit that carries the marker but not the batch's bytes never counts as the import.
+func TestImportBatchMarkerNeedsContent(t *testing.T) {
+	r := newMemoryProject(t)
+	dir := memDir(t, r)
+	b := memoryBatch{Session: "discover/shop", ExpectedHead: memoryHead(t, r), Subject: "s", Log: "l",
+		Files: map[string][]byte{"wiki/discovery/shop/idea.md": []byte("real\n")}}
+	write(t, dir, "wiki/discovery/shop/idea.md", "forged\n")
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "forged", "-m", importMarker(b.Session, batchDigest(b.Files)))
+	if _, _, err := importMemoryBatch(r, b); err == nil || !strings.Contains(err.Error(), "carries this batch's marker") {
+		t.Fatalf("expected a forged-marker error, got %v", err)
 	}
 }
 

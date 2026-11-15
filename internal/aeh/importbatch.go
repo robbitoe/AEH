@@ -68,7 +68,8 @@ var reservedOutputNames = map[string]bool{
 	approvalFile: true, implementedFile: true, "index.md": true, "log.md": true, "schema.md": true,
 }
 
-// freezeOutput reads dir against the manifest and returns its accepted bytes.
+// freezeOutput reads dir against the manifest and returns its accepted bytes. Every read goes
+// through an os.Root, so a directory swapped for a link while aeh walks cannot lead outside dir.
 func freezeOutput(dir string, m outputManifest) (frozenOutput, error) {
 	fi, err := os.Lstat(dir)
 	if err != nil {
@@ -77,21 +78,21 @@ func freezeOutput(dir string, m outputManifest) (frozenOutput, error) {
 	if !fi.IsDir() || fi.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
 		return frozenOutput{}, fmt.Errorf("%s output: %s must be a plain directory", m.Name, dir)
 	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return frozenOutput{}, fmt.Errorf("%s output: %w", m.Name, err)
+	}
+	defer root.Close()
 	files := map[string][]byte{}
 	var total int64
-	err = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+	err = fs.WalkDir(root.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if p == dir {
+		if rel == "." {
 			return nil
 		}
-		rel, err := filepath.Rel(dir, p)
-		if err != nil {
-			return err
-		}
-		rel = filepath.ToSlash(rel)
-		info, err := os.Lstat(p)
+		info, err := root.Lstat(filepath.FromSlash(rel))
 		if err != nil {
 			return err
 		}
@@ -114,7 +115,7 @@ func freezeOutput(dir string, m outputManifest) (frozenOutput, error) {
 		if !ok {
 			return fmt.Errorf("%s is not an expected file", rel)
 		}
-		b, err := readRegularFile(p, info, rule.MaxBytes)
+		b, err := readRegularFile(root, rel, info, rule.MaxBytes)
 		if err != nil {
 			return fmt.Errorf("%s: %w", rel, err)
 		}
@@ -135,8 +136,8 @@ func freezeOutput(dir string, m outputManifest) (frozenOutput, error) {
 
 // readRegularFile reads at most limit bytes from the file Lstat described, refusing a file
 // that was swapped for another one between the Lstat and the open.
-func readRegularFile(p string, before fs.FileInfo, limit int64) ([]byte, error) {
-	f, err := os.Open(p)
+func readRegularFile(root *os.Root, rel string, before fs.FileInfo, limit int64) ([]byte, error) {
+	f, err := root.Open(filepath.FromSlash(rel))
 	if err != nil {
 		return nil, err
 	}
@@ -174,18 +175,15 @@ func (m outputManifest) check(files map[string][]byte) error {
 		return fmt.Errorf("%s output: more than %d files", m.Name, m.MaxFiles)
 	}
 	counts := map[string]int{}
-	folded := map[string]string{}
 	var total int64
+	if err := checkCaseAliases(sortedKeys(files), nil); err != nil {
+		return fmt.Errorf("%s output: %w", m.Name, err)
+	}
 	for _, rel := range sortedKeys(files) {
 		b := files[rel]
 		if err := checkOutputName(rel); err != nil {
 			return fmt.Errorf("%s output: %s: %w", m.Name, rel, err)
 		}
-		low := strings.ToLower(rel)
-		if other, dup := folded[low]; dup {
-			return fmt.Errorf("%s output: %s and %s differ only in case", m.Name, other, rel)
-		}
-		folded[low] = rel
 		r, ok := m.rule(rel)
 		if !ok {
 			return fmt.Errorf("%s output: %s is not an expected file", m.Name, rel)
@@ -211,22 +209,50 @@ func (m outputManifest) check(files map[string][]byte) error {
 	return nil
 }
 
-// checkOutputName accepts a canonical relative path that checks out on every platform, is not
-// hidden, and is not a file only aeh writes.
+// outputSegment is a portable ASCII name: it cannot be hidden, quoted by Git, or spelled two
+// ways by Unicode.
+var outputSegment = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$`)
+
+// checkOutputName accepts a canonical relative path of portable ASCII names that checks out on
+// every platform and is not a file only aeh writes.
 func checkOutputName(rel string) error {
 	if err := checkPlanTestPath(rel); err != nil {
 		return err
 	}
 	for _, s := range strings.Split(rel, "/") {
-		if strings.HasPrefix(s, ".") {
-			return errors.New("hidden names are not allowed")
-		}
-		if !utf8.ValidString(s) || strings.ContainsFunc(s, func(r rune) bool { return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) }) {
-			return errors.New("names must be valid UTF-8 without control or format characters")
+		if !outputSegment.MatchString(s) {
+			return fmt.Errorf("name %q must be ASCII letters, digits, '.', '_' or '-', not starting with '.' or '-'", s)
 		}
 	}
 	if reservedOutputNames[strings.ToLower(path.Base(rel))] {
 		return errors.New("only aeh writes this file")
+	}
+	return nil
+}
+
+// checkCaseAliases refuses two paths, or a path and a known path, that spell one directory or
+// file in two cases: on a case-insensitive disk they are the same.
+func checkCaseAliases(paths, known []string) error {
+	seen := map[string]string{}
+	for _, p := range known {
+		segs := strings.Split(p, "/")
+		for i := range segs {
+			prefix := strings.Join(segs[:i+1], "/")
+			if _, ok := seen[strings.ToLower(prefix)]; !ok && p != "" {
+				seen[strings.ToLower(prefix)] = prefix
+			}
+		}
+	}
+	for _, p := range paths {
+		segs := strings.Split(p, "/")
+		for i := range segs {
+			prefix := strings.Join(segs[:i+1], "/")
+			low := strings.ToLower(prefix)
+			if other, ok := seen[low]; ok && other != prefix {
+				return fmt.Errorf("%s and %s differ only in case", other, prefix)
+			}
+			seen[low] = prefix
+		}
 	}
 	return nil
 }
@@ -394,6 +420,10 @@ func importMemoryBatch(r Repo, b memoryBatch) (commit string, imported bool, err
 	if _, sha, ok, err := findRecord(dir, marker); err != nil {
 		return "", false, err
 	} else if ok {
+		// The marker only counts when its commit really holds the batch.
+		if err := verifyImported(dir, sha, b.Files); err != nil {
+			return "", false, fmt.Errorf("import %s: memory commit %s carries this batch's marker but %w; check the memory repository by hand", b.Session, short(sha), err)
+		}
 		return sha, false, nil
 	}
 	head, err := git(dir, "rev-parse", "HEAD")
@@ -431,11 +461,40 @@ func importMemoryBatch(r Repo, b memoryBatch) (commit string, imported bool, err
 	if err := appendLog(dir, w, "["+today+"] import | "+b.Session+" | "+b.Log); err != nil {
 		return fail(err)
 	}
+	if now, err := git(dir, "rev-parse", "HEAD"); err != nil || now != b.ExpectedHead {
+		return fail(fmt.Errorf("%w while aeh was writing the batch", ErrMemoryChanged))
+	}
 	if err := w.commit(dir, b.Subject, marker); err != nil {
 		return fail(err)
 	}
 	commit, err = git(dir, "rev-parse", "HEAD")
-	return commit, true, err
+	if err != nil {
+		return "", false, fmt.Errorf("import %s: %w", b.Session, err)
+	}
+	// Files the batch left untouched come from the parent, so the parent must be the expected
+	// head and every batch file must read as the batch says. A retry re-checks this too.
+	parent, err := git(dir, "rev-parse", commit+"^")
+	if err == nil && parent != b.ExpectedHead {
+		err = fmt.Errorf("its parent is %s, not %s", short(parent), short(b.ExpectedHead))
+	}
+	if err == nil {
+		err = verifyImported(dir, commit, b.Files)
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("import %s: memory commit %s %w; check the memory repository by hand", b.Session, short(commit), err)
+	}
+	return commit, true, nil
+}
+
+// verifyImported checks that commit holds every batch file with the batch's exact bytes.
+func verifyImported(dir, commit string, files map[string][]byte) error {
+	for _, rel := range sortedKeys(files) {
+		got, ok := gitBlob(dir, commit, rel)
+		if !ok || got != string(files[rel]) {
+			return fmt.Errorf("does not hold %s as the batch wrote it", rel)
+		}
+	}
+	return nil
 }
 
 func (b memoryBatch) validate() error {
@@ -450,8 +509,9 @@ func (b memoryBatch) validate() error {
 	if !isFullSHA(b.ExpectedHead) {
 		return fmt.Errorf("import %s: expected memory HEAD %q is not a full SHA", b.Session, b.ExpectedHead)
 	}
-	if err := checkBatchLine(b.Subject, 200); err != nil || strings.HasPrefix(b.Subject, "AEH-") {
-		return fmt.Errorf("import %s: commit subject must be one line of at most 200 bytes, not starting with AEH-", b.Session)
+	if err := checkBatchLine(b.Subject, 200); err != nil || b.Subject != strings.TrimSpace(b.Subject) ||
+		strings.Contains(strings.ToUpper(b.Subject), "AEH-") {
+		return fmt.Errorf("import %s: commit subject must be one trimmed line of at most 200 bytes without \"AEH-\"", b.Session)
 	}
 	if err := checkBatchLine(b.Log, 300); err != nil {
 		return fmt.Errorf("import %s: log entry: %w", b.Session, err)
@@ -459,16 +519,13 @@ func (b memoryBatch) validate() error {
 	if len(b.Files) == 0 {
 		return fmt.Errorf("import %s: the batch has no files", b.Session)
 	}
-	folded := map[string]string{}
+	if err := checkCaseAliases(sortedKeys(b.Files), nil); err != nil {
+		return fmt.Errorf("import %s: %w", b.Session, err)
+	}
 	for _, rel := range sortedKeys(b.Files) {
 		if err := checkBatchPath(rel); err != nil {
 			return fmt.Errorf("import %s: %s: %w", b.Session, rel, err)
 		}
-		low := strings.ToLower(rel)
-		if other, dup := folded[low]; dup {
-			return fmt.Errorf("import %s: %s and %s differ only in case", b.Session, other, rel)
-		}
-		folded[low] = rel
 		if !utf8.Valid(b.Files[rel]) || bytes.IndexByte(b.Files[rel], 0) >= 0 {
 			return fmt.Errorf("import %s: %s must be UTF-8 text without NUL bytes", b.Session, rel)
 		}
@@ -486,7 +543,7 @@ func checkBatchPath(rel string) error {
 	if len(segs) < 2 || segs[0] != "wiki" {
 		return errors.New("imports write only under wiki/")
 	}
-	if segs[1] == "features" && (len(segs) != 4 || segs[3] != "spec.md" || checkSlug(segs[2]) != nil) {
+	if strings.EqualFold(segs[1], "features") && (segs[1] != "features" || len(segs) != 4 || segs[3] != "spec.md" || checkSlug(segs[2]) != nil) {
 		return errors.New("under wiki/features/ an import writes only <feature>/spec.md")
 	}
 	return nil
@@ -494,27 +551,21 @@ func checkBatchPath(rel string) error {
 
 func checkBatchLine(s string, max int) error {
 	if strings.TrimSpace(s) == "" || len(s) > max || strings.ContainsFunc(s, unicode.IsControl) ||
-		strings.ContainsAny(s, "\u0085  ") {
+		strings.ContainsAny(s, "\u0085\u2028\u2029") {
 		return fmt.Errorf("must be one non-empty line of at most %d bytes", max)
 	}
 	return nil
 }
 
-// checkTrackedCase refuses a batch path that names a tracked memory file in another case: on a
-// case-insensitive disk both would be one file.
+// checkTrackedCase refuses a batch path that names a tracked memory file or directory in another
+// case: on a case-insensitive disk both would be one.
 func checkTrackedCase(dir string, files map[string][]byte) error {
 	tracked, err := git(dir, "ls-files", "-z")
 	if err != nil {
 		return fmt.Errorf("memory files: %w", err)
 	}
-	have := map[string]string{}
-	for _, t := range strings.Split(tracked, "\x00") {
-		have[strings.ToLower(t)] = t
-	}
-	for rel := range files {
-		if t, ok := have[strings.ToLower(rel)]; ok && t != rel {
-			return fmt.Errorf("%s differs only in case from the tracked %s", rel, t)
-		}
+	if err := checkCaseAliases(sortedKeys(files), strings.Split(tracked, "\x00")); err != nil {
+		return fmt.Errorf("against tracked memory files: %w", err)
 	}
 	return nil
 }
