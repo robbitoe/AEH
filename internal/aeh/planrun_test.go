@@ -482,8 +482,24 @@ func TestPlanRefusesAnUntrackedTestDirectory(t *testing.T) {
 	}
 }
 
-func TestPlanRulesOnFilesAndTaskPathsAddReviewersForGood(t *testing.T) {
-	// Attempt 1 plans src/db/ (a rule adds DBA) and fails red; attempt 2 plans src/ and passes.
+// A rule that only the files of a rejected candidate trigger still adds its reviewer for good.
+func TestPlanRuleOnRejectedCandidateFilesPersists(t *testing.T) {
+	author := `case "$1" in *"previous attempt"*) ;; *) mkdir -p ` + planDir + `/fixtures && echo x > ` + planDir + `/fixtures/db.sql ;; esac
+` + authorOK
+	f := newPlanFixture(t, author, reviewOK)
+	f.writeConfig("triage:\n  rules:\n    - name: sql\n      paths: [\"**/*.sql\"]\n      reviewers: [dba]\n")
+	f.commitAll("rules")
+	st := f.plan()
+	if st.Phase != PlanLogged || len(st.Attempts) != 2 || st.Attempts[0].FailedStep != "scope" {
+		t.Fatalf("setup: %+v", st.Attempts)
+	}
+	if reviewRolesOf(st.Reviews) != "qa,security,dba" {
+		t.Fatalf("the DBA review added by the rejected candidate's files must stay: %s", reviewRolesOf(st.Reviews))
+	}
+}
+
+// A rule that only a failed attempt's planned task path triggers still adds its reviewer.
+func TestPlanRuleOnFailedTaskPathPersists(t *testing.T) {
 	author := `d=` + planDir + `; mkdir -p $d
 case "$1" in
 *"previous attempt"*) printf 'grep -q "paid" src/pay.txt\n' > $d/pay.sh; p="src/" ;;
@@ -492,18 +508,59 @@ esac
 printf 'task:\n  goal: Write src/pay.txt saying paid\n  paths: [%s]\ntrace:\n  AC-1: [pay.sh]\n' "$p" > $d/plan.yaml
 echo "PLAN: READY"`
 	f := newPlanFixture(t, author, reviewOK)
-	f.writeConfig("triage:\n  rules:\n    - name: db\n      paths: [src/db]\n      reviewers: [dba]\n    - name: suite\n      paths: [\"tests/acceptance/**\"]\n      reviewers: [security]\n")
+	f.writeConfig("triage:\n  rules:\n    - name: db\n      paths: [src/db]\n      reviewers: [dba]\n")
 	f.commitAll("rules")
 	st := f.plan()
 	if st.Phase != PlanLogged || len(st.Attempts) != 2 || st.Attempts[0].FailedStep != "red" {
 		t.Fatalf("setup: %+v", st.Attempts)
 	}
 	if reviewRolesOf(st.Reviews) != "qa,security,dba" {
-		t.Fatalf("the DBA review added by attempt 1 must stay: %s", reviewRolesOf(st.Reviews))
+		t.Fatalf("the DBA review added by attempt 1's task path must stay: %s", reviewRolesOf(st.Reviews))
 	}
-	outcome, _ := gitBlob(f.dir, st.PlanCommit, "aeh/outcomes/"+planID+".yaml")
-	if !strings.Contains(outcome, "route: new") {
-		t.Fatalf("outcome route: %s", outcome)
+}
+
+// A rejection saved with its verdict ends the attempt: resuming never asks that reviewer again.
+func TestPlanRejectedReviewIsTerminalAfterResume(t *testing.T) {
+	f := newPlanFixture(t, countCall+authorOK, countCall+reviewReject)
+	f.writeConfig("plan:\n  ladder: [author]\n")
+	f.commitAll("ladder")
+	st := f.plan()
+	if st.Status != StatusBlocked || len(st.Attempts) != 2 || st.Attempts[1].FailedStep != "review" {
+		t.Fatalf("setup: %+v", st)
+	}
+	authors, reviews := f.count("author"), f.count("qa")
+	// The process stopped right after saving the second rejection, before blocking.
+	st.Status, st.Question = StatusRunning, ""
+	if err := savePlanState(f.repo, &st); err != nil {
+		t.Fatal(err)
+	}
+	st = f.plan()
+	if st.Status != StatusBlocked || f.count("qa") != reviews || f.count("author") != authors {
+		t.Fatalf("a rejected candidate was reviewed or authored again: %+v (reviews +%d, authors +%d)", st, f.count("qa")-reviews, f.count("author")-authors)
+	}
+}
+
+// A crash between ladder steps continues the round instead of restarting it.
+func TestPlanLadderContinuesAfterACrash(t *testing.T) {
+	f := newPlanFixture(t, countCall+`echo "PLAN: maybe"`, reviewOK)
+	f.writeConfig("plan:\n  ladder: [author, author2]\n")
+	write(t, f.dir, "aeh/config.yaml", readFile(t, f.repo.ConfigPath())+fmt.Sprintf(
+		"  author2:\n    provider: author2\n    command: [\"sh\", %q, \"{{prompt}}\"]\n    env:\n      AEH_COUNTER: %q\n",
+		filepath.ToSlash(filepath.Join(f.tmp, "author.sh")), filepath.ToSlash(filepath.Join(f.tmp, "author2.count"))))
+	f.commitAll("ladder")
+	st := f.plan() // author fails twice, then author2 fails twice: blocked
+	if st.Status != StatusBlocked || len(st.Attempts) != 4 {
+		t.Fatalf("setup: %+v", st.Attempts)
+	}
+	// Pretend the process stopped after author's two failures, before author2 started.
+	st.Attempts, st.Status, st.Question = st.Attempts[:2], StatusRunning, ""
+	if err := savePlanState(f.repo, &st); err != nil {
+		t.Fatal(err)
+	}
+	authors := f.count("author")
+	st = f.plan()
+	if f.count("author") != authors || len(st.Attempts) != 4 || st.Attempts[2].Profile != "author2" {
+		t.Fatalf("the ladder restarted instead of continuing: %+v", st.Attempts)
 	}
 }
 

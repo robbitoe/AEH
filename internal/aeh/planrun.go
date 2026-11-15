@@ -52,6 +52,7 @@ type PlanState struct {
 	Question        string           `json:"question,omitempty"`
 	RestartRequired bool             `json:"restart_required,omitempty"`
 	Answers         []string         `json:"answers,omitempty"`
+	LadderFrom      int              `json:"ladder_from"` // attempts before this index belong to earlier ladder rounds
 	UpdatedAt       time.Time        `json:"updated_at"`
 	Checks          []PlanCheckEntry `json:"checks,omitempty"` // of the published attempt
 }
@@ -690,8 +691,16 @@ func (p *planner) author(ctx context.Context) (bool, string, error) {
 	if len(st.Answers) > 0 {
 		feedback = strings.TrimSpace(feedback + "\n\nThe owner answered: " + strings.Join(st.Answers, "\n"))
 	}
+	// Each profile gets two tries per ladder round. A crash resumes the round where it was; an
+	// owner's answer starts a new round.
 	for _, profile := range p.pcfg.Ladder {
-		for try := 0; try < 2; try++ {
+		done := 0
+		for _, prev := range st.Attempts[min(st.LadderFrom, len(st.Attempts)):] {
+			if prev.Profile == profile {
+				done++
+			}
+		}
+		for try := done; try < 2; try++ {
 			n := len(st.Attempts) + 1
 			st.Attempts = append(st.Attempts, PlanAttempt{N: n, Profile: profile, FailedStep: "running",
 				RunDir: rel(p.repo.Root, p.repo.RunDir(st.ID, fmt.Sprintf("plan-a%d", n)))})
@@ -723,6 +732,13 @@ func (p *planner) author(ctx context.Context) (bool, string, error) {
 }
 
 func (p *planner) save() error { return savePlanState(p.repo, p.state) }
+
+// blockNow marks the plan blocked in memory so the next save records the question together
+// with the attempt's result; the caller returns the question.
+func (p *planner) blockNow(question string) string {
+	p.state.Status, p.state.Question = StatusBlocked, question
+	return question
+}
 
 func (p *planner) planWorktree(n int) string {
 	return p.repo.WorktreePath(fmt.Sprintf("%s-plan-a%d", p.state.ID, n))
@@ -760,7 +776,7 @@ func (p *planner) attempt(ctx context.Context, a *PlanAttempt, feedback string) 
 		if uncertainExit(err) {
 			keep = true
 			a.FailedStep, a.Feedback = "author", err.Error()
-			return fmt.Sprintf("The plan author %q was interrupted or timed out (worktree kept at %s). Confirm all processes stopped and review possible effects before answering to retry.", a.Profile, wt), nil
+			return p.blockNow(fmt.Sprintf("The plan author %q was interrupted or timed out (worktree kept at %s). Confirm all processes stopped and review possible effects before answering to retry.", a.Profile, wt)), nil
 		}
 		return fail("author", err.Error())
 	}
@@ -867,7 +883,7 @@ func (p *planner) verifyFrozen(ctx context.Context, a *PlanAttempt) (string, err
 		if uncertain {
 			keep = true
 			a.FailedStep, a.Feedback = step, msg
-			return fmt.Sprintf("Plan check %s was interrupted or timed out (worktree kept at %s). Confirm all processes stopped, then answer to retry.", step, vwt), nil
+			return p.blockNow(fmt.Sprintf("Plan check %s was interrupted or timed out (worktree kept at %s). Confirm all processes stopped, then answer to retry.", step, vwt)), nil
 		}
 		if step != "" {
 			return fail(step, msg)
@@ -885,17 +901,23 @@ func (p *planner) verifyFrozen(ctx context.Context, a *PlanAttempt) (string, err
 		if err != nil {
 			return "", err
 		}
+		// The verdict and what it means for the attempt are saved together: a rejected or
+		// uncertain review never resumes as a review still to ask.
 		a.Reviews = append(a.Reviews, v)
+		question := ""
+		switch {
+		case g.Uncertain:
+			keep = true
+			a.FailedStep, a.Feedback = "review", g.Output
+			question = p.blockNow(fmt.Sprintf("The %s review of the plan was interrupted or timed out (worktree kept at %s). Confirm all processes stopped, then answer to retry.", role, vwt))
+		case !g.Passed:
+			a.FailedStep, a.Feedback = "review", g.Output
+		}
 		if err := p.save(); err != nil {
 			return "", err
 		}
-		if g.Uncertain {
-			keep = true
-			a.FailedStep, a.Feedback = "review", g.Output
-			return fmt.Sprintf("The %s review of the plan was interrupted or timed out (worktree kept at %s). Confirm all processes stopped, then answer to retry.", role, vwt), nil
-		}
-		if !g.Passed {
-			return fail("review", g.Output)
+		if question != "" || !g.Passed {
+			return question, nil
 		}
 	}
 	a.FailedStep, a.Feedback = "", ""
@@ -1341,7 +1363,7 @@ func answerPlan(r Repo, id, text string) error {
 		return fmt.Errorf("plan %s is not blocked (phase %s)", st.ID, st.Phase)
 	}
 	st.Answers = append(st.Answers, strings.TrimSpace(text))
-	st.Question, st.Status = "", StatusPending
+	st.Question, st.Status, st.LadderFrom = "", StatusPending, len(st.Attempts)
 	return savePlanState(r, &st)
 }
 
