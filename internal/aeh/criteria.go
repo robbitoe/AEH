@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"os"
 	"os/exec"
@@ -194,7 +195,9 @@ func parseCriteria(body string) (crit []SpecCriterion, present bool, err error) 
 			note(n, "a lone carriage return is a line break in Markdown; use LF or CRLF line endings")
 		}
 		trimmed := strings.TrimLeft(line, " \t")
-		if trimmed != line && (strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~")) {
+		// Inside an open column-0 fence an indented fence-like line is content (or a valid
+		// closing fence, which codeFence handles); only an opening fence must start at column 0.
+		if f.n == 0 && trimmed != line && (strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~")) {
 			note(n, "fences must start at column 0 in a spec with acceptance criteria")
 		}
 		if f.step(line) {
@@ -205,7 +208,7 @@ func parseCriteria(body string) (crit []SpecCriterion, present bool, err error) 
 		}
 		if entityRef.MatchString(line) {
 			note(n, `character references such as "&nbsp;" or "&#65;" are not allowed outside fences in a spec with acceptance criteria; they render as other text than aeh reads, so type the character itself`)
-			if isCriteriaHeadingText(entityRef.ReplaceAllString(line, " ")) {
+			if isCriteriaHeadingText(html.UnescapeString(line)) {
 				attempted = true // "## Acceptance&nbsp;criteria" reads as a criteria heading
 			}
 		}
