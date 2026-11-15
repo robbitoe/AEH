@@ -33,6 +33,14 @@ type promptData struct {
 	MaxFiles   int
 	MaxBytes   int
 	PlanYAML   string // plan review: the frozen author's plan
+
+	// Discovery: the owner's idea, earlier questions with the latest answers, and limits.
+	Idea         string
+	History      string
+	Research     bool
+	Round        int
+	MaxQuestions int
+	MaxFeatures  int
 }
 
 // memorySpecBlock exposes only the declared feature as reference data.

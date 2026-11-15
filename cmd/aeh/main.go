@@ -23,6 +23,14 @@ Setup
   aeh init                          create aeh/config.yaml and an example outcome
   aeh notify test                   send a test event to the configured webhook
 
+Discovery (from an idea to a draft book of specs in memory)
+  aeh discover new <slug> "<idea>"  start a discovery session
+  aeh discover run <slug>           run one round: the agent asks questions or writes the draft book
+  aeh discover show <slug>          phase, questions and answers
+  aeh discover answer <slug> <QID> "<text>"
+                                    answer a question (again to revise it)
+  aeh discover skip <slug> <QID>    skip an optional question
+
 Definition
   aeh tests approve <ID>            seal the outcome's acceptance tests
   aeh plan <feature>                write, check, review and seal acceptance tests and one task
@@ -134,6 +142,9 @@ func dispatch(ctx context.Context, args []string) (int, error) {
 
 	case "memory":
 		return memoryCommand(repo, args[1:])
+
+	case "discover":
+		return discoverCommand(ctx, repo, args[1:])
 
 	case "plan":
 		if len(args) != 2 {
@@ -291,10 +302,128 @@ func memoryCommand(repo aeh.Repo, args []string) (int, error) {
 	return 2, fmt.Errorf("unknown memory command %q; run `aeh help`", args[0])
 }
 
+func discoverCommand(ctx context.Context, repo aeh.Repo, args []string) (int, error) {
+	if len(args) < 2 {
+		return 2, errors.New("usage: aeh discover new|run|show|answer|skip <slug> ...")
+	}
+	slug := args[1]
+	switch args[0] {
+	case "new":
+		if len(args) < 3 {
+			return 2, errors.New(`usage: aeh discover new <slug> "<idea>"`)
+		}
+		if _, err := aeh.DiscoverNew(repo, slug, strings.Join(args[2:], " ")); err != nil {
+			return 1, err
+		}
+		fmt.Printf("discovery %s started; run its first round with: aeh discover run %s\n", slug, slug)
+		return 0, nil
+	case "run":
+		if len(args) != 2 {
+			return 2, errors.New("usage: aeh discover run <slug>")
+		}
+		st, err := aeh.DiscoverRun(ctx, repo, slug, os.Stdout)
+		if err != nil {
+			return 1, err
+		}
+		if st.Status == aeh.StatusBlocked {
+			fmt.Println(st.Question)
+			return 3, nil
+		}
+		printDiscovery(st, false)
+		return 0, nil
+	case "show":
+		if len(args) != 2 {
+			return 2, errors.New("usage: aeh discover show <slug>")
+		}
+		st, ok, err := aeh.LoadDiscovery(repo, slug)
+		if err != nil {
+			return 1, err
+		}
+		if !ok {
+			return 1, fmt.Errorf("discovery %s does not exist", slug)
+		}
+		printDiscovery(st, true)
+		return 0, nil
+	case "answer":
+		if len(args) < 4 {
+			return 2, errors.New(`usage: aeh discover answer <slug> <QID> "<text>"`)
+		}
+		st, err := aeh.DiscoverAnswer(repo, slug, args[2], strings.Join(args[3:], " "))
+		if err != nil {
+			return 1, err
+		}
+		fmt.Printf("answer to %s recorded; phase %s\n", args[2], st.Phase)
+		return 0, nil
+	case "skip":
+		if len(args) != 3 {
+			return 2, errors.New("usage: aeh discover skip <slug> <QID>")
+		}
+		st, err := aeh.DiscoverSkip(repo, slug, args[2])
+		if err != nil {
+			return 1, err
+		}
+		fmt.Printf("%s skipped; phase %s\n", args[2], st.Phase)
+		return 0, nil
+	}
+	return 2, fmt.Errorf("unknown discover command %q", args[0])
+}
+
+// printDiscovery shows a session. Questions and answers passed the display policy when they
+// were recorded.
+func printDiscovery(st aeh.DiscoveryState, all bool) {
+	fmt.Printf("discovery %s: phase %s, %d round(s)\n", st.Slug, st.Phase, len(st.Rounds))
+	if st.Status == aeh.StatusBlocked {
+		fmt.Println("  blocked: " + strings.ReplaceAll(firstLines(st.Question, 4), "\n", "\n           "))
+	}
+	for i, r := range st.Rounds {
+		if !all && i != len(st.Rounds)-1 {
+			continue
+		}
+		if r.Kind == "book" {
+			fmt.Printf("round %d: draft book with %d file(s) in memory under wiki/discovery/%s/drafts/\n", r.N, len(r.Files), st.Slug)
+			continue
+		}
+		fmt.Printf("round %d questions:\n", r.N)
+		for _, q := range r.Questions {
+			kind := "optional"
+			if q.Blocking {
+				kind = "blocking"
+			}
+			state := "open"
+			switch {
+			case len(q.Answers) > 0:
+				state = "answered"
+			case q.Skipped:
+				state = "skipped"
+			}
+			fmt.Printf("  %s (%s, %s) %s\n      why: %s\n", q.ID, kind, state, q.Text, q.Why)
+			if len(q.Options) > 0 {
+				fmt.Printf("      options: %s\n", strings.Join(q.Options, " | "))
+			}
+			if len(q.Answers) > 0 {
+				fmt.Printf("      answer: %s\n", strings.ReplaceAll(firstLines(q.Answers[len(q.Answers)-1].Text, 3), "\n", "\n              "))
+			}
+		}
+	}
+	switch st.Phase {
+	case aeh.DiscoveryAwaiting:
+		fmt.Printf("answer with: aeh discover answer %s <QID> \"...\"\n", st.Slug)
+	case aeh.DiscoveryReady:
+		fmt.Printf("next round: aeh discover run %s\n", st.Slug)
+	}
+}
+
 func printStatus(repo aeh.Repo) error {
 	states, err := aeh.ListStates(repo)
 	if err != nil {
 		return err
+	}
+	sessions, err := aeh.ListDiscoveries(repo)
+	if err != nil {
+		return err
+	}
+	for _, d := range sessions {
+		fmt.Printf("%-22s discovery %-7s phase %-16s rounds %d\n", d.Slug, d.Status, d.Phase, len(d.Rounds))
 	}
 	plans, err := aeh.ListPlanStates(repo)
 	if err != nil {
@@ -307,7 +436,7 @@ func printStatus(repo aeh.Repo) error {
 		}
 	}
 	if len(states) == 0 {
-		if len(plans) == 0 {
+		if len(plans) == 0 && len(sessions) == 0 {
 			fmt.Println("no outcomes have run yet")
 		}
 		return nil

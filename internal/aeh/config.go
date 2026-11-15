@@ -40,10 +40,11 @@ type Config struct {
 	Limits    struct {
 		MaxDiffLines int `yaml:"max_diff_lines"`
 	} `yaml:"limits"`
-	Ladder    []string       `yaml:"ladder"`
-	Plan      PlanConfig     `yaml:"plan"`
-	Reviewer  string         `yaml:"reviewer"` // legacy: one reviewer for every role
-	Reviewers ReviewerPolicy `yaml:"reviewers"`
+	Ladder    []string        `yaml:"ladder"`
+	Plan      PlanConfig      `yaml:"plan"`
+	Discovery DiscoveryConfig `yaml:"discovery"`
+	Reviewer  string          `yaml:"reviewer"` // legacy: one reviewer for every role
+	Reviewers ReviewerPolicy  `yaml:"reviewers"`
 	Triage    struct {
 		Profile string       `yaml:"profile"`
 		Rules   []TriageRule `yaml:"rules"`
@@ -237,6 +238,9 @@ func checkConfigYAML(b []byte) (reviewersDeclared bool, err error) {
 
 func (c *Config) validate() error {
 	if err := c.validatePlanConfig(); err != nil {
+		return err
+	}
+	if err := c.validateDiscoveryConfig(); err != nil {
 		return err
 	}
 	if strings.TrimSpace(c.Commands.Test) == "" {
