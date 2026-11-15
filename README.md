@@ -66,6 +66,34 @@ aeh discover run shop                 # next round, with the latest answer to ea
 
 A round ends with questions or with the draft book. Blocking questions must be answered before the next round. Answering again records a revision, and the next round receives only the latest one. The book has `vision.md`, `data.md`, one `features/<feature>.md` per feature with acceptance criteria, and optional HTML mockups. It is stored under `wiki/discovery/<slug>/drafts/` in memory. Drafts are not features: they claim no paths, and no run sees them.
 
+Each feature draft starts with strict YAML front matter containing exactly `title` (one display line, at most 200 bytes) and `paths` (1-20 repository-relative paths). Unknown fields, YAML anchors and explicit tags are rejected. Draft slugs must be new, and paths of different drafts must not overlap. Criteria must be present, non-empty, numbered from 1 without gaps, and must not use `observed`:
+
+```markdown
+---
+title: Cart
+paths: [src/cart/**, web/cart/**]
+---
+# Cart
+The cart holds items.
+
+## Acceptance criteria
+- AC-1: Given an empty cart, when the user adds an item, then the cart has one item.
+```
+
+Before import, the first independent QA profile reviews the frozen book using `review-book.md` (the legacy `reviewer` setting remains supported). The review is advisory: `approve`, `reject`, `invalid`, `unavailable`, `interrupted` and `not_run` are explicit evidence states, and none prevents import. Findings become optional questions attributed to the reviewer. `show` and `.aeh/reports/discover-<slug>.md` show the reviewer, provider, book digest and whether the review is stale after committed draft edits. A stopped review resumes on the saved snapshot without running the author again.
+
+Promote and accept are explicit owner actions:
+
+```sh
+aeh discover promote shop cart       # creates wiki/features/cart/spec.md at 0.1.0
+aeh memory approve cart              # separate approval of the spec
+aeh plan cart
+aeh discover accept shop vision      # wiki/vision.md, or wiki/vision.next.md if it exists
+aeh discover accept shop data        # wiki/data.md, or wiki/data.next.md if it exists
+```
+
+Promotion reads the committed draft from memory HEAD and revalidates it against existing features and their paths. Resolve conflicts by editing and committing the draft in the memory repository; no agent reruns. The promoted spec must also meet the existing spec format, including its 120-byte title limit. Repeating promotion or acceptance of unchanged draft content succeeds without another memory commit. Vision and data are advisory: neither enters feature approval digests nor run contracts. Each command refreshes the discovery report, which includes rounds, attempts, redacted feedback, answers and owner actions.
+
 The agent writes only into an output directory that aeh opened before the agent ran. aeh freezes that output against an exact list of allowed files and limits. Then it checks the output:
 
 - Text: restricted Markdown, with no HTML, no character references and no external images.
@@ -246,9 +274,11 @@ Make sure your project's `.gitignore` covers build output (`bin/`, `obj/`, `node
 | `aeh init` | Creates `aeh/config.yaml`, an example outcome, and ignores `.aeh/`. |
 | `aeh discover new <slug> "<idea>"` | Starts a discovery session and records the idea in memory. |
 | `aeh discover run <slug>` | Runs one discovery round: questions, or the draft book. Exit code 3 when the ladder is exhausted. |
-| `aeh discover show <slug>` | Phase, questions and answers of a session. |
+| `aeh discover show <slug>` | Phase, review validity, questions, answers and owner actions. |
 | `aeh discover answer <slug> <QID> "<text>"` | Answers a question; answering again records a revision. |
 | `aeh discover skip <slug> <QID>` | Skips an optional question. |
+| `aeh discover promote <slug> <feature>` | Creates an unapproved spec at 0.1.0 from a committed draft. |
+| `aeh discover accept <slug> vision\|data` | Accepts an advisory document; existing documents use `.next.md`. |
 | `aeh tests approve <ID>` | Seals a manual outcome's acceptance tests; refuses generated outcomes. |
 | `aeh plan <feature>` | Plans an approved spec, reviews and seals its tests, and publishes `aeh/<ID>`; resumes an unfinished plan. |
 | `aeh run <ID>` | Runs the outcome. Exit code 0 accepted, 3 blocked, 1 error. |
@@ -280,11 +310,11 @@ The engine above is the build stage of the [vision](docs/vision.md). Next, in or
 1. **Memory.** A private wiki in `.aeh/memory/` with versioned specs, kept in sync with the code by a deterministic drift gate.
 2. **Triage and reviewers (implemented).** Trivial, change and new routes, with QA, security and DBA reviewers chosen by route and rules.
 3. **Specs to code (implemented).** An approved feature produces one task and independently reviewed, runner-sealed acceptance tests with `aeh plan`.
-4. **Discovery (in progress).** From a vague idea to a spec book with HTML mockups: rounds of questions and the draft book are implemented; review, promotion to features, and adoption of existing systems come next.
+4. **Discovery (implemented); adoption next.** From a vague idea to a validated spec book with HTML mockups, advisory independent review, owner promotion to features, and acceptance of vision/data. Adoption of existing systems comes next.
 5. **Live review.** Specs keep evolving while approved features are built.
 6. **Sandbox.** Agents in a container with no network by default.
 
-Promoting drafts, adopting existing systems and live spec/test revision remain future work. Manual outcomes, tasks and acceptance tests can also be written by hand or with your agent CLI.
+Adopting existing systems and live spec/test revision remain future work. Manual outcomes, tasks and acceptance tests can also be written by hand or with your agent CLI.
 
 ## Development
 
