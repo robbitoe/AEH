@@ -8,9 +8,9 @@ The runner decides; models only propose.
 
 ## What works today
 
-The build stage. AEH turns an approved outcome into verified code on its own branch. You decide what to build and approve the acceptance tests; AEH runs agent CLIs (Codex, Claude Code, a local model) in isolated git worktrees and accepts a change only when deterministic gates pass. The rest of this README describes that engine.
+The build stage. AEH turns an approved feature spec into a plan, sealed acceptance tests and verified code on its own branch. You approve the spec; AEH generates, checks, independently reviews and seals the tests. Manual outcomes remain supported with owner-approved tests. AEH runs agent CLIs (Codex, Claude Code, a local model) in separate git worktrees and accepts a change only when deterministic gates and independent reviews pass.
 
-> **Status: MVP-1.** Worktrees separate Git changes. Agent CLIs and build/test commands run with your user's permissions, subject to any sandbox configured on the CLI itself. Use trusted repositories, profiles, and commands until AEH has a process sandbox.
+> Worktrees separate Git changes. Agent CLIs and build/test commands run with your user's permissions, subject to any sandbox configured on the CLI itself. Use trusted repositories, profiles, and commands until AEH has a process sandbox.
 
 ## Install
 
@@ -50,6 +50,52 @@ For small changes that don't need sealed tests:
 ```sh
 aeh do "fix the null check in FeeService.Calculate" --paths src/Fees/
 ```
+
+## From an approved spec to code
+
+Initialize product memory and create a feature spec with literal ownership paths (see [Product memory](#product-memory)). The spec must have structured criteria:
+
+```markdown
+## Acceptance criteria
+- AC-1: Given a cart, when the user pays, then one order is created.
+- AC-2: Given a failed payment, when the user retries, then no second charge is made.
+```
+
+Use positive, unique criterion numbers without leading zeros. Criteria stay on one line; put prose and examples outside this section. Criterion numbers are never reused. Commit spec edits in the private memory repository before approving.
+
+Configure `commands.acceptance` to run exactly the repository-relative test files listed, one per line, in the runner-written `{{manifest}}` file. The placeholder must occur exactly once. For example, a project with shell acceptance tests can use:
+
+```yaml
+commands:
+  build: "your-build-command"
+  test: "your-test-command"
+  acceptance: "sh tests/run-manifest.sh {{manifest}}"
+plan:
+  ladder: [test-author]
+  acceptance_dir: tests/acceptance
+  max_diff_lines: 400
+  max_files: 20
+  max_bytes: 262144
+ladder: [implementer]
+```
+
+Define those profiles and independent QA/security reviewers in the same config. `plan.ladder` defaults to the implementation ladder when omitted, so configure separate authors for generated outcomes. Every reachable implementer must differ from the accepted test author, and also from its provider under the default `provider` independence policy. With `reviewers.independence: profile`, different profiles of one provider are allowed. The run checks the whole reachable ladder before any agent starts.
+
+```sh
+aeh memory approve checkout           # owner approval of this exact spec
+aeh plan checkout                     # generates, checks, reviews and seals the plan
+aeh run checkout-v0_1_0                # use the ID printed by plan
+```
+
+Planning requires a clean code checkout and memory, an approved spec with criteria, a green baseline and independent reviewers. It supports new criteria that fit one task. Changed or removed implemented criteria block until a future test-revision workflow; an empty delta needs no plan. A prior implementation must already be integrated into the planning base. An occupied outcome ID also blocks, ignoring case. Resolve environment failures or answer a blocked plan with `aeh answer <ID> "..."`, then repeat `aeh plan <feature>`; changing pinned planning inputs requires a fresh plan/ID.
+
+The test author writes tests and `plan.yaml` under `<acceptance_dir>/<ID>/`. AEH checks scope, paths and criterion-to-file traceability, requires every new test file to fail before implementation, checks the previous acceptance suite and obtains independent reviews on the frozen plan commit. These checks provide evidence; reviewers judge whether the tests fail for the right reason. The owner approves the spec, not the generated tests. `aeh tests approve <ID>` refuses any ID with plan state.
+
+The published plan already owns branch `aeh/<ID>`. Running it starts at the pinned plan commit and reads the outcome and runner seal from Git objects. An unfinished plan, a moved branch or a different outcome/seal file shadowing it in the main checkout blocks execution. A changed or re-approved spec whose content digest differs from the planned approval blocks with `RestartRequired`: approve the spec and plan again. Candidates may never add, edit or delete files in the outcome's acceptance directory; historical tests of unchanged criteria retain their original bytes too. The run executes both the normal project suite and the new/unchanged criteria through `commands.acceptance`, including at the final check.
+
+Resume requires the recorded integration head and execution contract, including plan provenance, plan commit and seal manifest. The report includes plan checks, the test author and every plan review's role, profile, provider, SHA and verdict. Acceptance writes `implemented.yaml` with the planned approval digest, accepted code SHA and all criterion/test mappings in the same private memory commit as the change record. A failed memory write leaves that implementation in the pending record for `aeh memory record <ID>` to retry.
+
+Manual outcomes keep the quick-start workflow with `aeh tests approve`; both kinds coexist.
 
 ## How a task runs
 
@@ -163,10 +209,11 @@ Make sure your project's `.gitignore` covers build output (`bin/`, `obj/`, `node
 | Command | What it does |
 | --- | --- |
 | `aeh init` | Creates `aeh/config.yaml`, an example outcome, and ignores `.aeh/`. |
-| `aeh tests approve <ID>` | Seals the outcome's acceptance tests. |
+| `aeh tests approve <ID>` | Seals a manual outcome's acceptance tests; refuses generated outcomes. |
+| `aeh plan <feature>` | Plans an approved spec, reviews and seals its tests, and publishes `aeh/<ID>`; resumes an unfinished plan. |
 | `aeh run <ID>` | Runs the outcome. Exit code 0 accepted, 3 blocked, 1 error. |
 | `aeh do "<change>" [--paths a/,b/] [--profile name] [--route trivial\|change\|new] [--feature slug --change patch\|minor\|major --note "..."]` | Level-1 change with one task; optionally links and records a feature. |
-| `aeh answer <ID> "<text>"` | Answers a blocked outcome; the answer goes into the next prompt. |
+| `aeh answer <ID> "<text>"` | Answers a blocked outcome or plan; the answer goes into the next prompt. |
 | `aeh status` | Status, tasks and attempts of every outcome. |
 | `aeh notify test` | Sends a test event to the webhook. |
 | `aeh memory init` | Creates the product memory in `.aeh/memory/` of the main checkout. |
@@ -176,7 +223,7 @@ Make sure your project's `.gitignore` covers build output (`bin/`, `obj/`, `node
 | `aeh memory lint` | Checks the memory and its privacy settings. |
 | `aeh memory record <ID>` | Retries a memory record that failed after an outcome was accepted. |
 
-### Product memory (in progress)
+### Product memory
 
 The memory is a local wiki in `.aeh/memory/` of the project's main checkout, also when you run from a linked worktree. It is its own Git repository with no remote, and the project ignores `.aeh/`, so aeh does not publish it. Each feature has a spec with a version and the paths it owns; `index.md` and `log.md` are maintained by aeh. Only aeh commands write it, one at a time per project. You can edit spec text by hand and commit it inside the memory repository; aeh refuses to record on top of uncommitted changes.
 
@@ -192,12 +239,12 @@ The engine above is the build stage of the [vision](docs/vision.md). Next, in or
 
 1. **Memory.** A private wiki in `.aeh/memory/` with versioned specs, kept in sync with the code by a deterministic drift gate.
 2. **Triage and reviewers (implemented).** Trivial, change and new routes, with QA, security and DBA reviewers chosen by route and rules.
-3. **Specs to code.** An approved feature produces its tasks and acceptance tests.
+3. **Specs to code (implemented).** An approved feature produces one task and independently reviewed, runner-sealed acceptance tests with `aeh plan`.
 4. **Discovery.** From a vague idea to a spec book with HTML mockups.
 5. **Live review.** Specs keep evolving while approved features are built.
 6. **Sandbox.** Agents in a container with no network by default.
 
-Until then, outcomes, tasks and acceptance tests are written by hand or with your agent CLI.
+Discovery and live spec/test revision remain future work. Manual outcomes, tasks and acceptance tests can also be written by hand or with your agent CLI.
 
 ## Development
 
@@ -205,8 +252,10 @@ Go standard library only, plus `gopkg.in/yaml.v3`. One file per responsibility i
 
 ```sh
 go vet ./...
-go test ./...
+go test -timeout 30m ./...
 ```
+
+The full suite takes about 12 minutes on Windows; the extended timeout is required.
 
 Agent instruction files (`AGENTS.md`, `CLAUDE.md`, `.claude/`, `.codex/`), agent coordination notes (`.agents/`) and local state (`.aeh/`) are git-ignored: they stay on your machine. Design decisions are recorded in [docs/adr](docs/adr).
 

@@ -10,8 +10,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // maxAttempts follows the ladder: same profile, same profile with feedback, next profile.
@@ -31,10 +35,43 @@ type runner struct {
 	reviewSources   map[string]string
 	triagePrompt    string
 	memory          MemorySnapshot
+	generated       *generatedRun
+}
+
+// generatedRun is an immutable snapshot of the plan provenance and its Git manifests.
+type generatedRun struct {
+	Plan     PlanState
+	Seal     Seal
+	Manifest Seal
+	Paths    []string
+	Trace    PlanFile
 }
 
 // RunOutcome executes an outcome from aeh/outcomes/<id>.yaml until it is accepted or blocked.
 func RunOutcome(ctx context.Context, r Repo, id string, log io.Writer) (State, error) {
+	plan, generated, err := LoadPlanState(r, id)
+	if err != nil {
+		return State{}, err
+	}
+	if generated {
+		if plan.Phase != PlanLogged {
+			return State{}, fmt.Errorf("plan %s is not finished; run aeh plan %s", id, plan.Feature)
+		}
+		main, err := MainCheckout(r)
+		if err != nil {
+			return State{}, err
+		}
+		r = Repo{Root: main}
+		cfg, err := r.LoadConfig()
+		if err != nil {
+			return State{}, err
+		}
+		o, gen, err := loadGeneratedRun(r, cfg, plan)
+		if err != nil {
+			return State{}, err
+		}
+		return run(ctx, r, cfg, o, log, gen)
+	}
 	cfg, err := r.LoadConfig()
 	if err != nil {
 		return State{}, err
@@ -80,7 +117,7 @@ func Do(ctx context.Context, r Repo, text string, paths []string, profile string
 	return run(ctx, r, cfg, o, log)
 }
 
-func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer) (State, error) {
+func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer, generated ...*generatedRun) (State, error) {
 	// One run or memory write at a time per project, across linked worktrees.
 	unlockProject, err := lockProject(r)
 	if err != nil {
@@ -92,6 +129,13 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer) (Sta
 		return State{}, err
 	}
 	defer unlock()
+	// A first generated run may use only the branch published by planning. Triage can
+	// persist a partial run state, so the contract (rather than mere file existence)
+	// distinguishes a fresh run after an interruption here.
+	var gen *generatedRun
+	if len(generated) > 0 {
+		gen = generated[0]
+	}
 	memory, err := LoadMemory(r)
 	if err != nil {
 		return State{}, fmt.Errorf("load run memory: %w", err)
@@ -115,7 +159,28 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer) (Sta
 	case StatusBlocked:
 		return st, fmt.Errorf("%s is blocked; answer it first: aeh answer %s \"...\"\n%s", o.ID, o.ID, st.Question)
 	}
-	ru := &runner{repo: r, cfg: cfg, outcome: o, protected: protectedPaths(cfg, o), state: &st, log: log, memory: memory}
+	ru := &runner{repo: r, cfg: cfg, outcome: o, protected: protectedPaths(cfg, o), state: &st, log: log, memory: memory, generated: gen}
+	if gen != nil {
+		ru.seal = &gen.Seal
+		spec, exists := memory.Spec(gen.Plan.Feature)
+		if !exists || !spec.Approved() || spec.Approval.Content != gen.Plan.SpecDigest {
+			st.RestartRequired = true
+			err := ru.block("spec changed since plan; approve it and run aeh plan again")
+			return st, err
+		}
+		if err := generatedPreflight(cfg, o, gen.Plan.Author); err != nil {
+			return st, err
+		}
+		if st.Contract == "" {
+			current, exists := branchCommit(r.Root, IntegrationBranch(o.ID))
+			if !exists || current != gen.Plan.PlanCommit {
+				return st, fmt.Errorf("cannot start %s: integration branch must point at plan commit %s", o.ID, gen.Plan.PlanCommit)
+			}
+		}
+		if g := gateSealedManifest(r.Root, gen.Plan.PlanCommit, gen.Manifest, gen.Paths); !g.Passed {
+			return st, errors.New(g.Output)
+		}
+	}
 	if attrs := attributesFileInRepo(r.Root); attrs != "" {
 		ru.protected = append(ru.protected, attrs)
 	}
@@ -142,7 +207,7 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer) (Sta
 		return st, err
 	}
 	var sealErr error
-	if o.Level >= 2 && len(o.Acceptance) > 0 {
+	if gen == nil && o.Level >= 2 && len(o.Acceptance) > 0 {
 		ru.seal, sealErr = verifySeal(r, o)
 	}
 	if question := ru.newRequirements(); question != "" {
@@ -169,7 +234,12 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer) (Sta
 	if err != nil {
 		return st, err
 	}
-	if current, exists := branchCommit(r.Root, branch); st.Contract != "" || exists || st.Branch != "" {
+	if current, exists := branchCommit(r.Root, branch); gen != nil && st.Contract == "" && st.Branch == "" && st.Head == "" {
+		if !exists || current != gen.Plan.PlanCommit {
+			return st, fmt.Errorf("cannot start %s: integration branch must point at plan commit %s", o.ID, gen.Plan.PlanCommit)
+		}
+		st.Base, st.Head, st.Contract = gen.Plan.PlanCommit, gen.Plan.PlanCommit, contract
+	} else if st.Contract != "" || exists || st.Branch != "" {
 		if st.Contract != contract || st.Head == "" || current != st.Head {
 			return st, fmt.Errorf("cannot resume %s: contract or integration branch differs from recorded state; inspect it or use a new outcome ID", o.ID)
 		}
@@ -182,6 +252,11 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer) (Sta
 			return st, err
 		}
 		st.Base, st.Head, st.Contract = base, base, contract
+	}
+	if gen != nil {
+		if g := gateSealedManifest(r.Root, st.Head, gen.Manifest, gen.Paths); !g.Passed {
+			return st, errors.New(g.Output)
+		}
 	}
 	st.Title, st.Branch, st.Status = o.Title, branch, StatusRunning
 	for _, t := range o.Tasks {
@@ -206,7 +281,6 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer) (Sta
 			return st, err
 		}
 	}
-
 	ok, question, err := ru.completeReviews(ctx)
 	if err != nil {
 		return st, err
@@ -227,6 +301,14 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer) (Sta
 	var pendingErr error
 	if o.Feature != "" {
 		current, err := LoadMemory(r)
+		if gen != nil && err == nil {
+			spec, exists := current.Spec(o.Feature)
+			if !exists || !spec.Approved() || spec.Approval.Content != gen.Plan.SpecDigest {
+				st.RestartRequired = true
+				err := ru.block("spec changed since plan; approve it and run aeh plan again")
+				return st, err
+			}
+		}
 		if err != nil || current.Fingerprint != memory.Fingerprint {
 			reason := ErrMemoryChanged.Error()
 			if err != nil {
@@ -236,6 +318,12 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer) (Sta
 			return st, err
 		}
 		pending = PendingRecord{OutcomeID: o.ID, Feature: o.Feature, Change: o.Change, Note: o.Changelog, Commit: st.Head}
+		if gen != nil {
+			pending.Implementation, err = ru.implementation()
+			if err != nil {
+				return st, err
+			}
+		}
 		pendingErr = SavePending(r, pending)
 		// Persist a retry message with acceptance, even if the process stops before recording.
 		st.MemoryError = "memory record is pending"
@@ -288,9 +376,10 @@ func (ru *runner) contractHash() (string, error) {
 		InitialRoute    string
 		Rules           []TriageRule
 		Memory          memoryContract
+		Generated       any `json:",omitempty"`
 	}{commands, ru.cfg.PassEnv, ru.cfg.Protected, ru.cfg.Limits, outcome, seal, ru.implementPrompt, ru.reviewPrompts,
 		ru.triagePrompt, ru.state.TriageOutput, ru.state.InitialRoute, ru.cfg.Triage.Rules,
-		memoryContract{ru.memory.ContractFingerprint(outcome.Feature), outcome.Feature, outcome.Change, outcome.Changelog}})
+		memoryContract{ru.memory.ContractFingerprint(outcome.Feature), outcome.Feature, outcome.Change, outcome.Changelog}, ru.generatedContract()})
 	if err != nil {
 		return "", fmt.Errorf("encode execution contract: %w", err)
 	}
@@ -452,7 +541,7 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 	// candidate is checked out, and no checkout filter runs, until both have passed.
 	passed := true
 	if ru.seal != nil {
-		passed = check(gateSealedTree(r.Root, base, commit, o.Acceptance))
+		passed = check(ru.sealedGate(base, commit))
 	}
 	if passed {
 		passed = check(gateScope(changes, ru.protected, t.Paths, maxLines))
@@ -480,6 +569,9 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 	}
 	if passed {
 		passed = check(checkoutGate(gateCommand(ctx, "test", verified, ru.cfg.Commands.Test, timeout, ru.cfg.PassEnv), verified, commit))
+	}
+	if passed && ru.generated != nil {
+		passed = check(ru.acceptanceGate(ctx, verified, commit))
 	}
 	if passed {
 		roles := requiredRoles(ru.state.EffectiveRoute, ru.state.Roles)
@@ -777,7 +869,14 @@ func (ru *runner) finalCheck(ctx context.Context) (bool, string, error) {
 	timeout := time.Duration(ru.cfg.Commands.TimeoutMinutes) * time.Minute
 	gates := []GateResult{}
 	if ru.seal != nil {
-		gates = append(gates, gateHash(wt, *ru.seal, o.Acceptance))
+		if ru.generated != nil {
+			gates = append(gates, ru.sealedGate(ru.state.Base, head))
+			if gates[len(gates)-1].Passed {
+				gates = append(gates, gateHash(wt, ru.generated.Manifest, ru.generated.Paths))
+			}
+		} else {
+			gates = append(gates, gateHash(wt, *ru.seal, o.Acceptance))
+		}
 	}
 	if len(gates) == 0 || gates[len(gates)-1].Passed {
 		changes, err := candidateChanges(r.Root, ru.state.Base, ru.state.Head)
@@ -791,6 +890,9 @@ func (ru *runner) finalCheck(ctx context.Context) (bool, string, error) {
 	}
 	if gates[len(gates)-1].Passed {
 		gates = append(gates, checkoutGate(gateCommand(ctx, "test", wt, ru.cfg.Commands.Test, timeout, ru.cfg.PassEnv), wt, head))
+	}
+	if gates[len(gates)-1].Passed && ru.generated != nil {
+		gates = append(gates, ru.acceptanceGate(ctx, wt, head))
 	}
 	keep = gates[len(gates)-1].Uncertain
 	evidence := map[string]string{"commit": head, "contract": ru.state.Contract}
@@ -1132,4 +1234,207 @@ func firstLine(s string) string {
 		s = s[:100] + "..."
 	}
 	return s
+}
+
+// loadGeneratedRun never discovers provenance in a checkout file. The state chooses the
+// commit first; local copies are only checked for conflicts with those pinned bytes.
+func loadGeneratedRun(r Repo, cfg Config, st PlanState) (Outcome, *generatedRun, error) {
+	var o Outcome
+	if st.Phase != PlanLogged {
+		return o, nil, fmt.Errorf("plan %s is not finished; run aeh plan %s", st.ID, st.Feature)
+	}
+	if !isFullSHA(st.PlanCommit) || st.Author == "" || !validRoute(st.Route) {
+		return o, nil, fmt.Errorf("plan %s has invalid provenance", st.ID)
+	}
+	if strings.TrimSpace(cfg.Commands.Acceptance) == "" {
+		return o, nil, fmt.Errorf("generated outcome %s requires commands.acceptance with {{manifest}}", st.ID)
+	}
+	read := func(file string) ([]byte, error) {
+		contents, err := sealedGitContents(r.Root, st.PlanCommit, []string{file})
+		if err != nil {
+			return nil, fmt.Errorf("plan %s: %w", st.ID, err)
+		}
+		b, ok := contents[file]
+		if !ok || len(contents) != 1 {
+			return nil, fmt.Errorf("plan %s: missing blob %s", st.ID, file)
+		}
+		local := filepath.Join(r.Root, filepath.FromSlash(file))
+		info, err := os.Lstat(local)
+		if err == nil {
+			if !info.Mode().IsRegular() {
+				return nil, fmt.Errorf("shadowing file conflicts with plan %s: %s", st.ID, file)
+			}
+			shadow, err := os.ReadFile(local)
+			if err != nil {
+				return nil, err
+			}
+			if string(shadow) != string(b) {
+				return nil, fmt.Errorf("shadowing file conflicts with plan %s: %s", st.ID, file)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		return b, nil
+	}
+	b, err := read("aeh/outcomes/" + st.ID + ".yaml")
+	if err != nil {
+		return o, nil, err
+	}
+	// Keep LoadOutcome's YAML parsing, ID default and normalization semantics.
+	if err := yaml.Unmarshal(b, &o); err != nil {
+		return o, nil, fmt.Errorf("parse outcome %s: %w", st.ID, err)
+	}
+	if o.ID == "" {
+		o.ID = st.ID
+	}
+	if err := o.normalize(); err != nil {
+		return o, nil, err
+	}
+	dir := cfg.plan().AcceptanceDir + "/" + st.ID + "/"
+	if o.ID != st.ID || o.Feature != st.Feature || o.Level != 2 || len(o.Tasks) != 1 ||
+		!reflect.DeepEqual(o.Acceptance, []string{dir}) || o.Route != st.Route {
+		return o, nil, fmt.Errorf("outcome %s differs from its plan state", st.ID)
+	}
+	gen := &generatedRun{Plan: st, Paths: []string{dir}}
+	b, err = read("aeh/seals/" + st.ID + ".json")
+	if err != nil {
+		return o, nil, err
+	}
+	if err := json.Unmarshal(b, &gen.Seal); err != nil {
+		return o, nil, fmt.Errorf("plan %s seal: %w", st.ID, err)
+	}
+	contents, err := sealedGitContents(r.Root, st.PlanCommit, gen.Paths)
+	if err != nil {
+		return o, nil, err
+	}
+	want := sealFromContents(st.ID, contents, st.SpecDigest, gen.Seal.ApprovedAt)
+	if gen.Seal.Outcome != st.ID || gen.Seal.SealedBy != "runner" || gen.Seal.SpecContent != st.SpecDigest ||
+		gen.Seal.Hash != want.Hash || !reflect.DeepEqual(gen.Seal.Files, want.Files) {
+		return o, nil, fmt.Errorf("plan %s seal does not match its pinned acceptance files or spec", st.ID)
+	}
+	gen.Trace, err = parsePlanFile(contents[dir+"plan.yaml"])
+	if err != nil {
+		return o, nil, err
+	}
+	if o.Tasks[0].Goal != gen.Trace.Task.Goal || !reflect.DeepEqual(o.Tasks[0].Paths, gen.Trace.Task.Paths) {
+		return o, nil, fmt.Errorf("outcome %s task differs from plan.yaml", st.ID)
+	}
+	// A prior implementation identifies both the test paths and the immutable code
+	// commit that owns their bytes. Never trust their current checkout or branch base.
+	for _, c := range st.Delta.Unchanged {
+		if !isFullSHA(st.PriorCode) {
+			return o, nil, fmt.Errorf("plan %s has no prior implementation commit", st.ID)
+		}
+		for _, file := range c.Tests {
+			if err := checkPlanTestPath(file); err != nil {
+				return o, nil, err
+			}
+			old, err := sealedGitContents(r.Root, st.PriorCode, []string{file})
+			if err != nil {
+				return o, nil, err
+			}
+			b, ok := old[file]
+			if !ok || len(old) != 1 {
+				return o, nil, fmt.Errorf("historical sealed test is not a file: %s", file)
+			}
+			if previous, exists := contents[file]; exists {
+				if string(previous) != string(b) {
+					return o, nil, fmt.Errorf("conflicting sealed test: %s", file)
+				}
+				continue
+			}
+			contents[file] = b
+			gen.Paths = append(gen.Paths, file)
+		}
+	}
+	gen.Manifest = sealFromContents(st.ID, contents, st.SpecDigest, gen.Seal.ApprovedAt)
+	// Plan roles include rules observed while authoring tests, even if implementation
+	// paths alone would not predict those roles.
+	o.Reviewers = requiredRoles(st.Route, o.Reviewers, st.Roles)
+	return o, gen, nil
+}
+
+func generatedPreflight(cfg Config, o Outcome, author string) error {
+	if _, ok := cfg.Profiles[author]; !ok {
+		return fmt.Errorf("test author profile %q is missing; cannot verify implementer independence", author)
+	}
+	for _, task := range o.Tasks {
+		for _, profile := range cfg.reachableAuthors(task) {
+			if err := cfg.independent(author, profile); err != nil {
+				return fmt.Errorf("implementer must be independent from test author: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+func (ru *runner) generatedContract() any {
+	if ru.generated == nil {
+		return nil
+	}
+	p := ru.generated.Plan
+	return struct {
+		Provenance, PlanCommit, Author, SpecDigest, PriorCode string
+		Delta                                                 CriteriaDelta
+		Route                                                 string
+		Roles                                                 []string
+		Reviews                                               []ReviewVerdict
+		Checks                                                []PlanCheckEntry
+		Manifest                                              Seal
+	}{"plan", p.PlanCommit, p.Author, p.SpecDigest, p.PriorCode, p.Delta, p.Route, p.Roles, p.Reviews, p.Checks, ru.generated.Manifest}
+}
+
+func (ru *runner) sealedGate(base, commit string) GateResult {
+	if g := ru.generated; g != nil {
+		return gateSealedManifest(ru.repo.Root, commit, g.Manifest, g.Paths)
+	}
+	return gateSealedTree(ru.repo.Root, base, commit, ru.outcome.Acceptance)
+}
+
+// acceptanceGate runs the new and unchanged criteria through the configured manifest
+// command, in addition to the normal project suite. plan.yaml is sealed, but is not a test.
+func (ru *runner) acceptanceGate(ctx context.Context, wt, commit string) GateResult {
+	var files []string
+	for _, f := range ru.generated.Manifest.Files {
+		if f.Path != ru.outcome.Acceptance[0]+"plan.yaml" {
+			files = append(files, f.Path)
+		}
+	}
+	p := planner{cfg: ru.cfg}
+	g, err := p.acceptanceCommand(ctx, "acceptance", wt, files)
+	if err != nil {
+		return GateResult{Name: "acceptance", Output: err.Error()}
+	}
+	if err := verifyCheckout(wt, commit); err != nil {
+		g.Passed, g.Output = false, g.Output+"\n"+err.Error()
+	}
+	return g
+}
+
+func (ru *runner) implementation() (*Implementation, error) {
+	g := ru.generated
+	spec, _ := ru.memory.Spec(ru.outcome.Feature)
+	crit, _, err := spec.Criteria()
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(crit, func(i, j int) bool { return crit[i].ID < crit[j].ID })
+	unchanged := map[int]ImplementedCriterion{}
+	for _, c := range g.Plan.Delta.Unchanged {
+		unchanged[c.ID] = c
+	}
+	im := &Implementation{Outcome: ru.outcome.ID, Approval: g.Plan.SpecDigest, Code: ru.state.Head}
+	for _, c := range crit {
+		tests := append([]string(nil), unchanged[c.ID].Tests...)
+		if len(tests) == 0 {
+			for _, file := range g.Trace.Trace[fmt.Sprintf("AC-%d", c.ID)] {
+				tests = append(tests, ru.outcome.Acceptance[0]+file)
+			}
+		}
+		if len(tests) == 0 {
+			return nil, fmt.Errorf("plan %s has no tests for AC-%d", im.Outcome, c.ID)
+		}
+		im.Criteria = append(im.Criteria, ImplementedCriterion{ID: c.ID, Text: c.Text, Tests: tests})
+	}
+	return im, nil
 }
