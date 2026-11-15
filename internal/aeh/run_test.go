@@ -44,6 +44,7 @@ func newFixture(t *testing.T, profiles map[string]string, ladder []string, revie
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
 	}
+	endToEnd(t)
 	dir := t.TempDir()
 	tmp := t.TempDir()
 	mustGit(t, dir, "init", "-q", "-b", "main")

@@ -39,6 +39,7 @@ func newPlanFixture(t *testing.T, author, reviewer string) *planFixture {
 			t.Skip("plan tests require " + tool)
 		}
 	}
+	endToEnd(t)
 	// A repository path with a space and a shell metacharacter: nothing may break or run.
 	f := &planFixture{t: t, dir: filepath.Join(t.TempDir(), "AEH QA & co"), tmp: t.TempDir()}
 	if err := os.MkdirAll(f.dir, 0o755); err != nil {
