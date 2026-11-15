@@ -113,6 +113,19 @@ discovery:
   research: false
 ```
 
+## Adopting an existing system
+
+An existing system without documentation is adopted area by area. An agent reads an area of the code at a pinned commit and reports observations: behavior with the code locations behind it. Each observation gets its own number, AC-<n>, in an append-only event log in memory (`wiki/adopt/<feature>/observations.log.yaml`). `area.md` holds the area's title, paths and description, and a criteria section that aeh renders from the log: `- AC-<n> (observed): ...` until you decide, then `- AC-<n>: ...` for behavior you confirm.
+
+```sh
+aeh adopt show billing
+aeh adopt confirm billing AC-1 keep --seen 3f9c0a1b2d4e   # the current behavior is right
+aeh adopt confirm billing AC-2 bug --seen 81d2c4e5f6a7    # recorded in defects.md; fixed later as a new criterion
+aeh adopt confirm billing AC-3 drop --seen 0c1d2e3f4a5b   # not worth keeping
+```
+
+The token binds your decision to the observation as you saw it. If an agent observed it again in the meantime, the command fails and shows the new text. The same decision again is a no-op; a different one is refused. A bug or a drop retires the number for good. The log is checked against the memory history, so a rewritten or restored log is refused. A criterion added or changed by hand in `area.md` is reported, not accepted; edit the description freely. Taking an area's inventory and observations with an agent, promoting it to a feature and characterization tests come next.
+
 ## From an approved spec to code
 
 Initialize product memory and create a feature spec with literal ownership paths (see [Product memory](#product-memory)). The spec must have structured criteria:
@@ -279,6 +292,8 @@ Make sure your project's `.gitignore` covers build output (`bin/`, `obj/`, `node
 | `aeh discover skip <slug> <QID>` | Skips an optional question. |
 | `aeh discover promote <slug> <feature>` | Creates an unapproved spec at 0.1.0 from a committed draft. |
 | `aeh discover accept <slug> vision\|data` | Accepts an advisory document; existing documents use `.next.md`. |
+| `aeh adopt show <feature>` | Observations of an adopted area: state, decision and the token to decide on each. |
+| `aeh adopt confirm <feature> AC-<n> keep\|bug\|drop --seen <token>` | Decides on an observation as you saw it; refuses if it changed since. |
 | `aeh tests approve <ID>` | Seals a manual outcome's acceptance tests; refuses generated outcomes. |
 | `aeh plan <feature>` | Plans an approved spec, reviews and seals its tests, and publishes `aeh/<ID>`; resumes an unfinished plan. |
 | `aeh run <ID>` | Runs the outcome. Exit code 0 accepted, 3 blocked, 1 error. |
