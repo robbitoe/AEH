@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -373,6 +374,16 @@ func (d *discoverySession) memRel(name string) string {
 // record saves the state change together with the memory batch that records it, then imports
 // the batch. A crash after the save is finished by the next discovery command.
 func (d *discoverySession) record(files map[string][]byte, subject, log string) error {
+	for _, rel := range sortedKeys(files) {
+		if err := checkNoSecrets(rel, files[rel]); err != nil {
+			return fmt.Errorf("discover %s: %w", d.state.Slug, err)
+		}
+		if strings.HasSuffix(rel, ".md") {
+			if err := checkDisplayMarkdown(string(files[rel]), 1<<20); err != nil {
+				return fmt.Errorf("discover %s: %s: %w", d.state.Slug, rel, err)
+			}
+		}
+	}
 	head, err := git(d.memDir, "rev-parse", "HEAD")
 	if err != nil {
 		return fmt.Errorf("discover %s: %w", d.state.Slug, err)
@@ -433,11 +444,101 @@ func (d *discoverySession) resume() error {
 	if d.state == nil {
 		return fmt.Errorf("discovery does not exist; start it with: aeh discover new <slug> \"<idea>\"")
 	}
+	if d.state.Pending != nil {
+		if err := discardPartialImport(d.memDir, d.state.Pending, "discover/"+d.state.Slug); err != nil {
+			return fmt.Errorf("discover %s: %w", d.state.Slug, err)
+		}
+	}
 	if err := memoryClean(d.memDir); err != nil {
 		return fmt.Errorf("discover %s: %w", d.state.Slug, err)
 	}
 	return d.finishPending()
 }
+
+// discardPartialImport undoes what an import interrupted before its commit left on disk, and
+// nothing else: each dirty path must be a batch file holding exactly the batch's bytes, or
+// the log with exactly this import's entry appended. Anything else stays for the owner, and
+// memoryClean reports it.
+func discardPartialImport(dir string, p *pendingImport, session string) error {
+	out, err := gitRaw(dir, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+	if err != nil || out == "" {
+		return err
+	}
+	type dirty struct {
+		path    string
+		tracked bool
+	}
+	var paths []dirty
+	for _, e := range strings.Split(strings.TrimRight(out, "\x00"), "\x00") {
+		if len(e) < 4 || e[0] == 'R' || e[0] == 'C' {
+			return nil // a rename or copy is not aeh's
+		}
+		paths = append(paths, dirty{path: e[3:], tracked: e[:2] != "??"})
+	}
+	for _, d := range paths {
+		disk, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(d.path)))
+		if err != nil {
+			return nil
+		}
+		if want, ok := p.Files[d.path]; ok {
+			if !bytes.Equal(disk, want) {
+				return nil
+			}
+			continue
+		}
+		if d.path != "wiki/log.md" {
+			return nil
+		}
+		head, ok := gitBlob(dir, "HEAD", d.path)
+		if !ok || !partialLogEntry(head, string(disk), session, p.Log) {
+			return nil
+		}
+	}
+	for _, d := range paths {
+		if d.tracked {
+			if _, err := git(dir, "checkout", "-q", "HEAD", "--", d.path); err != nil {
+				return err
+			}
+			continue
+		}
+		_, _ = git(dir, "reset", "-q", "--", d.path)
+		if err := os.Remove(filepath.Join(dir, filepath.FromSlash(d.path))); err != nil {
+			return err
+		}
+		for p := filepath.Dir(filepath.Join(dir, filepath.FromSlash(d.path))); len(p) > len(dir); p = filepath.Dir(p) {
+			if os.Remove(p) != nil {
+				break // not empty
+			}
+		}
+	}
+	return nil
+}
+
+// gitRaw runs git and returns its output untrimmed, for porcelain formats where leading
+// spaces carry meaning.
+func gitRaw(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", append(append([]string{}, gitSafety...), args...)...)
+	cmd.Dir = dir
+	cmd.Env = commandEnv(nil)
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("git %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(errb.String()))
+	}
+	return out.String(), nil
+}
+
+// partialLogEntry reports whether disk is head plus exactly the entry appendLog writes for
+// this import, on any date.
+func partialLogEntry(head, disk, session, log string) bool {
+	if head != "" && !strings.HasSuffix(head, "\n") {
+		head += "\n"
+	}
+	rest, ok := strings.CutPrefix(disk, head)
+	return ok && importLogEntry.MatchString(rest) && strings.HasSuffix(rest, "] import | "+session+" | "+log+"\n")
+}
+
+var importLogEntry = regexp.MustCompile(`^\n## \[[0-9]{4}-[0-9]{2}-[0-9]{2}\] import \| [^\n]*\n$`)
 
 // DiscoverRun runs one discovery round with the discovery ladder. The round ends with the
 // agent's questions for the owner, or with a validated draft book in memory.
@@ -478,7 +579,7 @@ func DiscoverRun(ctx context.Context, r Repo, slug string, log io.Writer) (Disco
 	for _, profile := range d.dcfg.Ladder {
 		done := 0
 		for _, prev := range st.Attempts[min(st.LadderFrom, len(st.Attempts)):] {
-			if prev.Profile == profile {
+			if prev.Profile == profile && prev.Round == round {
 				done++
 			}
 		}
@@ -536,7 +637,7 @@ type discoveryOutput struct {
 // the session, or neither when the attempt failed with feedback for the next one.
 func (d *discoverySession) attempt(ctx context.Context, a *DiscoveryAttempt, round int, feedback string) (*discoveryOutput, string, error) {
 	fail := func(msg string) (*discoveryOutput, string, error) {
-		a.Result, a.Feedback = "failed", msg
+		a.Result, a.Feedback = "failed", redactDiagnostic(msg)
 		return nil, "", nil
 	}
 	outDir := d.repo.WorktreePath(fmt.Sprintf("discover-%s-a%d", d.state.Slug, a.N))
@@ -561,7 +662,7 @@ func (d *discoverySession) attempt(ctx context.Context, a *DiscoveryAttempt, rou
 			return nil, "", err
 		}
 		if uncertainExit(err) {
-			a.Result, a.Feedback = "failed", err.Error()
+			a.Result, a.Feedback = "failed", redactDiagnostic(err.Error())
 			return nil, fmt.Sprintf("The discovery agent %q was interrupted or timed out. Confirm its processes stopped, then run again: aeh discover run %s", a.Profile, d.state.Slug), nil
 		}
 		return fail(err.Error())
@@ -677,6 +778,11 @@ func parseDiscoveryQuestions(b []byte, round, max int) ([]DiscoveryQuestion, err
 				return nil, fmt.Errorf("question %d option %d: %w", n, j+1, err)
 			}
 		}
+		// YAML escapes can spell a secret the raw bytes did not show.
+		decoded := strings.Join(append([]string{q.Text, q.Why}, q.Options...), "\n")
+		if err := checkNoSecrets(fmt.Sprintf("question %d", n), []byte(decoded)); err != nil {
+			return nil, err
+		}
 		out = append(out, DiscoveryQuestion{ID: fmt.Sprintf("R%d-Q%d", round, n), Text: strings.TrimSpace(q.Text),
 			Why: strings.TrimSpace(q.Why), Blocking: *q.Blocking, Options: q.Options})
 	}
@@ -776,9 +882,9 @@ func (d *discoverySession) renderRound(r DiscoveryRound) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Round %d\n\nGenerated by aeh from the discovery agent (profile %s) and the owner's answers. Do not edit by hand.\n", r.N, r.Profile)
 	if r.Kind == roundBook {
-		b.WriteString("\nThe agent proposed a draft book. Drafts are not features: they claim no paths until the owner promotes one.\n\n")
+		b.WriteString("\nThe agent proposed a draft book in this session's directory. Drafts are not features: they claim no paths until the owner promotes one.\n\n")
 		for _, f := range r.Files {
-			fmt.Fprintf(&b, "- [%s](../%s)\n", f, f)
+			fmt.Fprintf(&b, "- %s\n", f)
 		}
 		return b.String()
 	}

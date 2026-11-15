@@ -187,6 +187,10 @@ func checkDisplayLine(s string, maxBytes int) error {
 	if strings.TrimSpace(s) == "" {
 		return artifactError(s, 0, "single-line fields must be non-empty after trimming")
 	}
+	// A single line is shown inside other text, so it cannot open a fence that exempts it.
+	if t := strings.TrimLeft(s, " "); strings.HasPrefix(t, "```") || strings.HasPrefix(t, "~~~") {
+		return artifactError(s, 0, "single-line fields must not start with a code fence")
+	}
 	return checkDisplayMarkdown(s, maxBytes)
 }
 
@@ -238,6 +242,24 @@ func findSecrets(b []byte) []secretFinding {
 		findings = append(findings, secretFinding{Line: line, Kind: m.kind})
 	}
 	return findings
+}
+
+// redactDiagnostic makes a diagnostic safe to show, store and send back to an agent: every
+// recognized secret is replaced by its kind, and control, bidi and format characters other
+// than LF become "?".
+func redactDiagnostic(s string) string {
+	for _, p := range artifactSecretPatterns {
+		s = p.re.ReplaceAllString(s, "[redacted "+p.kind+"]")
+	}
+	return strings.Map(func(r rune) rune {
+		if r == '\n' {
+			return r
+		}
+		if r == utf8.RuneError || unicode.IsControl(r) || isArtifactBidi(r) || unicode.Is(unicode.Cf, r) {
+			return '?'
+		}
+		return r
+	}, strings.ToValidUTF8(s, "?"))
 }
 
 func checkNoSecrets(name string, b []byte) error {

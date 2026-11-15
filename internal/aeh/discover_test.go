@@ -263,6 +263,31 @@ func TestDiscoveryRejectsSecretsAndUnsafeText(t *testing.T) {
 	}
 }
 
+func TestDiscoveryLadderResetsEachRound(t *testing.T) {
+	endToEnd(t)
+	f := newDiscoveryFixture(t, askTwo)
+	if _, err := DiscoverNew(f.repo, "shop", "A shop."); err != nil {
+		t.Fatal(err)
+	}
+	for round := 1; round <= 3; round++ {
+		st := f.run()
+		if st.Status != "" || len(st.Rounds) != round {
+			t.Fatalf("round %d did not run: %+v", round, st)
+		}
+		if _, err := DiscoverAnswer(f.repo, "shop", fmt.Sprintf("R%d-Q1", round), "Consumers"); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestRedactDiagnostic(t *testing.T) {
+	secret := "ghp_" + strings.Repeat("B", 36)
+	got := redactDiagnostic("x" + secret + ".md\x1b[2J\u202e is not an expected file\nline two")
+	if strings.Contains(got, secret) || strings.ContainsAny(got, "\x1b\u202e") || !strings.Contains(got, "[redacted GitHub token]") || !strings.Contains(got, "\nline two") {
+		t.Fatalf("redacted: %q", got)
+	}
+}
+
 func TestParseDiscoveryQuestions(t *testing.T) {
 	ok := "questions:\n  - text: \"A?\"\n    why: \"B\"\n    blocking: false\n"
 	if q, err := parseDiscoveryQuestions([]byte(ok), 3, 2); err != nil || q[0].ID != "R3-Q1" || q[0].Blocking {
@@ -276,6 +301,9 @@ func TestParseDiscoveryQuestions(t *testing.T) {
 		"html":          "questions:\n  - {text: \"<b>a</b>\", why: b, blocking: true}\n",
 		"empty why":     "questions:\n  - {text: a, why: \" \", blocking: true}\n",
 		"many options":  "questions:\n  - {text: a, why: b, blocking: true, options: [1,2,3,4,5,6,7]}\n",
+		"yaml escape":   "questions:\n  - {text: \"\\x67hp_" + strings.Repeat("A", 36) + "\", why: b, blocking: true}\n",
+		"fence why":     "questions:\n  - {text: a, why: '~~~<img src=\"https://x.invalid/p\">', blocking: true}\n",
+		"fence text":    "questions:\n  - {text: '```', why: b, blocking: true}\n",
 	} {
 		if _, err := parseDiscoveryQuestions([]byte(src), 1, 2); err == nil {
 			t.Errorf("%s: accepted", name)
@@ -373,6 +401,49 @@ func TestDiscoveryFinishesPendingImport(t *testing.T) {
 	}
 	if st, _, _ := LoadDiscovery(f.repo, "shop"); st.Pending != nil || st.Phase != DiscoveryReady {
 		t.Fatalf("state after recovery: %+v", st)
+	}
+	// A crash in the middle of an import leaves the batch's own bytes and log entry on disk:
+	// the next command discards exactly those and imports the batch.
+	memoryWriteFile = func(p string, b []byte) error { return errors.New("disk full") }
+	_, err = DiscoverAnswer(f.repo, "shop", "R1-Q1", "Consumers, crashed")
+	memoryWriteFile = writeFileAtomic
+	if err == nil {
+		t.Fatal("expected the write to fail")
+	}
+	st, _, _ = LoadDiscovery(f.repo, "shop")
+	for rel, b := range st.Pending.Files {
+		write(t, mem, rel, string(b))
+	}
+	logBefore := f.memFile("wiki/log.md")
+	write(t, mem, "wiki/log.md", logBefore+"\n## [2026-11-13] import | discover/shop | "+st.Pending.Log+"\n")
+	if st, err := DiscoverAnswer(f.repo, "shop", "R1-Q2", "No coupons"); err != nil || st.Pending != nil {
+		t.Fatalf("recovery after a crash: %v %+v", err, st.Pending)
+	}
+	if round := f.memFile("wiki/discovery/shop/rounds/01.md"); !strings.Contains(round, "Consumers, crashed") || !strings.Contains(round, "No coupons") {
+		t.Fatalf("rounds/01.md:\n%s", round)
+	}
+	if err := memoryClean(mem); err != nil {
+		t.Fatal(err)
+	}
+	// Dirt that is not the batch's own stays for the owner.
+	memoryWriteFile = func(p string, b []byte) error { return errors.New("disk full") }
+	_, err = DiscoverAnswer(f.repo, "shop", "R1-Q1", "Consumers, again")
+	memoryWriteFile = writeFileAtomic
+	if err == nil {
+		t.Fatal("expected the write to fail")
+	}
+	write(t, mem, "wiki/scratch.md", "owner draft\n")
+	if _, err := DiscoverAnswer(f.repo, "shop", "R1-Q2", "x"); !errors.Is(err, ErrMemoryDirty) {
+		t.Fatalf("expected dirty memory, got %v", err)
+	}
+	if got := f.memFile("wiki/scratch.md"); got != "owner draft\n" {
+		t.Fatalf("an owner file was discarded: %q", got)
+	}
+	if err := os.Remove(filepath.Join(mem, "wiki", "scratch.md")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DiscoverSkip(f.repo, "shop", "R1-Q2"); err == nil {
+		t.Fatal("an answered question was skipped")
 	}
 	// The owner's commit touched a batch file: aeh does not move the batch over it.
 	memoryWriteFile = func(p string, b []byte) error { return errors.New("disk full") }
