@@ -784,8 +784,9 @@ func (p *planner) attempt(ctx context.Context, a *PlanAttempt, feedback string) 
 	switch planVerdict(string(out)) {
 	case "TOO-LARGE":
 		a.FailedStep, a.Feedback = "author", "the author says the new criteria do not fit one task:\n"+tail(string(out), 2000)
-		return fmt.Sprintf("The plan author says the new criteria of %s %s do not fit one task of %d changed lines:\n%s\nSplit the spec into smaller versions (approve fewer new criteria at a time), or answer to retry.",
-			st.Feature, st.SpecVersion, p.pcfg.MaxDiffLines, tail(string(out), 1500)), nil
+		// Blocked in the same save as the attempt: the owner's pause cannot be lost to a crash.
+		return p.blockNow(fmt.Sprintf("The plan author says the new criteria of %s %s do not fit one task of %d changed lines:\n%s\nSplit the spec into smaller versions (approve fewer new criteria at a time), or answer to retry.",
+			st.Feature, st.SpecVersion, p.pcfg.MaxDiffLines, tail(string(out), 1500))), nil
 	case "READY":
 	default:
 		return fail("author", `the author's output must end with "PLAN: READY" or "PLAN: TOO-LARGE"`)
