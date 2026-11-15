@@ -382,8 +382,9 @@ func (p *planner) checkCollisions(id string) error {
 		}
 		for _, e := range entries {
 			for _, ext := range exts {
-				name := strings.TrimSuffix(e.Name(), ext)
-				if name != e.Name() && same(name) && !(ext == ".lock" && e.Name() == id+".lock") {
+				folded := strings.ToLower(e.Name())
+				name := strings.TrimSuffix(folded, ext)
+				if name != folded && same(name) && !(ext == ".lock" && e.Name() == id+".lock") {
 					return fmt.Errorf("outcome ID %s is already used by %s", id, filepath.Join(dir, e.Name()))
 				}
 			}

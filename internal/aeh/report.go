@@ -26,6 +26,23 @@ func (ru *runner) writeReport() string {
 	if st.TriageWorktree != "" {
 		fmt.Fprintf(&b, "Retained triage worktree: `%s`\n\n", st.TriageWorktree)
 	}
+	if ru.generated != nil {
+		p := ru.generated.Plan
+		fmt.Fprintf(&b, "## Plan\n\nPlan commit: `%s` · Test author: `%s` · sealed by runner\n\n", p.PlanCommit, p.Author)
+		b.WriteString("Plan checks:\n\n")
+		for _, c := range p.Checks {
+			status := "FAIL"
+			if c.Passed {
+				status = "ok"
+			}
+			fmt.Fprintf(&b, "- %s: %s %s\n", c.Name, status, c.Detail)
+		}
+		b.WriteString("\nPlan reviews:\n\n")
+		for _, v := range p.Reviews {
+			fmt.Fprintf(&b, "- Role: **%s** · Profile: `%s` · Provider: `%s` · SHA: `%s` · Verdict: **%s**\n", v.Role, v.Profile, v.Provider, v.SHA, v.Verdict)
+		}
+		b.WriteString("\nThese checks and declared traceability are evidence, not proof of semantic coverage; independent reviewers judge why each test fails.\n\n")
+	}
 	if o.Feature != "" {
 		fmt.Fprintf(&b, "Declared feature: `%s` · Change: `%s`\n\n", o.Feature, o.Change)
 		if result := ru.memoryRecordSummary(); result != "" {

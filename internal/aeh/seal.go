@@ -104,6 +104,11 @@ func hashPaths(dir string, paths []string) (string, []SealFile, error) {
 
 // ApproveTests seals the outcome's acceptance tests as they are now in the working tree.
 func ApproveTests(r Repo, id string) (Seal, error) {
+	if _, generated, err := LoadPlanState(r, id); err != nil {
+		return Seal{}, err
+	} else if generated {
+		return Seal{}, fmt.Errorf("outcome %s is generated; its tests are sealed by runner during aeh plan", id)
+	}
 	o, err := r.LoadOutcome(id)
 	if err != nil {
 		return Seal{}, err

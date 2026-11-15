@@ -116,6 +116,54 @@ func gateSealedTree(root, base, commit string, paths []string) GateResult {
 	return g
 }
 
+// sealedGitContents reads a complete manifest from Git objects, including file types.
+// Literal pathspecs prevent a filename in a prior implementation from widening the check.
+func sealedGitContents(root, commit string, paths []string) (map[string][]byte, error) {
+	args := append([]string{"--literal-pathspecs", "ls-tree", "-r", "-z", commit, "--"}, paths...)
+	out, err := git(root, args...)
+	if err != nil {
+		return nil, err
+	}
+	contents := map[string][]byte{}
+	for _, entry := range strings.Split(out, "\x00") {
+		if entry == "" {
+			continue
+		}
+		meta, file, ok := strings.Cut(entry, "\t")
+		fields := strings.Fields(meta)
+		if !ok || len(fields) != 3 || fields[1] != "blob" || (fields[0] != "100644" && fields[0] != "100755") {
+			return nil, fmt.Errorf("sealed entry is not a regular file: %s", file)
+		}
+		b, ok := gitBlob(root, commit, file)
+		if !ok {
+			return nil, fmt.Errorf("read sealed file %s at %s", file, commit)
+		}
+		contents[file] = []byte(b)
+	}
+	if len(contents) == 0 {
+		return nil, errors.New("sealed paths contain no files")
+	}
+	return contents, nil
+}
+
+// gateSealedManifest checks the original manifest, never the immediate candidate base.
+// Listing the whole acceptance directory also detects newly added files.
+func gateSealedManifest(root, commit string, seal Seal, paths []string) GateResult {
+	g := GateResult{Name: "hash"}
+	contents, err := sealedGitContents(root, commit, paths)
+	if err != nil {
+		g.Output = "acceptance tests unreadable: " + err.Error()
+		return g
+	}
+	actual := sealFromContents(seal.Outcome, contents, seal.SpecContent, seal.ApprovedAt)
+	if actual.Hash != seal.Hash {
+		g.Output = "acceptance tests were modified; they are sealed and must not change"
+		return g
+	}
+	g.Passed = true
+	return g
+}
+
 // gateScope fails if the change touches protected paths, leaves the task's paths, or is too large.
 func gateScope(changes []fileChange, protected, allowed []string, maxLines int) GateResult {
 	g := GateResult{Name: "scope"}
