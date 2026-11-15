@@ -83,6 +83,10 @@ func freezeOutput(dir string, m outputManifest) (frozenOutput, error) {
 		return frozenOutput{}, fmt.Errorf("%s output: %w", m.Name, err)
 	}
 	defer root.Close()
+	// OpenRoot follows a link; the root must be the very directory Lstat described.
+	if opened, err := root.Stat("."); err != nil || !os.SameFile(fi, opened) {
+		return frozenOutput{}, fmt.Errorf("%s output: %s changed while aeh was opening it", m.Name, dir)
+	}
 	files := map[string][]byte{}
 	var total int64
 	err = fs.WalkDir(root.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
@@ -420,8 +424,8 @@ func importMemoryBatch(r Repo, b memoryBatch) (commit string, imported bool, err
 	if _, sha, ok, err := findRecord(dir, marker); err != nil {
 		return "", false, err
 	} else if ok {
-		// The marker only counts when its commit really holds the batch.
-		if err := verifyImported(dir, sha, b.Files); err != nil {
+		// The marker only counts when its commit is exactly this batch on its expected base.
+		if err := verifyImported(dir, sha, b); err != nil {
 			return "", false, fmt.Errorf("import %s: memory commit %s carries this batch's marker but %w; check the memory repository by hand", b.Session, short(sha), err)
 		}
 		return sha, false, nil
@@ -471,26 +475,26 @@ func importMemoryBatch(r Repo, b memoryBatch) (commit string, imported bool, err
 	if err != nil {
 		return "", false, fmt.Errorf("import %s: %w", b.Session, err)
 	}
-	// Files the batch left untouched come from the parent, so the parent must be the expected
-	// head and every batch file must read as the batch says. A retry re-checks this too.
-	parent, err := git(dir, "rev-parse", commit+"^")
-	if err == nil && parent != b.ExpectedHead {
-		err = fmt.Errorf("its parent is %s, not %s", short(parent), short(b.ExpectedHead))
-	}
-	if err == nil {
-		err = verifyImported(dir, commit, b.Files)
-	}
-	if err != nil {
+	// Files the batch left untouched come from the parent. A retry runs the same check.
+	if err := verifyImported(dir, commit, b); err != nil {
 		return "", false, fmt.Errorf("import %s: memory commit %s %w; check the memory repository by hand", b.Session, short(commit), err)
 	}
 	return commit, true, nil
 }
 
-// verifyImported checks that commit holds every batch file with the batch's exact bytes.
-func verifyImported(dir, commit string, files map[string][]byte) error {
-	for _, rel := range sortedKeys(files) {
+// verifyImported checks that commit's only parent is the batch's expected head and that it holds
+// every batch file with the batch's exact bytes.
+func verifyImported(dir, commit string, b memoryBatch) error {
+	parents, err := git(dir, "rev-list", "--parents", "-n", "1", commit)
+	if err != nil {
+		return fmt.Errorf("cannot be read: %w", err)
+	}
+	if got := strings.Fields(parents); len(got) != 2 || got[1] != b.ExpectedHead {
+		return fmt.Errorf("is not a single commit on top of %s", short(b.ExpectedHead))
+	}
+	for _, rel := range sortedKeys(b.Files) {
 		got, ok := gitBlob(dir, commit, rel)
-		if !ok || got != string(files[rel]) {
+		if !ok || got != string(b.Files[rel]) {
 			return fmt.Errorf("does not hold %s as the batch wrote it", rel)
 		}
 	}

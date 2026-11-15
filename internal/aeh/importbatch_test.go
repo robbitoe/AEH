@@ -351,6 +351,24 @@ func TestImportBatchMarkerNeedsContent(t *testing.T) {
 	}
 }
 
+// The right bytes on the wrong base are not the import either: files the batch did not name
+// would come from a commit the batch was never checked against.
+func TestImportBatchMarkerNeedsExpectedParent(t *testing.T) {
+	r := newMemoryProject(t)
+	dir := memDir(t, r)
+	b := memoryBatch{Session: "discover/shop", ExpectedHead: memoryHead(t, r), Subject: "s", Log: "l",
+		Files: map[string][]byte{"wiki/discovery/shop/idea.md": []byte("real\n")}}
+	write(t, dir, "wiki/notes.md", "someone else\n")
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "between")
+	write(t, dir, "wiki/discovery/shop/idea.md", "real\n")
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "import", "-m", importMarker(b.Session, batchDigest(b.Files)))
+	if _, _, err := importMemoryBatch(r, b); err == nil || !strings.Contains(err.Error(), "not a single commit on top of") {
+		t.Fatalf("expected a wrong-parent error, got %v", err)
+	}
+}
+
 const importedSpec = "---\nfeature: shop\ntitle: Shop\nversion: 0.1.0\npaths: [src/shop/**]\n---\n# Shop\n\nSell things.\n\n" +
 	"## Changelog\n- 0.1.0 (2026-11-13) created; not implemented yet.\n"
 
