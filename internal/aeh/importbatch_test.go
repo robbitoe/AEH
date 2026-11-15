@@ -36,13 +36,55 @@ func writeOutput(t *testing.T, files map[string]string) string {
 	return dir
 }
 
+// freezeDir opens dir as a root, as aeh does before an agent runs, and freezes it.
+func freezeDir(t *testing.T, dir string, m outputManifest) (frozenOutput, error) {
+	t.Helper()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	return freezeOutput(root, m)
+}
+
+// The root opened before the agent runs keeps reading the original directory, even when the
+// agent moves it away and puts a link to another directory in its place.
+func TestFreezeOutputKeepsTheOpenedDirectory(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "runs", "out")
+	root, err := openOutputDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if _, err := openOutputDir(dir); err == nil {
+		t.Fatal("an existing output directory was reused")
+	}
+	write(t, dir, "questions.yaml", "q: 1\n")
+	outside := t.TempDir()
+	write(t, outside, "questions.yaml", "q: outside\n")
+	if err := os.Rename(filepath.Join(parent, "runs"), filepath.Join(parent, "moved")); err != nil {
+		t.Skipf("cannot move an open directory here: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(parent, "runs")); err != nil {
+		t.Logf("no link in place (%v); the move alone still tests the handle", err)
+	}
+	f, err := freezeOutput(root, roundManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(f.Files["questions.yaml"]); got != "q: 1\n" {
+		t.Fatalf("froze %q, not the original directory", got)
+	}
+}
+
 func TestFreezeOutputAndReload(t *testing.T) {
 	dir := writeOutput(t, map[string]string{
 		"questions.yaml":         "questions:\n  - id: R1-Q1\n",
 		"features/cart.md":       "# Cart\n",
 		"mockups/cart/list.html": "<p>Cart</p>\n",
 	})
-	f, err := freezeOutput(dir, roundManifest)
+	f, err := freezeDir(t, dir, roundManifest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +93,7 @@ func TestFreezeOutputAndReload(t *testing.T) {
 	}
 	// The snapshot is independent of the directory: later edits do not reach it.
 	write(t, dir, "features/cart.md", "# Changed\n")
-	if again, err := freezeOutput(dir, roundManifest); err != nil || again.Digest == f.Digest {
+	if again, err := freezeDir(t, dir, roundManifest); err != nil || again.Digest == f.Digest {
 		t.Fatalf("an edited output must freeze to another digest: %v", err)
 	}
 
@@ -127,7 +169,7 @@ func TestFreezeOutputRejects(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			_, err := freezeOutput(writeOutput(t, c.files), roundManifest)
+			_, err := freezeDir(t, writeOutput(t, c.files), roundManifest)
 			if err == nil || !strings.Contains(err.Error(), c.want) {
 				t.Fatalf("want %q, got %v", c.want, err)
 			}
@@ -163,7 +205,7 @@ func TestFreezeOutputRejectsLinks(t *testing.T) {
 	if err := os.Symlink(target, filepath.Join(dir, "features", "a.md")); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
-	if _, err := freezeOutput(dir, roundManifest); err == nil || !strings.Contains(err.Error(), "link") {
+	if _, err := freezeDir(t, dir, roundManifest); err == nil || !strings.Contains(err.Error(), "link") {
 		t.Fatalf("expected a link error, got %v", err)
 	}
 }
@@ -184,7 +226,7 @@ func TestFreezeOutputRejectsJunctions(t *testing.T) {
 	if out, err := exec.Command("cmd", "/C", "mklink", "/J", filepath.Join(dir, "mockups", "x"), outside).CombinedOutput(); err != nil {
 		t.Skipf("mklink /J: %v %s", err, out)
 	}
-	if _, err := freezeOutput(dir, roundManifest); err == nil || !strings.Contains(err.Error(), "reparse point") {
+	if _, err := freezeDir(t, dir, roundManifest); err == nil || !strings.Contains(err.Error(), "reparse point") {
 		t.Fatalf("expected a reparse point error, got %v", err)
 	}
 }

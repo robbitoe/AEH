@@ -68,28 +68,44 @@ var reservedOutputNames = map[string]bool{
 	approvalFile: true, implementedFile: true, "index.md": true, "log.md": true, "schema.md": true,
 }
 
-// freezeOutput reads dir against the manifest and returns its accepted bytes. Every read goes
-// through an os.Root, so a directory swapped for a link while aeh walks cannot lead outside dir.
-func freezeOutput(dir string, m outputManifest) (frozenOutput, error) {
+// openOutputDir creates a new, empty output directory for an agent and opens it as a root.
+// aeh opens it before the agent runs and freezes through that same handle afterwards, so no
+// later path lookup, of the directory or of its ancestors, decides what aeh reads.
+func openOutputDir(dir string) (*os.Root, error) {
+	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
+		return nil, fmt.Errorf("output directory: %w", err)
+	}
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("output directory: %w", err)
+	}
 	fi, err := os.Lstat(dir)
 	if err != nil {
-		return frozenOutput{}, fmt.Errorf("%s output: %w", m.Name, err)
+		return nil, fmt.Errorf("output directory: %w", err)
 	}
 	if !fi.IsDir() || fi.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
-		return frozenOutput{}, fmt.Errorf("%s output: %s must be a plain directory", m.Name, dir)
+		return nil, fmt.Errorf("output directory: %s must be a plain directory", dir)
 	}
 	root, err := os.OpenRoot(dir)
 	if err != nil {
-		return frozenOutput{}, fmt.Errorf("%s output: %w", m.Name, err)
+		return nil, fmt.Errorf("output directory: %w", err)
 	}
-	defer root.Close()
-	// OpenRoot follows a link; the root must be the very directory Lstat described.
 	if opened, err := root.Stat("."); err != nil || !os.SameFile(fi, opened) {
-		return frozenOutput{}, fmt.Errorf("%s output: %s changed while aeh was opening it", m.Name, dir)
+		root.Close()
+		return nil, fmt.Errorf("output directory: %s changed while aeh was opening it", dir)
+	}
+	return root, nil
+}
+
+// freezeOutput reads an output directory, through the root aeh opened before the agent ran,
+// against the manifest and returns its accepted bytes. Every lookup goes through the root, so
+// nothing the agent renames or links can lead outside the directory.
+func freezeOutput(root *os.Root, m outputManifest) (frozenOutput, error) {
+	if fi, err := root.Stat("."); err != nil || !fi.IsDir() {
+		return frozenOutput{}, fmt.Errorf("%s output: %s is no longer a directory", m.Name, root.Name())
 	}
 	files := map[string][]byte{}
 	var total int64
-	err = fs.WalkDir(root.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
+	err := fs.WalkDir(root.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
