@@ -400,53 +400,24 @@ func (d *discoverySession) memRel(name string) string {
 // record saves the state change together with the memory batch that records it, then imports
 // the batch. A crash after the save is finished by the next discovery command.
 func (d *discoverySession) record(files map[string][]byte, subject, log string) error {
-	for _, rel := range sortedKeys(files) {
-		if err := checkNoSecrets(rel, files[rel]); err != nil {
-			return fmt.Errorf("discover %s: %w", d.state.Slug, err)
-		}
-		if strings.HasSuffix(rel, ".md") {
-			if err := checkDisplayMarkdown(string(files[rel]), 1<<20); err != nil {
-				return fmt.Errorf("discover %s: %s: %w", d.state.Slug, rel, err)
-			}
-		}
-	}
-	head, err := git(d.memDir, "rev-parse", "HEAD")
+	p, err := newPendingImport(d.memDir, files, subject, log)
 	if err != nil {
 		return fmt.Errorf("discover %s: %w", d.state.Slug, err)
 	}
-	d.state.Pending = &pendingImport{Files: files, ExpectedHead: head, Subject: subject, Log: log}
+	d.state.Pending = p
 	if err := d.save(); err != nil {
 		return err
 	}
 	return d.finishPending()
 }
 
-// finishPending imports a saved batch. If the owner committed to memory in between without
-// touching the batch's files, the batch moves onto the new HEAD; otherwise the owner decides.
+// finishPending imports the saved batch, if any.
 func (d *discoverySession) finishPending() error {
-	p := d.state.Pending
-	if p == nil {
+	if d.state.Pending == nil {
 		return nil
 	}
-	b := memoryBatch{Session: "discover/" + d.state.Slug, ExpectedHead: p.ExpectedHead, Files: p.Files, Subject: p.Subject, Log: p.Log}
-	_, _, err := importMemoryBatch(d.repo, b)
-	if errors.Is(err, ErrMemoryChanged) {
-		head, herr := git(d.memDir, "rev-parse", "HEAD")
-		if herr != nil {
-			return herr
-		}
-		if touched := batchFilesChanged(d.memDir, p.ExpectedHead, head, p.Files); touched != "" {
-			return fmt.Errorf("discover %s: memory changed %s since aeh prepared this step; restore it or commit it back, then run the discovery command again", d.state.Slug, touched)
-		}
-		p.ExpectedHead = head
-		if err := d.save(); err != nil {
-			return err
-		}
-		b.ExpectedHead = head
-		_, _, err = importMemoryBatch(d.repo, b)
-	}
-	if err != nil {
-		return err
+	if err := finishImport(d.repo, d.memDir, "discover/"+d.state.Slug, d.state.Pending, d.save); err != nil {
+		return fmt.Errorf("discover %s: %w", d.state.Slug, err)
 	}
 	d.state.Pending = nil
 	return d.save()
@@ -470,12 +441,7 @@ func (d *discoverySession) resume() error {
 	if d.state == nil {
 		return fmt.Errorf("discovery does not exist; start it with: aeh discover new <slug> \"<idea>\"")
 	}
-	if d.state.Pending != nil {
-		if err := discardPartialImport(d.memDir, d.state.Pending, "discover/"+d.state.Slug); err != nil {
-			return fmt.Errorf("discover %s: %w", d.state.Slug, err)
-		}
-	}
-	if err := memoryClean(d.memDir); err != nil {
+	if err := recoverPending(d.memDir, "discover/"+d.state.Slug, d.state.Pending); err != nil {
 		return fmt.Errorf("discover %s: %w", d.state.Slug, err)
 	}
 	return d.finishPending()

@@ -35,6 +35,11 @@ Discovery (from an idea to a draft book of specs in memory)
   aeh discover accept <slug> vision|data
                                     accept an advisory document (existing documents use .next.md)
 
+Adoption (an existing system, area by area)
+  aeh adopt show <feature>          observations of an area, with their state and decision token
+  aeh adopt confirm <feature> AC-<n> keep|bug|drop --seen <token>
+                                    decide on an observation as you saw it
+
 Definition
   aeh tests approve <ID>            seal the outcome's acceptance tests
   aeh plan <feature>                write, check, review and seal acceptance tests and one task
@@ -149,6 +154,9 @@ func dispatch(ctx context.Context, args []string) (int, error) {
 
 	case "discover":
 		return discoverCommand(ctx, repo, args[1:])
+
+	case "adopt":
+		return adoptCommand(repo, args[1:])
 
 	case "plan":
 		if len(args) != 2 {
@@ -304,6 +312,51 @@ func memoryCommand(repo aeh.Repo, args []string) (int, error) {
 		return 0, nil
 	}
 	return 2, fmt.Errorf("unknown memory command %q; run `aeh help`", args[0])
+}
+
+func adoptCommand(repo aeh.Repo, args []string) (int, error) {
+	if len(args) < 2 {
+		return 2, errors.New("usage: aeh adopt show|confirm <feature> ...")
+	}
+	feature := args[1]
+	switch args[0] {
+	case "show":
+		if len(args) != 2 {
+			return 2, errors.New("usage: aeh adopt show <feature>")
+		}
+		area, err := aeh.LoadAdoptArea(repo, feature)
+		if err != nil {
+			return 1, err
+		}
+		fmt.Printf("area %s: %s\n  paths: %s\n", area.Feature, area.Title, strings.Join(area.Paths, ", "))
+		for _, o := range area.Observations {
+			state := o.Status
+			if o.Decision != "" {
+				state += ", " + o.Decision
+			}
+			fmt.Printf("  AC-%d (%s) %s\n      observed at %s in %s\n", o.ID, state, o.Text, o.CodeSHA[:7], strings.Join(o.Locations, ", "))
+			if o.Status == aeh.ObservationActive {
+				fmt.Printf("      decide: aeh adopt confirm %s AC-%d keep|bug|drop --seen %s\n", area.Feature, o.ID, o.Token())
+			}
+		}
+		return 0, nil
+	case "confirm":
+		fs := flag.NewFlagSet("adopt confirm", flag.ContinueOnError)
+		seen := fs.String("seen", "", "the token aeh adopt show printed for the observation")
+		if err := fs.Parse(reorder(args[2:])); err != nil {
+			return 2, err
+		}
+		if fs.NArg() != 2 || *seen == "" {
+			return 2, errors.New("usage: aeh adopt confirm <feature> AC-<n> keep|bug|drop --seen <token>")
+		}
+		o, err := aeh.AdoptConfirm(repo, feature, fs.Arg(0), fs.Arg(1), *seen)
+		if err != nil {
+			return 1, err
+		}
+		fmt.Printf("AC-%d is %s (%s)\n", o.ID, o.Status, o.Decision)
+		return 0, nil
+	}
+	return 2, fmt.Errorf("unknown adopt command %q", args[0])
 }
 
 func discoverCommand(ctx context.Context, repo aeh.Repo, args []string) (int, error) {
