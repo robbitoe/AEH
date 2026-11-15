@@ -1,6 +1,7 @@
 package aeh
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,7 +11,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -126,6 +129,7 @@ type planner struct {
 	pcfg    PlanConfig
 	spec    Spec
 	memDir  string
+	owners  string // every feature's paths and the declared spec, as the run contract sees them
 	state   *PlanState
 	log     io.Writer
 	prompts map[string]string // plan.md, review-plan.md and review-<role>.md
@@ -142,6 +146,13 @@ func (p *planner) logf(format string, args ...any) {
 // lets a test author write acceptance tests and one task, checks and reviews the frozen
 // result, and publishes it on aeh/<ID>. Calling it again resumes an unfinished plan.
 func PlanFeature(ctx context.Context, r Repo, feature string, log io.Writer) (PlanState, error) {
+	// Plan state, locks, configuration and the base all come from the main checkout, also
+	// when aeh plan runs in a linked worktree, so every caller sees one plan.
+	main, err := MainCheckout(r)
+	if err != nil {
+		return PlanState{}, err
+	}
+	r = Repo{Root: main}
 	unlockProject, err := lockProject(r)
 	if err != nil {
 		return PlanState{}, err
@@ -161,9 +172,6 @@ func PlanFeature(ctx context.Context, r Repo, feature string, log io.Writer) (Pl
 	if !memory.Present {
 		return PlanState{}, errors.New("memory is not initialized; run: aeh memory init")
 	}
-	if err := memoryClean(memory.Dir); err != nil {
-		return PlanState{}, fmt.Errorf("plan %s: %w; commit your memory edits first", feature, err)
-	}
 	spec, ok := memory.Spec(feature)
 	if !ok {
 		return PlanState{}, fmt.Errorf("feature %q does not exist in memory", feature)
@@ -181,13 +189,20 @@ func PlanFeature(ctx context.Context, r Repo, feature string, log io.Writer) (Pl
 	}
 	defer unlock()
 
-	p := &planner{repo: r, cfg: cfg, pcfg: cfg.plan(), spec: spec, memDir: memory.Dir, log: log}
+	p := &planner{repo: r, cfg: cfg, pcfg: cfg.plan(), spec: spec, memDir: memory.Dir, log: log, owners: memory.ContractFingerprint(feature)}
 	if err := p.loadPrompts(); err != nil {
 		return PlanState{}, err
 	}
 	st, exists, err := LoadPlanState(r, id)
 	if err != nil {
 		return st, err
+	}
+	// Memory must be clean to reserve or to work before publication. After publication only
+	// the log entry is missing, and logMemory reconciles an interrupted write of it.
+	if !exists || st.Phase == PlanReserved || st.Phase == PlanAuthoring {
+		if err := memoryClean(memory.Dir); err != nil {
+			return st, fmt.Errorf("plan %s: %w; commit your memory edits first", feature, err)
+		}
 	}
 	if !exists {
 		st, err = p.reserve(id)
@@ -209,7 +224,11 @@ func PlanFeature(ctx context.Context, r Repo, feature string, log io.Writer) (Pl
 	if err != nil {
 		return st, err
 	}
-	if inputs != st.Inputs || st.SpecDigest != spec.Approval.Content {
+	prior, delta, err := p.currentDelta()
+	if err != nil {
+		return st, err
+	}
+	if inputs != st.Inputs || st.SpecDigest != spec.Approval.Content || prior != st.PriorCode || !sameDelta(delta, st.Delta) {
 		return st, p.restart("The plan's inputs changed since it was reserved (spec, configuration or prompts). " +
 			"Approve the spec as a new version, which gives the plan a new outcome ID, and run aeh plan again.")
 	}
@@ -288,28 +307,21 @@ func (p *planner) reserve(id string) (PlanState, error) {
 	if err := p.checkCollisions(id); err != nil {
 		return st, err
 	}
-	crit, _, err := checkSpecCriteria(p.memDir, p.spec)
-	if err != nil {
-		return st, fmt.Errorf("plan %s: acceptance criteria: %w", p.spec.Feature, err)
-	}
-	if len(crit) == 0 {
-		return st, fmt.Errorf("plan %s: the spec has no %q section; add criteria and approve it", p.spec.Feature, criteriaHeading)
-	}
 	base, err := headCommit(p.repo.Root)
 	if err != nil {
 		return st, err
 	}
 	st.Base = base
-	var last *Implementation
-	if im, ok := p.spec.LastImplementation(); ok {
-		last = &im
-		st.PriorCode = im.Code
-		if _, err := git(p.repo.Root, "merge-base", "--is-ancestor", im.Code, base); err != nil {
+	if st.PriorCode, st.Delta, err = p.currentDelta(); err != nil {
+		return st, err
+	}
+	last, hasLast := p.spec.LastImplementation()
+	if hasLast {
+		if _, err := git(p.repo.Root, "merge-base", "--is-ancestor", last.Code, base); err != nil {
 			return st, fmt.Errorf("plan %s: the last implementation (%s on %s) is not in the base %s; merge it first, then run aeh plan again",
-				p.spec.Feature, short(im.Code), IntegrationBranch(im.Outcome), short(base))
+				p.spec.Feature, short(last.Code), IntegrationBranch(last.Outcome), short(base))
 		}
 	}
-	st.Delta = criteriaDelta(crit, last)
 	switch {
 	case len(st.Delta.Changed) > 0 || len(st.Delta.Removed) > 0:
 		return st, fmt.Errorf("plan %s: criteria changed %v or removed %v since %s; replacing sealed tests is not supported yet. Restore them, or keep them and add new criteria",
@@ -318,7 +330,7 @@ func (p *planner) reserve(id string) (PlanState, error) {
 		return st, fmt.Errorf("plan %s: the approved spec adds no criteria; nothing to plan", p.spec.Feature)
 	}
 	st.Route = RouteChange
-	if last == nil {
+	if !hasLast {
 		st.Route = RouteNew
 	}
 	st.Roles = requiredRoles(st.Route)
@@ -328,6 +340,28 @@ func (p *planner) reserve(id string) (PlanState, error) {
 	p.state = &st
 	p.logf("%s: planning %s %s (%d new criteria, route %s, base %s)", id, p.spec.Feature, p.spec.Version, len(st.Delta.New), st.Route, short(base))
 	return st, savePlanState(p.repo, &st)
+}
+
+// currentDelta reads the approved criteria and the last implementation as memory has them now.
+func (p *planner) currentDelta() (string, CriteriaDelta, error) {
+	crit, _, err := checkSpecCriteria(p.memDir, p.spec)
+	if err != nil {
+		return "", CriteriaDelta{}, fmt.Errorf("plan %s: acceptance criteria: %w", p.spec.Feature, err)
+	}
+	if len(crit) == 0 {
+		return "", CriteriaDelta{}, fmt.Errorf("plan %s: the spec has no %q section; add criteria and approve it", p.spec.Feature, criteriaHeading)
+	}
+	im, ok := p.spec.LastImplementation()
+	if !ok {
+		return "", criteriaDelta(crit, nil), nil
+	}
+	return im.Code, criteriaDelta(crit, &im), nil
+}
+
+func sameDelta(a, b CriteriaDelta) bool {
+	x, _ := json.Marshal(a)
+	y, _ := json.Marshal(b)
+	return string(x) == string(y)
 }
 
 // checkCollisions refuses an ID that any outcome, state, seal, branch or test directory
@@ -363,9 +397,15 @@ func (p *planner) checkCollisions(id string) error {
 			return fmt.Errorf("outcome ID %s is already used by branch %s", id, ref)
 		}
 	}
-	tests, _ := git(p.repo.Root, "ls-tree", "-d", "--name-only", "HEAD", p.pcfg.AcceptanceDir+"/")
-	for _, d := range strings.Fields(tests) {
-		if same(filepath.Base(d)) {
+	tests, _ := git(p.repo.Root, "ls-tree", "-z", "-d", "--name-only", "HEAD", p.pcfg.AcceptanceDir+"/")
+	names := strings.Split(tests, "\x00")
+	if entries, err := os.ReadDir(filepath.Join(p.repo.Root, filepath.FromSlash(p.pcfg.AcceptanceDir))); err == nil {
+		for _, e := range entries {
+			names = append(names, e.Name()) // untracked or ignored directories count too
+		}
+	}
+	for _, d := range names {
+		if d != "" && same(path.Base(d)) {
 			return fmt.Errorf("outcome ID %s is already used by the test directory %s", id, d)
 		}
 	}
@@ -382,12 +422,14 @@ func (p *planner) inputsDigestFor(st *PlanState) (string, error) {
 		Delta             CriteriaDelta
 		Plan              PlanConfig
 		Commands          any
+		PassEnv           []string
+		Owners            string
 		Protected         []string
 		Rules             []TriageRule
 		Reviewers         ReviewerPolicy
 		Profiles          map[string]Profile
 		Prompts           map[string]string
-	}{st.Base, st.SpecDigest, st.PriorCode, st.Delta, p.pcfg, p.cfg.Commands, p.cfg.Protected, p.cfg.Triage.Rules, p.cfg.Reviewers, p.cfg.Profiles, p.prompts}
+	}{st.Base, st.SpecDigest, st.PriorCode, st.Delta, p.pcfg, p.cfg.Commands, p.cfg.PassEnv, p.owners, p.cfg.Protected, p.cfg.Triage.Rules, p.cfg.Reviewers, p.cfg.Profiles, p.prompts}
 	b, err := json.Marshal(v)
 	if err != nil {
 		return "", err
@@ -437,29 +479,63 @@ func (p *planner) preflight() error {
 }
 
 // acceptanceCommand runs the configured acceptance command on a runner-written manifest.
-func (p *planner) acceptanceCommand(ctx context.Context, name, wt, runDir string, files []string) (GateResult, error) {
-	manifest := filepath.Join(runDir, name+".manifest")
-	if err := os.MkdirAll(runDir, 0o700); err != nil {
+func (p *planner) acceptanceCommand(ctx context.Context, name, wt string, files []string) (GateResult, error) {
+	// The manifest is passed as a relative path made only of safe characters, so neither the
+	// repository's location nor a file name ever reaches the shell. It lives in the worktree's
+	// .aeh/, which memory's privacy rules require to be ignored, and is removed afterwards.
+	rel := ".aeh/manifest-" + name + ".txt"
+	if !safeManifestName.MatchString(rel) {
+		return GateResult{}, fmt.Errorf("unsafe manifest name %q", rel)
+	}
+	full := filepath.Join(wt, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
 		return GateResult{}, err
 	}
-	if err := os.WriteFile(manifest, []byte(strings.Join(files, "\n")+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(full, []byte(strings.Join(files, "\n")+"\n"), 0o600); err != nil {
 		return GateResult{}, err
 	}
-	command := strings.Replace(p.cfg.Commands.Acceptance, "{{manifest}}", filepath.ToSlash(manifest), 1)
+	defer os.Remove(full)
+	command := strings.Replace(p.cfg.Commands.Acceptance, "{{manifest}}", rel, 1)
 	return gateCommand(ctx, name, wt, command, p.timeout(), p.cfg.PassEnv), nil
 }
+
+var safeManifestName = regexp.MustCompile(`^\.aeh/manifest-[a-z0-9-]+\.txt$`)
 
 func (p *planner) timeout() time.Duration {
 	return time.Duration(p.cfg.Commands.TimeoutMinutes) * time.Minute
 }
 
-func (p *planner) unchangedTests() []string {
+// previousSuite lists the acceptance tests the base already has: every file under the
+// acceptance directory except plan files. The new tests are not in the base, so running this
+// manifest on the plan commit checks that the additions leave the previous suite green.
+func (p *planner) previousSuite() ([]string, error) {
+	out, err := git(p.repo.Root, "ls-tree", "-r", "-z", "--name-only", p.state.Base, "--", p.pcfg.AcceptanceDir+"/")
+	if err != nil {
+		return nil, err
+	}
 	var files []string
-	for _, c := range p.state.Delta.Unchanged {
-		files = append(files, c.Tests...)
+	for _, f := range strings.Split(out, "\x00") {
+		if f != "" && path.Base(f) != "plan.yaml" {
+			files = append(files, f)
+		}
 	}
 	sort.Strings(files)
-	return files
+	return files, nil
+}
+
+// freshWorktree checks out commit at path, first removing whatever an interrupted or answered
+// earlier run left there. The caller holds the project and outcome locks.
+func (p *planner) freshWorktree(wt, commit string) error {
+	if _, err := os.Stat(wt); err == nil {
+		removeWorktree(p.repo.Root, wt)
+		if err := os.RemoveAll(wt); err != nil {
+			return fmt.Errorf("remove stale worktree %s: %w", wt, err)
+		}
+	}
+	if err := addWorktreeDetached(p.repo.Root, wt, commit); err != nil {
+		return err
+	}
+	return verifyCheckout(wt, commit)
 }
 
 // baseline checks, before any agent runs, that the base builds, passes its tests and passes
@@ -469,7 +545,7 @@ func (p *planner) baseline(ctx context.Context) (bool, string, error) {
 	st := p.state
 	runDir := p.repo.RunDir(st.ID, "plan-baseline")
 	wt := p.repo.WorktreePath(st.ID + "-plan-baseline")
-	if err := addWorktreeDetached(p.repo.Root, wt, st.Base); err != nil {
+	if err := p.freshWorktree(wt, st.Base); err != nil {
 		return false, "", err
 	}
 	keep := false
@@ -478,9 +554,6 @@ func (p *planner) baseline(ctx context.Context) (bool, string, error) {
 			removeWorktree(p.repo.Root, wt)
 		}
 	}()
-	if err := verifyCheckout(wt, st.Base); err != nil {
-		return false, "", err
-	}
 	p.logf("  baseline on %s", short(st.Base))
 	steps := []func() (GateResult, error){
 		func() (GateResult, error) {
@@ -490,8 +563,12 @@ func (p *planner) baseline(ctx context.Context) (bool, string, error) {
 			return gateCommand(ctx, "test", wt, p.cfg.Commands.Test, p.timeout(), p.cfg.PassEnv), nil
 		},
 	}
-	if tests := p.unchangedTests(); len(tests) > 0 {
-		steps = append(steps, func() (GateResult, error) { return p.acceptanceCommand(ctx, "sealed", wt, runDir, tests) })
+	tests, err := p.previousSuite()
+	if err != nil {
+		return false, "", err
+	}
+	if len(tests) > 0 {
+		steps = append(steps, func() (GateResult, error) { return p.acceptanceCommand(ctx, "sealed", wt, tests) })
 	}
 	var results []GateResult
 	for _, step := range steps {
@@ -523,6 +600,20 @@ func (p *planner) baseline(ctx context.Context) (bool, string, error) {
 // failure as feedback, then the next profile; then the plan blocks with a question.
 func (p *planner) author(ctx context.Context) (bool, string, error) {
 	st := p.state
+	for i := range st.Attempts {
+		a := &st.Attempts[i]
+		if a.FailedStep == "running" {
+			a.FailedStep, a.Feedback = "interrupted", "the previous aeh plan stopped during this attempt"
+		}
+		// Worktrees kept for an uncertain step are released once the owner answered.
+		wt := p.repo.WorktreePath(fmt.Sprintf("%s-plan-a%d", st.ID, a.N))
+		for _, dir := range []string{wt, wt + "-verify"} {
+			if _, err := os.Stat(dir); err == nil {
+				removeWorktree(p.repo.Root, dir)
+				_ = os.RemoveAll(dir)
+			}
+		}
+	}
 	feedback := ""
 	if n := len(st.Attempts); n > 0 {
 		feedback = st.Attempts[n-1].Feedback
@@ -532,8 +623,13 @@ func (p *planner) author(ctx context.Context) (bool, string, error) {
 	}
 	for _, profile := range p.pcfg.Ladder {
 		for try := 0; try < 2; try++ {
-			a, question, err := p.attempt(ctx, len(st.Attempts)+1, profile, feedback)
-			st.Attempts = append(st.Attempts, a)
+			n := len(st.Attempts) + 1
+			st.Attempts = append(st.Attempts, PlanAttempt{N: n, Profile: profile, FailedStep: "running"})
+			if err := savePlanState(p.repo, st); err != nil {
+				return false, "", err
+			}
+			a, question, err := p.attempt(ctx, n, profile, feedback)
+			st.Attempts[n-1] = a
 			if serr := savePlanState(p.repo, st); serr != nil && err == nil {
 				err = serr
 			}
@@ -570,7 +666,7 @@ func (p *planner) attempt(ctx context.Context, n int, profile, feedback string) 
 		return a, "", nil
 	}
 	wt := r.WorktreePath(st.ID + "-" + name)
-	if err := addWorktreeDetached(r.Root, wt, st.Base); err != nil {
+	if err := p.freshWorktree(wt, st.Base); err != nil {
 		return a, "", err
 	}
 	keep := false
@@ -628,7 +724,7 @@ func (p *planner) attempt(ctx context.Context, n int, profile, feedback string) 
 	}
 	// Rules on the planned task's paths can raise the route and add reviewers before review.
 	route, roles := applyRules(st.Route, st.Roles, rulesForTasks(p.cfg.Triage.Rules, []Task{{ID: "T1", Paths: plan.Task.Paths}}))
-	frozen, err := p.freeze(wt, candidate, files, plan, route)
+	frozen, err := p.freeze(candidate, files, plan, route)
 	if err != nil {
 		return a, "", err
 	}
@@ -645,7 +741,7 @@ func (p *planner) attempt(ctx context.Context, n int, profile, feedback string) 
 	}
 
 	vwt := wt + "-verify"
-	if err := addWorktreeDetached(r.Root, vwt, frozen); err != nil {
+	if err := p.freshWorktree(vwt, frozen); err != nil {
 		return a, "", err
 	}
 	keepVerify := false
@@ -654,10 +750,7 @@ func (p *planner) attempt(ctx context.Context, n int, profile, feedback string) 
 			removeWorktree(r.Root, vwt)
 		}
 	}()
-	if err := verifyCheckout(vwt, frozen); err != nil {
-		return a, "", err
-	}
-	checks, step, msg, uncertain, err := p.redGreen(ctx, vwt, frozen, runDir, plan)
+	checks, step, msg, uncertain, err := p.redGreen(ctx, vwt, frozen, plan)
 	if err != nil {
 		return a, "", err
 	}
@@ -745,11 +838,11 @@ func planCandidateFiles(root, base, commit string) ([]PlanCandidateFile, error) 
 
 // freeze writes the generated outcome and the runner's seal next to the tests and commits
 // them as one commit on the base. That commit is what is checked, reviewed and published.
-func (p *planner) freeze(wt, candidate string, files []PlanCandidateFile, plan PlanFile, route string) (string, error) {
-	st := p.state
+func (p *planner) freeze(candidate string, files []PlanCandidateFile, plan PlanFile, route string) (string, error) {
+	st, root := p.state, p.repo.Root
 	contents := map[string][]byte{}
 	for _, f := range files {
-		b, ok := gitBlob(p.repo.Root, candidate, f.Path)
+		b, ok := gitBlob(root, candidate, f.Path)
 		if !ok {
 			return "", fmt.Errorf("read %s from the candidate", f.Path)
 		}
@@ -769,62 +862,114 @@ func (p *planner) freeze(wt, candidate string, files []PlanCandidateFile, plan P
 	if err != nil {
 		return "", err
 	}
-	for rel, b := range map[string][]byte{
+	generated := map[string][]byte{
 		"aeh/outcomes/" + st.ID + ".yaml": outcome,
 		"aeh/seals/" + st.ID + ".json":    append(sealJSON, '\n'),
-	} {
-		full := filepath.Join(wt, filepath.FromSlash(rel))
-		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-			return "", err
-		}
-		if err := os.WriteFile(full, b, 0o644); err != nil {
-			return "", err
-		}
 	}
-	frozen, err := candidateCommit(wt, st.Base, fmt.Sprintf("aeh: plan %s for %s %s\n\nAcceptance tests and one task for %s, sealed by aeh.",
-		st.ID, st.Feature, st.SpecVersion, strings.Join(ids, ", ")))
+	// Build the tree from the candidate's objects in a private index: nothing the author's
+	// worktree does after the candidate was captured can reach the plan commit.
+	tmp, err := os.MkdirTemp("", "aeh-plan-index-")
 	if err != nil {
 		return "", err
 	}
-	// The frozen commit adds exactly the candidate's files and the two generated ones.
-	got, err := planCandidateFiles(p.repo.Root, st.Base, frozen)
+	defer os.RemoveAll(tmp)
+	env := []string{"GIT_INDEX_FILE=" + filepath.Join(tmp, "index")}
+	if _, err := gitEnv(root, env, nil, "read-tree", candidate); err != nil {
+		return "", err
+	}
+	for rel, b := range generated {
+		sha, err := gitEnv(root, nil, b, "hash-object", "-w", "--no-filters", "--stdin")
+		if err != nil {
+			return "", err
+		}
+		if _, err := gitEnv(root, env, nil, "update-index", "--add", "--cacheinfo", "100644,"+sha+","+rel); err != nil {
+			return "", err
+		}
+	}
+	tree, err := gitEnv(root, env, nil, "write-tree")
 	if err != nil {
 		return "", err
 	}
-	want := map[string]bool{"aeh/outcomes/" + st.ID + ".yaml": true, "aeh/seals/" + st.ID + ".json": true}
+	msg := fmt.Sprintf("aeh: plan %s for %s %s\n\nAcceptance tests and one task for %s, sealed by aeh.", st.ID, st.Feature, st.SpecVersion, strings.Join(ids, ", "))
+	frozen, err := git(root, "-c", "user.name=aeh", "-c", "user.email=aeh@localhost", "-c", "commit.gpgsign=false", "commit-tree", tree, "-p", st.Base, "-m", msg)
+	if err != nil {
+		return "", err
+	}
+	// Verify the frozen commit: exactly the candidate's files with the same objects and modes,
+	// plus the two generated files with exactly the generated bytes.
+	got, err := planCandidateFiles(root, st.Base, frozen)
+	if err != nil {
+		return "", err
+	}
+	if len(got) != len(files)+len(generated) {
+		return "", fmt.Errorf("frozen plan commit changes %d paths, expected %d", len(got), len(files)+len(generated))
+	}
+	want := map[string]PlanCandidateFile{}
 	for _, f := range files {
-		want[f.Path] = true
-	}
-	if len(got) != len(want) {
-		return "", fmt.Errorf("frozen plan commit changes %d paths, expected %d", len(got), len(want))
+		want[f.Path] = f
 	}
 	for _, f := range got {
-		if !want[f.Path] || f.Status != 'A' {
+		if f.Status != 'A' {
 			return "", fmt.Errorf("frozen plan commit has unexpected change %c %s", f.Status, f.Path)
+		}
+		if b, ok := generated[f.Path]; ok {
+			if blob, ok := gitBlob(root, frozen, f.Path); !ok || blob != string(b) || f.Mode != "100644" {
+				return "", fmt.Errorf("frozen plan commit has unexpected content in %s", f.Path)
+			}
+			continue
+		}
+		c, ok := want[f.Path]
+		if !ok || c.Mode != f.Mode {
+			return "", fmt.Errorf("frozen plan commit has unexpected file %s", f.Path)
+		}
+		a, err1 := git(root, "rev-parse", candidate+":"+f.Path)
+		b, err2 := git(root, "rev-parse", frozen+":"+f.Path)
+		if err1 != nil || err2 != nil || a != b {
+			return "", fmt.Errorf("frozen plan commit changed %s from the checked candidate", f.Path)
 		}
 	}
 	return frozen, nil
+}
+
+// gitEnv runs git with extra environment variables and optional stdin.
+func gitEnv(dir string, env []string, stdin []byte, args ...string) (string, error) {
+	cmd := exec.Command("git", append(append([]string{}, gitSafety...), args...)...)
+	cmd.Dir = dir
+	cmd.Env = append(commandEnv(nil), env...)
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("git %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(errb.String()))
+	}
+	return strings.TrimSpace(out.String()), nil
 }
 
 // redGreen checks the frozen commit: it builds, every new test file fails on its own (the
 // feature does not exist yet), and the sealed tests of unchanged criteria still pass. Each
 // command runs in the verify worktree, whose checkout must stay intact even when a command
 // fails as expected. A failure is evidence, not proof: the reviewer judges why it fails.
-func (p *planner) redGreen(ctx context.Context, wt, commit, runDir string, plan PlanFile) ([]PlanCheckEntry, string, string, bool, error) {
+func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile) ([]PlanCheckEntry, string, string, bool, error) {
 	var checks []PlanCheckEntry
-	run := func(g GateResult) (GateResult, error) {
-		if err := verifyCheckout(wt, commit); err != nil {
-			return g, fmt.Errorf("plan check %s modified the checkout: %w", g.Name, err)
+	// settle reports, in this order: an uncertain end (timeout or cancellation: block and keep
+	// the worktree, whatever else happened), then damage to the checkout (a failed attempt).
+	settle := func(g GateResult) (uncertain bool, damaged string) {
+		if g.Uncertain {
+			return true, ""
 		}
-		return g, nil
+		if err := verifyCheckout(wt, commit); err != nil {
+			return false, fmt.Sprintf("%s modified the checkout: %v", g.Name, err)
+		}
+		return false, ""
 	}
-	g, err := run(gateCommand(ctx, "build", wt, p.cfg.Commands.Build, p.timeout(), p.cfg.PassEnv))
-	if err != nil {
-		return checks, "build", err.Error(), false, nil
-	}
-	checks = append(checks, PlanCheckEntry{Name: "build", Passed: g.Passed})
-	if g.Uncertain {
+	g := gateCommand(ctx, "build", wt, p.cfg.Commands.Build, p.timeout(), p.cfg.PassEnv)
+	checks = append(checks, PlanCheckEntry{Name: "build", Passed: g.Passed && !g.Uncertain})
+	if uncertain, damaged := settle(g); uncertain {
 		return checks, "build", g.Output, true, nil
+	} else if damaged != "" {
+		return checks, "build", damaged, false, nil
 	}
 	if !g.Passed {
 		return checks, "build", "the build fails with the new tests:\n" + g.Output, false, nil
@@ -842,35 +987,37 @@ func (p *planner) redGreen(ctx context.Context, wt, commit, runDir string, plan 
 	}
 	sort.Strings(files)
 	for i, f := range files {
-		g, err := p.acceptanceCommand(ctx, fmt.Sprintf("red-%d", i+1), wt, runDir, []string{dir + f})
+		g, err := p.acceptanceCommand(ctx, fmt.Sprintf("red-%d", i+1), wt, []string{dir + f})
 		if err != nil {
 			return checks, "", "", false, err
 		}
-		if g, err = run(g); err != nil {
-			return checks, "red", err.Error(), false, nil
-		}
-		checks = append(checks, PlanCheckEntry{Name: "red " + dir + f, Passed: !g.Passed, Detail: tail(g.Output, 500)})
-		if g.Uncertain {
+		checks = append(checks, PlanCheckEntry{Name: "red " + dir + f, Passed: !g.Passed && !g.Uncertain, Detail: tail(g.Output, 500)})
+		if uncertain, damaged := settle(g); uncertain {
 			return checks, "red", g.Output, true, nil
+		} else if damaged != "" {
+			return checks, "red", damaged, false, nil
 		}
 		if g.Passed {
 			return checks, "red", fmt.Sprintf("%s%s passes before the feature exists; each test must fail until the criterion is implemented", dir, f), false, nil
 		}
 	}
-	if tests := p.unchangedTests(); len(tests) > 0 {
-		g, err := p.acceptanceCommand(ctx, "sealed", wt, runDir, tests)
+	tests, err := p.previousSuite()
+	if err != nil {
+		return checks, "", "", false, err
+	}
+	if len(tests) > 0 {
+		g, err := p.acceptanceCommand(ctx, "previous", wt, tests)
 		if err != nil {
 			return checks, "", "", false, err
 		}
-		if g, err = run(g); err != nil {
-			return checks, "sealed", err.Error(), false, nil
-		}
-		checks = append(checks, PlanCheckEntry{Name: "sealed tests still pass", Passed: g.Passed})
-		if g.Uncertain {
-			return checks, "sealed", g.Output, true, nil
+		checks = append(checks, PlanCheckEntry{Name: "previous acceptance suite still passes", Passed: g.Passed && !g.Uncertain})
+		if uncertain, damaged := settle(g); uncertain {
+			return checks, "previous", g.Output, true, nil
+		} else if damaged != "" {
+			return checks, "previous", damaged, false, nil
 		}
 		if !g.Passed {
-			return checks, "sealed", "the sealed tests of unchanged criteria fail with the new files:\n" + g.Output, false, nil
+			return checks, "previous", "the previous acceptance suite fails with the new files:\n" + g.Output, false, nil
 		}
 	}
 	return checks, "", "", false, nil
@@ -952,20 +1099,67 @@ func (p *planner) publish() error {
 // implementation is recorded when aeh run accepts the outcome.
 func (p *planner) logMemory() error {
 	st := p.state
-	if err := memoryClean(p.memDir); err != nil {
-		return fmt.Errorf("log plan %s: %w; commit memory edits, then run aeh plan %s again to finish", st.ID, err, st.Feature)
+	marker := "AEH-Plan: " + st.ID + " " + st.PlanCommit
+	done := func() error {
+		st.Phase, st.Status = PlanLogged, PlanLogged
+		return savePlanState(p.repo, st)
+	}
+	// A crash after the memory commit: the marker is there, nothing to append.
+	if found, err := git(p.memDir, "log", "--format=%H", "--fixed-strings", "--grep="+marker); err != nil {
+		return err
+	} else if found != "" {
+		return done()
 	}
 	today := memoryNow().UTC().Format("2006-01-02")
+	subject := fmt.Sprintf("plan %s %s (%s)", st.Feature, st.SpecVersion, st.ID)
+	if err := memoryClean(p.memDir); err != nil {
+		// A crash between writing the log and committing it: commit that entry if it is the
+		// only change, otherwise leave memory to the owner.
+		if p.pendingLogEntry() {
+			if err := commitMemory(p.memDir, []string{"wiki/log.md"}, subject, marker); err != nil {
+				return fmt.Errorf("log plan %s: %w", st.ID, err)
+			}
+			return done()
+		}
+		return fmt.Errorf("log plan %s: %w; commit memory edits, then run aeh plan %s again to finish", st.ID, err, st.Feature)
+	}
 	w := memoryWrites{}
 	err := appendLog(p.memDir, w, fmt.Sprintf("[%s] plan | %s %s -> %s @ %s", today, st.Feature, st.SpecVersion, st.ID, short(st.PlanCommit)))
 	if err == nil {
-		err = w.commit(p.memDir, fmt.Sprintf("plan %s %s (%s)", st.Feature, st.SpecVersion, st.ID), "AEH-Plan: "+st.ID+" "+st.PlanCommit)
+		err = w.commit(p.memDir, subject, marker)
 	}
 	if err != nil {
 		return fmt.Errorf("log plan %s: %w", st.ID, w.restore(p.memDir, err))
 	}
-	st.Phase, st.Status = PlanLogged, PlanLogged
-	return savePlanState(p.repo, st)
+	return done()
+}
+
+// pendingLogEntry reports that memory's only change is this plan's uncommitted log entry.
+func (p *planner) pendingLogEntry() bool {
+	st := p.state
+	status, err := git(p.memDir, "status", "--porcelain", "--untracked-files=all")
+	if err != nil || strings.TrimSpace(status) != "M wiki/log.md" {
+		return false
+	}
+	diff, err := git(p.memDir, "diff", "--unified=0", "--no-color", "--", "wiki/log.md")
+	if err != nil {
+		return false
+	}
+	entry := "plan | " + st.Feature + " " + st.SpecVersion + " -> " + st.ID + " @ " + short(st.PlanCommit)
+	added := 0
+	for _, l := range strings.Split(diff, "\n") {
+		switch {
+		case strings.HasPrefix(l, "+++"), strings.HasPrefix(l, "---"), !strings.HasPrefix(l, "+") && !strings.HasPrefix(l, "-"):
+		case strings.HasPrefix(l, "-"):
+			return false
+		case strings.TrimSpace(strings.TrimPrefix(l, "+")) == "":
+		case strings.Contains(l, entry):
+			added++
+		default:
+			return false
+		}
+	}
+	return added == 1
 }
 
 func (p *planner) block(question string) error {
@@ -987,7 +1181,26 @@ func (p *planner) restart(question string) error {
 }
 
 // answerPlan records the owner's answer to a blocked plan so aeh plan can retry it.
-func answerPlan(r Repo, st PlanState, text string) error {
+func answerPlan(r Repo, id, text string) error {
+	main, err := MainCheckout(r)
+	if err != nil {
+		return err
+	}
+	if !samePath(main, r.Root) {
+		// Plans live in the main checkout; take its outcome lock too, then reload.
+		unlock, err := lockOutcome(Repo{Root: main}, id)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+	}
+	st, ok, err := LoadPlanState(r, id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("plan %s does not exist", id)
+	}
 	if st.RestartRequired {
 		return errors.New(st.Question)
 	}
@@ -997,4 +1210,35 @@ func answerPlan(r Repo, st PlanState, text string) error {
 	st.Answers = append(st.Answers, strings.TrimSpace(text))
 	st.Question, st.Status = "", StatusPending
 	return savePlanState(r, &st)
+}
+
+// ListPlanStates returns every plan of the main checkout, most recently updated first.
+func ListPlanStates(r Repo) ([]PlanState, error) {
+	main, err := MainCheckout(r)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(filepath.Join(main, ".aeh", "state"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []PlanState
+	for _, e := range entries {
+		id, ok := strings.CutSuffix(e.Name(), ".plan.json")
+		if !ok || e.IsDir() {
+			continue
+		}
+		st, found, err := LoadPlanState(r, id)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			out = append(out, st)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt.After(out[j].UpdatedAt) })
+	return out, nil
 }

@@ -147,8 +147,8 @@ func ListStates(r Repo) ([]State, error) {
 	}
 	var out []State
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") || strings.HasSuffix(e.Name(), ".plan.json") {
+			continue // plan records are listed by ListPlanStates
 		}
 		s, err := loadState(r, strings.TrimSuffix(e.Name(), ".json"))
 		if err != nil {
@@ -169,10 +169,10 @@ func Answer(r Repo, id, text string) error {
 	defer unlock()
 	// A blocked plan has no run state yet; its answer goes to the plan state.
 	if _, err := os.Stat(r.StatePath(id)); errors.Is(err, os.ErrNotExist) {
-		if ps, ok, err := LoadPlanState(r, id); err != nil {
+		if _, ok, err := LoadPlanState(r, id); err != nil {
 			return err
 		} else if ok {
-			return answerPlan(r, ps, text)
+			return answerPlan(r, id, text)
 		}
 	}
 	s, err := loadState(r, id)

@@ -296,8 +296,20 @@ func printStatus(repo aeh.Repo) error {
 	if err != nil {
 		return err
 	}
+	plans, err := aeh.ListPlanStates(repo)
+	if err != nil {
+		return err
+	}
+	for _, p := range plans {
+		fmt.Printf("%-22s plan %-9s phase %-10s %s %s\n", p.ID, p.Status, p.Phase, p.Feature, p.SpecVersion)
+		if p.Status == aeh.StatusBlocked {
+			fmt.Println("  question: " + strings.ReplaceAll(firstLines(p.Question, 4), "\n", "\n            "))
+		}
+	}
 	if len(states) == 0 {
-		fmt.Println("no outcomes have run yet")
+		if len(plans) == 0 {
+			fmt.Println("no outcomes have run yet")
+		}
 		return nil
 	}
 	for _, s := range states {

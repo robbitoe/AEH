@@ -2,6 +2,8 @@ package aeh
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -37,7 +39,11 @@ func newPlanFixture(t *testing.T, author, reviewer string) *planFixture {
 			t.Skip("plan tests require " + tool)
 		}
 	}
-	f := &planFixture{t: t, dir: t.TempDir(), tmp: t.TempDir()}
+	// A repository path with a space and a shell metacharacter: nothing may break or run.
+	f := &planFixture{t: t, dir: filepath.Join(t.TempDir(), "AEH QA & co"), tmp: t.TempDir()}
+	if err := os.MkdirAll(f.dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	f.repo = Repo{Root: f.dir}
 	mustGit(t, f.dir, "init", "-q", "-b", "main")
 	mustGit(t, f.dir, "config", "core.autocrlf", "false")
@@ -129,6 +135,13 @@ func TestPlanPublishesSealedOutcome(t *testing.T) {
 	var seal Seal
 	if !ok || json.Unmarshal([]byte(sealText), &seal) != nil || seal.SealedBy != "runner" || seal.SpecContent != st.SpecDigest || len(seal.Files) != 2 {
 		t.Fatalf("seal: %s", sealText)
+	}
+	for _, sf := range seal.Files {
+		blob, ok := gitBlob(f.dir, st.PlanCommit, sf.Path)
+		sum := sha256.Sum256([]byte(blob))
+		if !ok || hex.EncodeToString(sum[:]) != sf.SHA256 {
+			t.Fatalf("sealed hash of %s does not match the published file", sf.Path)
+		}
 	}
 	if len(st.Reviews) != 2 || st.Reviews[0].Role != RoleQA || st.Reviews[1].Role != RoleSecurity {
 		t.Fatalf("reviews: %+v", st.Reviews)
@@ -367,5 +380,104 @@ func TestPlanVerdict(t *testing.T) {
 		if got := planVerdict(out); got != want {
 			t.Errorf("planVerdict(%q) = %q, want %q", out, got, want)
 		}
+	}
+}
+
+func TestPlanMemoryLogIsIdempotent(t *testing.T) {
+	f := newPlanFixture(t, authorOK, reviewOK)
+	st := f.plan()
+	logPath := filepath.Join(memDir(t, f.repo), "wiki", "log.md")
+	entry := "plan | pay 0.1.0 -> " + planID
+	// A crash after the memory commit, before the state recorded it.
+	st.Phase, st.Status = PlanPublished, StatusRunning
+	if err := savePlanState(f.repo, &st); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.plan(); got.Phase != PlanLogged || strings.Count(readFile(t, logPath), entry) != 1 {
+		t.Fatalf("log entry duplicated or plan unfinished: %+v", got)
+	}
+	// A crash between writing the log and committing it.
+	mem := memDir(t, f.repo)
+	mustGit(t, mem, "reset", "-q", "HEAD~1")
+	if err := savePlanState(f.repo, &st); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.plan(); got.Phase != PlanLogged || strings.Count(readFile(t, logPath), entry) != 1 {
+		t.Fatalf("pending log entry not committed once: %+v", got)
+	}
+	if err := memoryClean(mem); err != nil {
+		t.Fatal(err)
+	}
+	if out := mustGit(t, mem, "log", "--format=%B", "-1"); !strings.Contains(out, "AEH-Plan: "+planID+" "+st.PlanCommit) {
+		t.Fatalf("plan marker missing: %s", out)
+	}
+}
+
+func TestPlanStatusAndLinkedWorktree(t *testing.T) {
+	f := newPlanFixture(t, `echo "PLAN: TOO-LARGE"`, reviewOK)
+	base := mustGit(t, f.dir, "rev-parse", "HEAD")
+	linked := filepath.Join(t.TempDir(), "linked")
+	mustGit(t, f.dir, "worktree", "add", "-q", "-b", "side", linked)
+	write(t, linked, "side.txt", "x\n")
+	mustGit(t, linked, "add", "-A")
+	mustGit(t, linked, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "side")
+	st, err := PlanFeature(context.Background(), Repo{Root: linked}, "pay", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Base != base {
+		t.Fatalf("a plan from a linked worktree must pin the main checkout's HEAD, got %s", st.Base)
+	}
+	if _, err := os.Stat(filepath.Join(f.dir, ".aeh", "state", planID+".plan.json")); err != nil {
+		t.Fatalf("plan state not in the main checkout: %v", err)
+	}
+	if _, err := ListStates(f.repo); err != nil {
+		t.Fatalf("status broke with a plan record: %v", err)
+	}
+	plans, err := ListPlanStates(Repo{Root: linked})
+	if err != nil || len(plans) != 1 || plans[0].Status != StatusBlocked {
+		t.Fatalf("plans: %+v %v", plans, err)
+	}
+	if err := Answer(Repo{Root: linked}, planID, "Retry."); err != nil {
+		t.Fatalf("answer from a linked worktree: %v", err)
+	}
+	if st, _, _ := LoadPlanState(f.repo, planID); st.Status != StatusPending || len(st.Answers) != 1 {
+		t.Fatalf("answer not recorded in the main checkout: %+v", st)
+	}
+}
+
+func TestPlanRecoversStaleWorktreesAndInterruptedAttempts(t *testing.T) {
+	f := newPlanFixture(t, `echo "PLAN: TOO-LARGE"`, reviewOK)
+	// Something left at the baseline worktree's path, as after a crash.
+	stale := f.repo.WorktreePath(planID + "-plan-baseline")
+	write(t, stale, "leftover.txt", "x\n")
+	st := f.plan()
+	if st.Status != StatusBlocked || len(st.Attempts) != 1 {
+		t.Fatalf("setup: %+v", st)
+	}
+	// An attempt that was running when the process stopped.
+	st.Attempts = append(st.Attempts, PlanAttempt{N: 2, Profile: "author", FailedStep: "running"})
+	if err := savePlanState(f.repo, &st); err != nil {
+		t.Fatal(err)
+	}
+	write(t, f.repo.WorktreePath(planID+"-plan-a2"), "leftover.txt", "x\n")
+	if err := Answer(f.repo, planID, "Go."); err != nil {
+		t.Fatal(err)
+	}
+	f.setScript("author", authorOK)
+	st = f.plan()
+	if st.Phase != PlanLogged || st.Attempts[1].FailedStep != "interrupted" || len(st.Attempts) != 3 {
+		t.Fatalf("recovery: %+v", st.Attempts)
+	}
+	if _, err := os.Stat(f.repo.WorktreePath(planID + "-plan-a2")); !os.IsNotExist(err) {
+		t.Fatal("the interrupted attempt's worktree was not removed")
+	}
+}
+
+func TestPlanRefusesAnUntrackedTestDirectory(t *testing.T) {
+	f := newPlanFixture(t, countCall+authorOK, reviewOK)
+	write(t, f.dir, "tests/acceptance/PAY-v0_1_0/local.sh", "exit 0\n") // untracked
+	if _, err := PlanFeature(context.Background(), f.repo, "pay", nil); err == nil || !strings.Contains(err.Error(), "already used") {
+		t.Fatalf("untracked test directory not detected: %v", err)
 	}
 }
