@@ -255,7 +255,7 @@ go vet ./...
 go test -timeout 30m ./...
 ```
 
-The full suite takes about 12 minutes on Windows; the extended timeout is required.
+End-to-end tests build real repositories, worktrees and agent processes, and run in parallel; the full suite takes about 10 minutes on Windows (process creation dominates), so the extended timeout is required. For a fast inner loop, `go test -short ./...` skips the end-to-end tests (about 3 minutes); run the full suite before every merge.
 
 Agent instruction files (`AGENTS.md`, `CLAUDE.md`, `.claude/`, `.codex/`), agent coordination notes (`.agents/`) and local state (`.aeh/`) are git-ignored: they stay on your machine. Design decisions are recorded in [docs/adr](docs/adr).
 
