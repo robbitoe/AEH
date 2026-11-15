@@ -548,3 +548,18 @@ func TestInvalidImplementationFileIsRejected(t *testing.T) {
 		}
 	}
 }
+
+// Stage 3 review minors: an indented fence-like line inside an open column-0 fence is content,
+// and a heading that spells "Acceptance criteria" with character references is an attempt.
+func TestCriteriaFollowups(t *testing.T) {
+	nested := "````markdown\n  ```js\n  x()\n  ```\n````\n\n## Acceptance criteria\n- AC-1: Pays.\n"
+	if crit, present, err := parseCriteria(nested); err != nil || !present || len(crit) != 1 {
+		t.Fatalf("a fenced example with an indented inner fence was rejected: %v", err)
+	}
+	if _, present, err := parseCriteria("## &#65;cceptance criteria\n- Require administrators.\n"); err == nil || !present {
+		t.Fatalf("an entity-spelled criteria heading passed as no criteria: %v %v", present, err)
+	}
+	if _, _, err := parseCriteria("## Acceptance criteria\n- AC-1: x\n\n  ```\ncode\n  ```\n"); err == nil {
+		t.Fatal("an opening fence that is not at column 0 must still be rejected")
+	}
+}

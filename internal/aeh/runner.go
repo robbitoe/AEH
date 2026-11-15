@@ -80,7 +80,7 @@ func RunOutcome(ctx context.Context, r Repo, id string, log io.Writer) (State, e
 	if err != nil {
 		return State{}, err
 	}
-	return run(ctx, r, cfg, o, log)
+	return run(ctx, r, cfg, o, log, nil)
 }
 
 // Do runs a level-1 change described in one sentence, with route-based reviews.
@@ -114,10 +114,11 @@ func Do(ctx context.Context, r Repo, text string, paths []string, profile string
 		Feature: link.Feature, Change: link.Change, Changelog: link.Note,
 		Tasks: []Task{{ID: "T1", Goal: text, Paths: paths, Start: profile}},
 	}
-	return run(ctx, r, cfg, o, log)
+	return run(ctx, r, cfg, o, log, nil)
 }
 
-func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer, generated ...*generatedRun) (State, error) {
+// run executes an outcome; gen is the pinned plan provenance of a generated outcome, or nil.
+func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer, gen *generatedRun) (State, error) {
 	// One run or memory write at a time per project, across linked worktrees.
 	unlockProject, err := lockProject(r)
 	if err != nil {
@@ -129,13 +130,6 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer, gene
 		return State{}, err
 	}
 	defer unlock()
-	// A first generated run may use only the branch published by planning. Triage can
-	// persist a partial run state, so the contract (rather than mere file existence)
-	// distinguishes a fresh run after an interruption here.
-	var gen *generatedRun
-	if len(generated) > 0 {
-		gen = generated[0]
-	}
 	memory, err := LoadMemory(r)
 	if err != nil {
 		return State{}, fmt.Errorf("load run memory: %w", err)
