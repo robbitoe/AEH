@@ -334,6 +334,14 @@ func TestBookRejectsOrphanMockupsAndUnsafeDocs(t *testing.T) {
 			t.Errorf("%s: accepted", name)
 		}
 	}
+	// A feature name that looks like a key is rejected, and the diagnostic never shows it.
+	secretSlug := "sk-" + strings.Repeat("a", 24)
+	if _, err := d.bookFiles(with("features/"+secretSlug+".md", "# x\n")); err == nil || strings.Contains(redactDiagnostic(err.Error()), secretSlug) {
+		t.Fatalf("secret-looking feature name: %v", err)
+	}
+	if err := redactErr(fmt.Errorf("wrap %s: %w", secretSlug, ErrMemoryDirty)); strings.Contains(err.Error(), secretSlug) || !errors.Is(err, ErrMemoryDirty) {
+		t.Fatalf("redactErr: %v", err)
+	}
 	files, err := d.bookFiles(with("mockups/cart/list.html", "<p>x</p>"))
 	if err != nil || len(files) != 4 || !strings.HasPrefix(string(files["wiki/discovery/shop/drafts/mockups/cart/list.html"]), "<!doctype html>") {
 		t.Fatalf("%v %v", files, err)
@@ -423,6 +431,54 @@ func TestDiscoveryFinishesPendingImport(t *testing.T) {
 		t.Fatalf("rounds/01.md:\n%s", round)
 	}
 	if err := memoryClean(mem); err != nil {
+		t.Fatal(err)
+	}
+	// A crash after the import staged its files: new files are in the index only.
+	if _, err := DiscoverRun(context.Background(), f.repo, "shop", nil); err != nil {
+		t.Fatal(err)
+	}
+	memoryWriteFile = func(p string, b []byte) error { return errors.New("disk full") }
+	_, err = DiscoverAnswer(f.repo, "shop", "R2-Q1", "Staged")
+	memoryWriteFile = writeFileAtomic
+	if err == nil {
+		t.Fatal("expected the write to fail")
+	}
+	st, _, _ = LoadDiscovery(f.repo, "shop")
+	var staged []string
+	for rel, b := range st.Pending.Files {
+		write(t, mem, rel, string(b))
+		staged = append(staged, rel)
+	}
+	write(t, mem, "wiki/log.md", f.memFile("wiki/log.md")+"\n## [2026-11-13] import | discover/shop | "+st.Pending.Log+"\n")
+	mustGit(t, mem, append([]string{"add", "--", "wiki/log.md"}, staged...)...)
+	if _, err := DiscoverSkip(f.repo, "shop", "R2-Q2"); err != nil {
+		t.Fatalf("recovery after a staged crash: %v", err)
+	}
+	if round := f.memFile("wiki/discovery/shop/rounds/02.md"); !strings.Contains(round, "Staged") || !strings.Contains(round, "Skipped by the owner.") {
+		t.Fatalf("rounds/02.md:\n%s", round)
+	}
+	// The owner staged other content for a batch file and put the batch's bytes back on disk:
+	// the staged content is the owner's and survives.
+	memoryWriteFile = func(p string, b []byte) error { return errors.New("disk full") }
+	_, err = DiscoverAnswer(f.repo, "shop", "R2-Q1", "Staged, revised")
+	memoryWriteFile = writeFileAtomic
+	if err == nil {
+		t.Fatal("expected the write to fail")
+	}
+	st, _, _ = LoadDiscovery(f.repo, "shop")
+	roundRel := "wiki/discovery/shop/rounds/02.md"
+	write(t, mem, roundRel, "owner staged\n")
+	mustGit(t, mem, "add", roundRel)
+	write(t, mem, roundRel, string(st.Pending.Files[roundRel]))
+	if _, err := DiscoverAnswer(f.repo, "shop", "R2-Q1", "x"); !errors.Is(err, ErrMemoryDirty) {
+		t.Fatalf("expected dirty memory, got %v", err)
+	}
+	if staged := mustGit(t, mem, "show", ":"+roundRel); staged != "owner staged" {
+		t.Fatalf("the owner's staged content was discarded: %q", staged)
+	}
+	mustGit(t, mem, "reset", "-q", "--", roundRel)
+	mustGit(t, mem, "checkout", "-q", "--", roundRel)
+	if _, err := DiscoverAnswer(f.repo, "shop", "R2-Q1", "Staged, final"); err != nil {
 		t.Fatal(err)
 	}
 	// Dirt that is not the batch's own stays for the owner.

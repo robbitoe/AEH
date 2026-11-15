@@ -322,8 +322,27 @@ func openDiscovery(r Repo, slug string, log io.Writer) (*discoverySession, func(
 	return d, unlock, nil
 }
 
+// redactedError shows a redacted message and still unwraps to the original error.
+type redactedError struct {
+	msg string
+	err error
+}
+
+func (e *redactedError) Error() string { return e.msg }
+func (e *redactedError) Unwrap() error { return e.err }
+
+// redactErr is applied to every error a discovery command returns: paths and diagnostics may
+// carry agent-chosen text.
+func redactErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &redactedError{msg: redactDiagnostic(err.Error()), err: err}
+}
+
 // DiscoverNew starts a discovery session for an idea and records the idea in memory.
-func DiscoverNew(r Repo, slug, idea string) (DiscoveryState, error) {
+func DiscoverNew(r Repo, slug, idea string) (_ DiscoveryState, err error) {
+	defer func() { err = redactErr(err) }()
 	d, unlock, err := openDiscovery(r, slug, nil)
 	if err != nil {
 		return DiscoveryState{}, err
@@ -464,48 +483,52 @@ func discardPartialImport(dir string, p *pendingImport, session string) error {
 	if err != nil || out == "" {
 		return err
 	}
-	type dirty struct {
-		path    string
-		tracked bool
-	}
-	var paths []dirty
+	var paths []string
 	for _, e := range strings.Split(strings.TrimRight(out, "\x00"), "\x00") {
 		if len(e) < 4 || e[0] == 'R' || e[0] == 'C' {
 			return nil // a rename or copy is not aeh's
 		}
-		paths = append(paths, dirty{path: e[3:], tracked: e[:2] != "??"})
+		paths = append(paths, e[3:])
 	}
-	for _, d := range paths {
-		disk, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(d.path)))
+	// Both the working file and the index entry must be aeh's: the index may hold HEAD's
+	// content (not staged yet) or exactly what aeh wrote (staged by the import).
+	for _, rel := range paths {
+		disk, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(rel)))
 		if err != nil {
 			return nil
 		}
-		if want, ok := p.Files[d.path]; ok {
-			if !bytes.Equal(disk, want) {
-				return nil
-			}
-			continue
-		}
-		if d.path != "wiki/log.md" {
+		head, inHead := gitBlob(dir, "HEAD", rel)
+		index, inIndex := gitBlob(dir, "", rel)
+		want, ours := p.Files[rel]
+		switch {
+		case ours:
+		case rel == "wiki/log.md" && inHead && partialLogEntry(head, string(disk), session, p.Log):
+			want = disk
+		default:
 			return nil
 		}
-		head, ok := gitBlob(dir, "HEAD", d.path)
-		if !ok || !partialLogEntry(head, string(disk), session, p.Log) {
+		if !bytes.Equal(disk, want) {
+			return nil
+		}
+		if inIndex && !(inHead && index == head) && index != string(want) {
 			return nil
 		}
 	}
-	for _, d := range paths {
-		if d.tracked {
-			if _, err := git(dir, "checkout", "-q", "HEAD", "--", d.path); err != nil {
+	for _, rel := range paths {
+		full := filepath.Join(dir, filepath.FromSlash(rel))
+		if _, err := git(dir, "reset", "-q", "--", rel); err != nil {
+			return err
+		}
+		if _, inHead := gitBlob(dir, "HEAD", rel); inHead {
+			if _, err := git(dir, "checkout", "-q", "HEAD", "--", rel); err != nil {
 				return err
 			}
 			continue
 		}
-		_, _ = git(dir, "reset", "-q", "--", d.path)
-		if err := os.Remove(filepath.Join(dir, filepath.FromSlash(d.path))); err != nil {
+		if err := os.Remove(full); err != nil {
 			return err
 		}
-		for p := filepath.Dir(filepath.Join(dir, filepath.FromSlash(d.path))); len(p) > len(dir); p = filepath.Dir(p) {
+		for p := filepath.Dir(full); len(p) > len(dir); p = filepath.Dir(p) {
 			if os.Remove(p) != nil {
 				break // not empty
 			}
@@ -542,7 +565,8 @@ var importLogEntry = regexp.MustCompile(`^\n## \[[0-9]{4}-[0-9]{2}-[0-9]{2}\] im
 
 // DiscoverRun runs one discovery round with the discovery ladder. The round ends with the
 // agent's questions for the owner, or with a validated draft book in memory.
-func DiscoverRun(ctx context.Context, r Repo, slug string, log io.Writer) (DiscoveryState, error) {
+func DiscoverRun(ctx context.Context, r Repo, slug string, log io.Writer) (_ DiscoveryState, err error) {
+	defer func() { err = redactErr(err) }()
 	d, unlock, err := openDiscovery(r, slug, log)
 	if err != nil {
 		return DiscoveryState{}, err
@@ -805,6 +829,9 @@ func (d *discoverySession) bookFiles(f frozenOutput) (map[string][]byte, error) 
 	files := map[string][]byte{}
 	for _, rel := range sortedKeys(f.Files) {
 		b := f.Files[rel]
+		if err := checkNoSecrets("a file name", []byte(rel)); err != nil {
+			return nil, err
+		}
 		if strings.HasSuffix(rel, ".html") {
 			parts := strings.Split(strings.TrimSuffix(rel, ".html"), "/") // mockups/<feature>/<screen>
 			if !features[parts[1]] {
@@ -816,6 +843,9 @@ func (d *discoverySession) bookFiles(f frozenOutput) (map[string][]byte, error) 
 			page, err := sanitizeMockup(b, parts[1]+" / "+parts[2], d.dcfg.MaxMockupBytes, discoveryImageBytes)
 			if err != nil {
 				return nil, fmt.Errorf("%s: %w", rel, err)
+			}
+			if err := checkNoSecrets(rel, page); err != nil {
+				return nil, err
 			}
 			b = page
 		} else if err := checkDisplayMarkdown(string(b), discoveryDocBytes); err != nil {
@@ -933,7 +963,8 @@ func (d *discoverySession) findQuestion(qid string) (*DiscoveryRound, *Discovery
 
 // DiscoverAnswer records the owner's answer to a question. Answering again records a revision;
 // the next round receives only the latest one.
-func DiscoverAnswer(r Repo, slug, qid, text string) (DiscoveryState, error) {
+func DiscoverAnswer(r Repo, slug, qid, text string) (_ DiscoveryState, err error) {
+	defer func() { err = redactErr(err) }()
 	d, unlock, err := openDiscovery(r, slug, nil)
 	if err != nil {
 		return DiscoveryState{}, err
@@ -956,7 +987,8 @@ func DiscoverAnswer(r Repo, slug, qid, text string) (DiscoveryState, error) {
 }
 
 // DiscoverSkip records that the owner skips an optional question.
-func DiscoverSkip(r Repo, slug, qid string) (DiscoveryState, error) {
+func DiscoverSkip(r Repo, slug, qid string) (_ DiscoveryState, err error) {
+	defer func() { err = redactErr(err) }()
 	d, unlock, err := openDiscovery(r, slug, nil)
 	if err != nil {
 		return DiscoveryState{}, err
