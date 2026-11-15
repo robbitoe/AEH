@@ -1,0 +1,935 @@
+package aeh
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Discovery (stage 4, entry A): an idea becomes a draft book of specs through rounds of an
+// agent's questions and the owner's answers. The agent writes only into an output directory
+// aeh opened before it ran; aeh freezes that output, validates it, and imports it into memory
+// under wiki/discovery/<slug>/ with one marked commit per step. Drafts are not features:
+// they claim no paths and no run sees them until the owner promotes one.
+
+// Discovery phases.
+const (
+	DiscoveryAwaiting = "awaiting_answers" // blocking questions of the last round are open
+	DiscoveryReady    = "ready_to_run"     // another round can run
+	DiscoveryDraft    = "draft_ready"      // a validated draft book is in memory; not an approval
+)
+
+// Agent verdicts: the last non-empty line of the agent's output.
+const (
+	discoveryQuestions = "DISCOVERY: QUESTIONS"
+	discoveryBook      = "DISCOVERY: READY"
+)
+
+const (
+	discoveryStateVersion = 1
+	discoveryDocBytes     = 65536
+	discoveryAnswerBytes  = 8192
+	discoveryLineBytes    = 500
+	discoveryOptionBytes  = 200
+	discoveryMaxOptions   = 6
+	discoveryImageBytes   = 65536
+)
+
+// DiscoveryConfig is the discovery section of aeh/config.yaml.
+type DiscoveryConfig struct {
+	Ladder         []string `yaml:"ladder"`
+	MaxQuestions   int      `yaml:"max_questions"`
+	MaxFeatures    int      `yaml:"max_features"`
+	MaxMockupBytes int      `yaml:"max_mockup_bytes"`
+	Research       bool     `yaml:"research"`
+}
+
+// UnmarshalYAML rejects misspelled discovery settings.
+func (d *DiscoveryConfig) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind != yaml.MappingNode {
+		return errors.New("discovery must be a mapping of ladder, limits and research")
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		switch k := n.Content[i].Value; k {
+		case "ladder", "max_questions", "max_features", "max_mockup_bytes", "research":
+		default:
+			return fmt.Errorf("discovery: unknown key %q", k)
+		}
+	}
+	type plain DiscoveryConfig
+	return n.Decode((*plain)(d))
+}
+
+// discovery applies defaults. Zero limits mean omitted; negative ones stay invalid.
+func (c Config) discovery() DiscoveryConfig {
+	d := c.Discovery
+	if len(d.Ladder) == 0 {
+		d.Ladder = c.Ladder
+	}
+	if d.MaxQuestions == 0 {
+		d.MaxQuestions = 7
+	}
+	if d.MaxFeatures == 0 {
+		d.MaxFeatures = 12
+	}
+	if d.MaxMockupBytes == 0 {
+		d.MaxMockupBytes = 204800
+	}
+	return d
+}
+
+func (c Config) validateDiscoveryConfig() error {
+	d := c.discovery()
+	switch {
+	case d.MaxQuestions < 1 || d.MaxQuestions > 20:
+		return errors.New("config: discovery.max_questions must be from 1 through 20")
+	case d.MaxFeatures < 1 || d.MaxFeatures > 50:
+		return errors.New("config: discovery.max_features must be from 1 through 50")
+	case d.MaxMockupBytes < 1024 || d.MaxMockupBytes > 2<<20:
+		return errors.New("config: discovery.max_mockup_bytes must be from 1024 through 2097152")
+	}
+	seen := map[string]bool{}
+	for _, name := range d.Ladder {
+		if seen[name] {
+			return fmt.Errorf("config: profile %q appears twice in the discovery ladder", name)
+		}
+		seen[name] = true
+		if err := c.checkProfile(name); err != nil {
+			return fmt.Errorf("config: discovery ladder: %w", err)
+		}
+	}
+	return nil
+}
+
+// DiscoveryState is the local record of one discovery session, in the main checkout's
+// .aeh/discovery/<slug>/state.json. Memory holds the readable record; this file holds what
+// aeh needs to resume.
+type DiscoveryState struct {
+	Version    int                `json:"version"`
+	Slug       string             `json:"slug"`
+	Idea       string             `json:"idea"`
+	Phase      string             `json:"phase"`
+	Status     string             `json:"status,omitempty"` // running or blocked while a run needs attention
+	Question   string             `json:"question,omitempty"`
+	Rounds     []DiscoveryRound   `json:"rounds,omitempty"`
+	Attempts   []DiscoveryAttempt `json:"attempts,omitempty"`
+	LadderFrom int                `json:"ladder_from"`
+	Pending    *pendingImport     `json:"pending,omitempty"` // a memory import that must finish first
+	UpdatedAt  time.Time          `json:"updated_at"`
+}
+
+// DiscoveryRound is one accepted agent round: questions, or the draft book.
+type DiscoveryRound struct {
+	N         int                 `json:"n"`
+	Kind      string              `json:"kind"` // questions or book
+	Profile   string              `json:"profile"`
+	Snapshot  string              `json:"snapshot_sha256"`
+	Questions []DiscoveryQuestion `json:"questions,omitempty"`
+	Files     []string            `json:"files,omitempty"` // book: the draft files in memory
+}
+
+// DiscoveryQuestion is one agent question with the owner's answers, latest last.
+type DiscoveryQuestion struct {
+	ID       string            `json:"id"`
+	Text     string            `json:"text"`
+	Why      string            `json:"why"`
+	Blocking bool              `json:"blocking"`
+	Options  []string          `json:"options,omitempty"`
+	Answers  []DiscoveryAnswer `json:"answers,omitempty"`
+	Skipped  bool              `json:"skipped,omitempty"`
+}
+
+// DiscoveryAnswer is one revision of the owner's answer.
+type DiscoveryAnswer struct {
+	Text string `json:"text"`
+	Date string `json:"date"`
+}
+
+// DiscoveryAttempt is one run of a discovery agent.
+type DiscoveryAttempt struct {
+	N        int     `json:"n"`
+	Round    int     `json:"round"`
+	Profile  string  `json:"profile"`
+	RunDir   string  `json:"run_dir"`
+	Result   string  `json:"result"` // running, failed, interrupted or accepted
+	Feedback string  `json:"feedback,omitempty"`
+	Snapshot string  `json:"snapshot_sha256,omitempty"`
+	Seconds  float64 `json:"seconds"`
+}
+
+// pendingImport is a memory batch saved with the state change it records, so a crash between
+// the two never loses or doubles it.
+type pendingImport struct {
+	Files        map[string][]byte `json:"files"`
+	ExpectedHead string            `json:"expected_head"`
+	Subject      string            `json:"subject"`
+	Log          string            `json:"log"`
+}
+
+// Kinds of rounds.
+const (
+	roundQuestions = "questions"
+	roundBook      = "book"
+)
+
+var discoveryQID = regexp.MustCompile(`^R([1-9][0-9]*)-Q([1-9][0-9]*)$`)
+
+func discoveryDir(r Repo, slug string) (string, error) {
+	main, err := MainCheckout(r)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(main, ".aeh", "discovery", slug), nil
+}
+
+// LoadDiscovery reads a session; ok is false when it does not exist.
+func LoadDiscovery(r Repo, slug string) (DiscoveryState, bool, error) {
+	var s DiscoveryState
+	if err := checkSlug(slug); err != nil {
+		return s, false, fmt.Errorf("discovery: %w", err)
+	}
+	dir, err := discoveryDir(r, slug)
+	if err != nil {
+		return s, false, err
+	}
+	if err := rejectLink(dir); err != nil {
+		return s, false, fmt.Errorf("discovery %s: %w", slug, err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "state.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return s, false, nil
+	}
+	if err != nil {
+		return s, false, err
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&s); err != nil {
+		return s, false, fmt.Errorf("discovery %s: %w", slug, err)
+	}
+	if s.Slug != slug || s.Version != discoveryStateVersion {
+		return s, false, fmt.Errorf("discovery %s: unexpected slug %q or version %d", slug, s.Slug, s.Version)
+	}
+	return s, true, nil
+}
+
+// ListDiscoveries returns every session, most recently updated first.
+func ListDiscoveries(r Repo) ([]DiscoveryState, error) {
+	main, err := MainCheckout(r)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(filepath.Join(main, ".aeh", "discovery"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []DiscoveryState
+	for _, e := range entries {
+		if !e.IsDir() || checkSlug(e.Name()) != nil {
+			continue
+		}
+		s, ok, err := LoadDiscovery(r, e.Name())
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out = append(out, s)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt.After(out[j].UpdatedAt) })
+	return out, nil
+}
+
+// discoverySession carries one discovery command.
+type discoverySession struct {
+	repo   Repo
+	cfg    Config
+	dcfg   DiscoveryConfig
+	memDir string
+	dir    string // .aeh/discovery/<slug>
+	state  *DiscoveryState
+	log    io.Writer
+}
+
+func (d *discoverySession) logf(format string, args ...any) {
+	if d.log != nil {
+		fmt.Fprintf(d.log, format+"\n", args...)
+	}
+}
+
+func (d *discoverySession) save() error {
+	d.state.UpdatedAt = time.Now().UTC()
+	return writePrivateJSON(filepath.Join(d.dir, "state.json"), d.state)
+}
+
+// openDiscovery takes the project lock and loads configuration, memory and the session. The
+// caller must call the returned unlock.
+func openDiscovery(r Repo, slug string, log io.Writer) (*discoverySession, func(), error) {
+	if err := checkSlug(slug); err != nil {
+		return nil, nil, fmt.Errorf("discovery: %w", err)
+	}
+	main, err := MainCheckout(r)
+	if err != nil {
+		return nil, nil, err
+	}
+	r = Repo{Root: main}
+	unlock, err := lockProject(r)
+	if err != nil {
+		return nil, nil, err
+	}
+	fail := func(err error) (*discoverySession, func(), error) {
+		unlock()
+		return nil, nil, err
+	}
+	cfg, err := r.LoadConfig()
+	if err != nil {
+		return fail(err)
+	}
+	memory, err := LoadMemory(r)
+	if err != nil {
+		return fail(err)
+	}
+	if !memory.Present {
+		return fail(errors.New("memory is not initialized; run: aeh memory init"))
+	}
+	dir, err := discoveryDir(r, slug)
+	if err != nil {
+		return fail(err)
+	}
+	d := &discoverySession{repo: r, cfg: cfg, dcfg: cfg.discovery(), memDir: memory.Dir, dir: dir, log: log}
+	st, ok, err := LoadDiscovery(r, slug)
+	if err != nil {
+		return fail(err)
+	}
+	if ok {
+		d.state = &st
+	}
+	return d, unlock, nil
+}
+
+// DiscoverNew starts a discovery session for an idea and records the idea in memory.
+func DiscoverNew(r Repo, slug, idea string) (DiscoveryState, error) {
+	d, unlock, err := openDiscovery(r, slug, nil)
+	if err != nil {
+		return DiscoveryState{}, err
+	}
+	defer unlock()
+	if d.state != nil {
+		return *d.state, fmt.Errorf("discovery %s already exists; continue it with: aeh discover run %s", slug, slug)
+	}
+	idea = normalizeOwnerText(idea)
+	if err := checkOwnerText("idea", idea, discoveryAnswerBytes); err != nil {
+		return DiscoveryState{}, err
+	}
+	if err := memoryClean(d.memDir); err != nil {
+		return DiscoveryState{}, fmt.Errorf("discover %s: %w", slug, err)
+	}
+	d.state = &DiscoveryState{Version: discoveryStateVersion, Slug: slug, Idea: idea, Phase: DiscoveryReady}
+	files := map[string][]byte{d.memRel("idea.md"): []byte("# Idea\n\n" + idea + "\n")}
+	if err := d.record(files, "discover "+slug+": idea", "new session"); err != nil {
+		return *d.state, err
+	}
+	return *d.state, nil
+}
+
+// normalizeOwnerText trims the text and turns CRLF into LF, as a terminal may pass it.
+func normalizeOwnerText(s string) string {
+	return strings.TrimSpace(strings.ReplaceAll(s, "\r\n", "\n"))
+}
+
+// checkOwnerText applies the display policy and the secrets filter to the owner's text: it is
+// stored in memory, shown again and sent to the next agent.
+func checkOwnerText(what, text string, max int) error {
+	if text == "" {
+		return fmt.Errorf("the %s is empty", what)
+	}
+	if err := checkDisplayMarkdown(text, max); err != nil {
+		return fmt.Errorf("the %s: %w (write plain Markdown without HTML or character references)", what, err)
+	}
+	if err := checkNoSecrets(what, []byte(text)); err != nil {
+		return fmt.Errorf("the %s may contain a secret; remove it:\n%w", what, err)
+	}
+	return nil
+}
+
+func (d *discoverySession) memRel(name string) string {
+	return "wiki/discovery/" + d.state.Slug + "/" + name
+}
+
+// record saves the state change together with the memory batch that records it, then imports
+// the batch. A crash after the save is finished by the next discovery command.
+func (d *discoverySession) record(files map[string][]byte, subject, log string) error {
+	head, err := git(d.memDir, "rev-parse", "HEAD")
+	if err != nil {
+		return fmt.Errorf("discover %s: %w", d.state.Slug, err)
+	}
+	d.state.Pending = &pendingImport{Files: files, ExpectedHead: head, Subject: subject, Log: log}
+	if err := d.save(); err != nil {
+		return err
+	}
+	return d.finishPending()
+}
+
+// finishPending imports a saved batch. If the owner committed to memory in between without
+// touching the batch's files, the batch moves onto the new HEAD; otherwise the owner decides.
+func (d *discoverySession) finishPending() error {
+	p := d.state.Pending
+	if p == nil {
+		return nil
+	}
+	b := memoryBatch{Session: "discover/" + d.state.Slug, ExpectedHead: p.ExpectedHead, Files: p.Files, Subject: p.Subject, Log: p.Log}
+	_, _, err := importMemoryBatch(d.repo, b)
+	if errors.Is(err, ErrMemoryChanged) {
+		head, herr := git(d.memDir, "rev-parse", "HEAD")
+		if herr != nil {
+			return herr
+		}
+		if touched := batchFilesChanged(d.memDir, p.ExpectedHead, head, p.Files); touched != "" {
+			return fmt.Errorf("discover %s: memory changed %s since aeh prepared this step; restore it or commit it back, then run the discovery command again", d.state.Slug, touched)
+		}
+		p.ExpectedHead = head
+		if err := d.save(); err != nil {
+			return err
+		}
+		b.ExpectedHead = head
+		_, _, err = importMemoryBatch(d.repo, b)
+	}
+	if err != nil {
+		return err
+	}
+	d.state.Pending = nil
+	return d.save()
+}
+
+// batchFilesChanged names the first batch file whose committed content differs between two
+// memory commits, or returns "".
+func batchFilesChanged(dir, from, to string, files map[string][]byte) string {
+	for _, rel := range sortedKeys(files) {
+		a, aok := gitBlob(dir, from, rel)
+		b, bok := gitBlob(dir, to, rel)
+		if aok != bok || a != b {
+			return rel
+		}
+	}
+	return ""
+}
+
+// resume finishes a pending import and checks that memory is clean, as every command needs.
+func (d *discoverySession) resume() error {
+	if d.state == nil {
+		return fmt.Errorf("discovery does not exist; start it with: aeh discover new <slug> \"<idea>\"")
+	}
+	if err := memoryClean(d.memDir); err != nil {
+		return fmt.Errorf("discover %s: %w", d.state.Slug, err)
+	}
+	return d.finishPending()
+}
+
+// DiscoverRun runs one discovery round with the discovery ladder. The round ends with the
+// agent's questions for the owner, or with a validated draft book in memory.
+func DiscoverRun(ctx context.Context, r Repo, slug string, log io.Writer) (DiscoveryState, error) {
+	d, unlock, err := openDiscovery(r, slug, log)
+	if err != nil {
+		return DiscoveryState{}, err
+	}
+	defer unlock()
+	if err := d.resume(); err != nil {
+		return d.snapshot(), err
+	}
+	st := d.state
+	switch st.Phase {
+	case DiscoveryAwaiting:
+		return *st, fmt.Errorf("discovery %s waits for answers; see them with: aeh discover show %s", slug, slug)
+	case DiscoveryDraft:
+		return *st, fmt.Errorf("discovery %s already has a draft book in memory under %s", slug, d.memRel("drafts/"))
+	}
+	if len(d.dcfg.Ladder) == 0 {
+		return *st, errors.New("config: discovery needs a ladder (discovery.ladder or ladder)")
+	}
+	for i := range st.Attempts {
+		if st.Attempts[i].Result == "running" {
+			st.Attempts[i].Result, st.Attempts[i].Feedback = "interrupted", "the previous aeh discover run stopped during this attempt"
+		}
+	}
+	if st.Status == StatusBlocked {
+		// Running again after a block is the owner's retry: a new ladder round starts.
+		st.LadderFrom, st.Status, st.Question = len(st.Attempts), "", ""
+	}
+	st.Status = StatusRunning
+	if err := d.save(); err != nil {
+		return *st, err
+	}
+	round := len(st.Rounds) + 1
+	feedback := ""
+	for _, profile := range d.dcfg.Ladder {
+		done := 0
+		for _, prev := range st.Attempts[min(st.LadderFrom, len(st.Attempts)):] {
+			if prev.Profile == profile {
+				done++
+			}
+		}
+		for try := done; try < 2; try++ {
+			n := len(st.Attempts) + 1
+			st.Attempts = append(st.Attempts, DiscoveryAttempt{N: n, Round: round, Profile: profile, Result: "running",
+				RunDir: rel(d.repo.Root, d.repo.RunDir("discover-"+slug, fmt.Sprintf("a%d", n)))})
+			if err := d.save(); err != nil {
+				return *st, err
+			}
+			start := time.Now()
+			out, blockQuestion, err := d.attempt(ctx, &st.Attempts[n-1], round, feedback)
+			st.Attempts[n-1].Seconds = time.Since(start).Seconds()
+			if err != nil {
+				_ = d.save()
+				return *st, err
+			}
+			if blockQuestion != "" {
+				st.Status, st.Question = StatusBlocked, blockQuestion
+				return *st, d.save()
+			}
+			if out != nil {
+				return *st, d.accept(round, &st.Attempts[n-1], out)
+			}
+			if err := d.save(); err != nil {
+				return *st, err
+			}
+			d.logf("    attempt %d failed: %s", n, firstLine(st.Attempts[n-1].Feedback))
+			feedback = "Your previous attempt was rejected:\n" + st.Attempts[n-1].Feedback
+		}
+	}
+	last := st.Attempts[len(st.Attempts)-1]
+	st.Status = StatusBlocked
+	st.Question = fmt.Sprintf("No discovery agent produced a valid round. Last failure:\n%s\nAdjust the discovery ladder or the prompt, then run again: aeh discover run %s", tail(last.Feedback, 2000), slug)
+	return *st, d.save()
+}
+
+// snapshot returns the session state for an error path, or an empty one.
+func (d *discoverySession) snapshot() DiscoveryState {
+	if d.state == nil {
+		return DiscoveryState{}
+	}
+	return *d.state
+}
+
+// discoveryOutput is an accepted round, ready to record.
+type discoveryOutput struct {
+	kind      string
+	snapshot  frozenOutput
+	questions []DiscoveryQuestion
+	files     map[string][]byte // book: memory files under drafts/
+}
+
+// attempt runs one discovery agent. It returns the accepted output, or a question that blocks
+// the session, or neither when the attempt failed with feedback for the next one.
+func (d *discoverySession) attempt(ctx context.Context, a *DiscoveryAttempt, round int, feedback string) (*discoveryOutput, string, error) {
+	fail := func(msg string) (*discoveryOutput, string, error) {
+		a.Result, a.Feedback = "failed", msg
+		return nil, "", nil
+	}
+	outDir := d.repo.WorktreePath(fmt.Sprintf("discover-%s-a%d", d.state.Slug, a.N))
+	_ = os.RemoveAll(outDir) // a leftover of an interrupted attempt with this number
+	root, err := openOutputDir(outDir)
+	if err != nil {
+		return nil, "", err
+	}
+	defer func() {
+		root.Close()
+		_ = os.RemoveAll(outDir)
+	}()
+	prompt, err := d.prompt(round, feedback)
+	if err != nil {
+		return nil, "", err
+	}
+	runDir := filepath.Join(d.repo.Root, filepath.FromSlash(a.RunDir))
+	d.logf("  discovery round %d, attempt %d with profile %q", round, a.N, a.Profile)
+	outPath, err := runAgent(ctx, d.cfg.Profiles[a.Profile], d.cfg.PassEnv, outDir, prompt, runDir, "discover")
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, "", err
+		}
+		if uncertainExit(err) {
+			a.Result, a.Feedback = "failed", err.Error()
+			return nil, fmt.Sprintf("The discovery agent %q was interrupted or timed out. Confirm its processes stopped, then run again: aeh discover run %s", a.Profile, d.state.Slug), nil
+		}
+		return fail(err.Error())
+	}
+	out, _ := os.ReadFile(outPath)
+	var m outputManifest
+	switch discoveryVerdict(string(out)) {
+	case discoveryQuestions:
+		m = questionsManifest()
+	case discoveryBook:
+		m = bookManifest(d.dcfg)
+	default:
+		return fail(fmt.Sprintf("the output must end with a line %q or %q", discoveryQuestions, discoveryBook))
+	}
+	frozen, err := freezeOutput(root, m)
+	if err != nil {
+		return fail(err.Error())
+	}
+	for _, rel := range sortedKeys(frozen.Files) {
+		if err := checkNoSecrets(rel, frozen.Files[rel]); err != nil {
+			return fail(err.Error())
+		}
+	}
+	res := &discoveryOutput{snapshot: frozen}
+	if m.Name == questionsManifest().Name {
+		res.kind = roundQuestions
+		res.questions, err = parseDiscoveryQuestions(frozen.Files["questions.yaml"], round, d.dcfg.MaxQuestions)
+	} else {
+		res.kind = roundBook
+		res.files, err = d.bookFiles(frozen)
+	}
+	if err != nil {
+		return fail(err.Error())
+	}
+	if err := saveFrozen(filepath.Join(d.dir, "snapshots", fmt.Sprintf("a%d.json", a.N)), frozen); err != nil {
+		return nil, "", err
+	}
+	a.Result, a.Snapshot = "accepted", frozen.Digest
+	return res, "", nil
+}
+
+func discoveryVerdict(out string) string {
+	lines := strings.Split(strings.TrimRight(strings.ReplaceAll(out, "\r\n", "\n"), "\n \t"), "\n")
+	switch last := strings.TrimSpace(lines[len(lines)-1]); last {
+	case discoveryQuestions, discoveryBook:
+		return last
+	}
+	return ""
+}
+
+func questionsManifest() outputManifest {
+	return outputManifest{
+		Name:     "discovery-questions",
+		Rules:    []outputRule{{Pattern: "questions.yaml", Kind: outputYAML, MaxBytes: discoveryDocBytes, MaxCount: 1, Required: true}},
+		MaxFiles: 1,
+		MaxTotal: discoveryDocBytes,
+	}
+}
+
+func bookManifest(d DiscoveryConfig) outputManifest {
+	mockups := 4 * d.MaxFeatures
+	return outputManifest{
+		Name: "discovery-book",
+		Rules: []outputRule{
+			{Pattern: "vision.md", Kind: outputMarkdown, MaxBytes: discoveryDocBytes, MaxCount: 1, Required: true},
+			{Pattern: "data.md", Kind: outputMarkdown, MaxBytes: discoveryDocBytes, MaxCount: 1, Required: true},
+			{Pattern: "features/*.md", Kind: outputMarkdown, MaxBytes: discoveryDocBytes, MaxCount: d.MaxFeatures, Required: true},
+			{Pattern: "mockups/*/*.html", Kind: outputHTML, MaxBytes: int64(d.MaxMockupBytes), MaxCount: mockups},
+		},
+		MaxFiles: 2 + d.MaxFeatures + mockups,
+		MaxTotal: int64(2+d.MaxFeatures)*discoveryDocBytes + int64(mockups)*int64(d.MaxMockupBytes),
+	}
+}
+
+// questionsFile is the schema of questions.yaml.
+type questionsFile struct {
+	Questions []struct {
+		Text     string   `yaml:"text"`
+		Why      string   `yaml:"why"`
+		Blocking *bool    `yaml:"blocking"`
+		Options  []string `yaml:"options"`
+	} `yaml:"questions"`
+}
+
+// parseDiscoveryQuestions reads questions.yaml; aeh assigns the IDs R<round>-Q<n> in order.
+func parseDiscoveryQuestions(b []byte, round, max int) ([]DiscoveryQuestion, error) {
+	var f questionsFile
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true)
+	if err := dec.Decode(&f); err != nil {
+		return nil, errors.New("questions.yaml must be a mapping with a questions list of text, why, blocking and options")
+	}
+	if len(f.Questions) == 0 || len(f.Questions) > max {
+		return nil, fmt.Errorf("questions.yaml must hold from 1 through %d questions", max)
+	}
+	var out []DiscoveryQuestion
+	for i, q := range f.Questions {
+		n := i + 1
+		if err := checkDisplayLine(q.Text, discoveryLineBytes); err != nil {
+			return nil, fmt.Errorf("question %d text: %w", n, err)
+		}
+		if err := checkDisplayLine(q.Why, discoveryLineBytes); err != nil {
+			return nil, fmt.Errorf("question %d why: %w", n, err)
+		}
+		if q.Blocking == nil {
+			return nil, fmt.Errorf("question %d must say blocking: true or false", n)
+		}
+		if len(q.Options) > discoveryMaxOptions {
+			return nil, fmt.Errorf("question %d has more than %d options", n, discoveryMaxOptions)
+		}
+		for j, o := range q.Options {
+			if err := checkDisplayLine(o, discoveryOptionBytes); err != nil {
+				return nil, fmt.Errorf("question %d option %d: %w", n, j+1, err)
+			}
+		}
+		out = append(out, DiscoveryQuestion{ID: fmt.Sprintf("R%d-Q%d", round, n), Text: strings.TrimSpace(q.Text),
+			Why: strings.TrimSpace(q.Why), Blocking: *q.Blocking, Options: q.Options})
+	}
+	return out, nil
+}
+
+// bookFiles validates a draft book and returns its memory files. Every document passes the
+// display policy; every mockup is rebuilt from validated tokens.
+func (d *discoverySession) bookFiles(f frozenOutput) (map[string][]byte, error) {
+	features := map[string]bool{}
+	for _, rel := range sortedKeys(f.Files) {
+		if name, ok := strings.CutPrefix(rel, "features/"); ok {
+			slug := strings.TrimSuffix(name, ".md")
+			if err := checkSlug(slug); err != nil {
+				return nil, fmt.Errorf("%s: %w", rel, err)
+			}
+			features[slug] = true
+		}
+	}
+	files := map[string][]byte{}
+	for _, rel := range sortedKeys(f.Files) {
+		b := f.Files[rel]
+		if strings.HasSuffix(rel, ".html") {
+			parts := strings.Split(strings.TrimSuffix(rel, ".html"), "/") // mockups/<feature>/<screen>
+			if !features[parts[1]] {
+				return nil, fmt.Errorf("%s: mockups belong under a feature of this book", rel)
+			}
+			if err := checkSlug(parts[2]); err != nil {
+				return nil, fmt.Errorf("%s: screen %w", rel, err)
+			}
+			page, err := sanitizeMockup(b, parts[1]+" / "+parts[2], d.dcfg.MaxMockupBytes, discoveryImageBytes)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", rel, err)
+			}
+			b = page
+		} else if err := checkDisplayMarkdown(string(b), discoveryDocBytes); err != nil {
+			return nil, fmt.Errorf("%s: %w", rel, err)
+		}
+		files[d.memRel("drafts/"+rel)] = b
+	}
+	return files, nil
+}
+
+// accept records an accepted round in state and memory, in one pending step.
+func (d *discoverySession) accept(round int, a *DiscoveryAttempt, out *discoveryOutput) error {
+	st := d.state
+	r := DiscoveryRound{N: round, Kind: out.kind, Profile: a.Profile, Snapshot: out.snapshot.Digest, Questions: out.questions}
+	files := map[string][]byte{}
+	subject := fmt.Sprintf("discover %s: round %d questions", st.Slug, round)
+	if out.kind == roundBook {
+		files = out.files
+		for _, rel := range sortedKeys(files) {
+			r.Files = append(r.Files, strings.TrimPrefix(rel, d.memRel("")))
+		}
+		subject = fmt.Sprintf("discover %s: round %d draft book", st.Slug, round)
+	}
+	st.Rounds = append(st.Rounds, r)
+	files[d.roundRel(round)] = []byte(d.renderRound(st.Rounds[len(st.Rounds)-1]))
+	st.Phase, st.Status, st.Question = d.phase(), "", ""
+	if err := d.record(files, subject, fmt.Sprintf("round %d %s", round, out.kind)); err != nil {
+		return err
+	}
+	switch st.Phase {
+	case DiscoveryDraft:
+		d.logf("round %d: the draft book is in memory under %s", round, d.memRel("drafts/"))
+	case DiscoveryAwaiting:
+		d.logf("round %d: the agent has questions; see them with: aeh discover show %s", round, st.Slug)
+	default:
+		d.logf("round %d: the agent has optional questions; answer them, or run the next round: aeh discover run %s", round, st.Slug)
+	}
+	return nil
+}
+
+func (d *discoverySession) roundRel(n int) string { return d.memRel(fmt.Sprintf("rounds/%02d.md", n)) }
+
+// phase derives the session phase from its rounds.
+func (d *discoverySession) phase() string {
+	rounds := d.state.Rounds
+	if len(rounds) == 0 {
+		return DiscoveryReady
+	}
+	last := rounds[len(rounds)-1]
+	if last.Kind == roundBook {
+		return DiscoveryDraft
+	}
+	for _, q := range last.Questions {
+		if q.Blocking && len(q.Answers) == 0 {
+			return DiscoveryAwaiting
+		}
+	}
+	return DiscoveryReady
+}
+
+// renderRound is the readable record of a round in memory. It depends only on state, so a
+// pending import can be rebuilt byte for byte.
+func (d *discoverySession) renderRound(r DiscoveryRound) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# Round %d\n\nGenerated by aeh from the discovery agent (profile %s) and the owner's answers. Do not edit by hand.\n", r.N, r.Profile)
+	if r.Kind == roundBook {
+		b.WriteString("\nThe agent proposed a draft book. Drafts are not features: they claim no paths until the owner promotes one.\n\n")
+		for _, f := range r.Files {
+			fmt.Fprintf(&b, "- [%s](../%s)\n", f, f)
+		}
+		return b.String()
+	}
+	for _, q := range r.Questions {
+		kind := "optional"
+		if q.Blocking {
+			kind = "blocking"
+		}
+		fmt.Fprintf(&b, "\n## %s (%s)\n\n%s\n\nWhy: %s\n", q.ID, kind, q.Text, q.Why)
+		if len(q.Options) > 0 {
+			b.WriteString("\nOptions:\n\n")
+			for _, o := range q.Options {
+				fmt.Fprintf(&b, "- %s\n", o)
+			}
+		}
+		for i, a := range q.Answers {
+			label := "Answer"
+			if i > 0 {
+				label = "Revised answer"
+			}
+			fmt.Fprintf(&b, "\n%s (%s):\n\n%s\n", label, a.Date, a.Text)
+		}
+		if q.Skipped {
+			b.WriteString("\nSkipped by the owner.\n")
+		}
+	}
+	return b.String()
+}
+
+// findQuestion locates a question by ID.
+func (d *discoverySession) findQuestion(qid string) (*DiscoveryRound, *DiscoveryQuestion, error) {
+	m := discoveryQID.FindStringSubmatch(qid)
+	if m == nil {
+		return nil, nil, fmt.Errorf("question ID %q must look like R1-Q2", qid)
+	}
+	for i := range d.state.Rounds {
+		r := &d.state.Rounds[i]
+		for j := range r.Questions {
+			if r.Questions[j].ID == qid {
+				return r, &r.Questions[j], nil
+			}
+		}
+	}
+	return nil, nil, fmt.Errorf("discovery %s has no question %s; see them with: aeh discover show %s", d.state.Slug, qid, d.state.Slug)
+}
+
+// DiscoverAnswer records the owner's answer to a question. Answering again records a revision;
+// the next round receives only the latest one.
+func DiscoverAnswer(r Repo, slug, qid, text string) (DiscoveryState, error) {
+	d, unlock, err := openDiscovery(r, slug, nil)
+	if err != nil {
+		return DiscoveryState{}, err
+	}
+	defer unlock()
+	if err := d.resume(); err != nil {
+		return d.snapshot(), err
+	}
+	text = normalizeOwnerText(text)
+	if err := checkOwnerText("answer", text, discoveryAnswerBytes); err != nil {
+		return *d.state, err
+	}
+	round, q, err := d.findQuestion(qid)
+	if err != nil {
+		return *d.state, err
+	}
+	q.Answers = append(q.Answers, DiscoveryAnswer{Text: text, Date: memoryNow().UTC().Format("2006-01-02")})
+	q.Skipped = false
+	return d.recordQuestion(round, fmt.Sprintf("answer %s", qid))
+}
+
+// DiscoverSkip records that the owner skips an optional question.
+func DiscoverSkip(r Repo, slug, qid string) (DiscoveryState, error) {
+	d, unlock, err := openDiscovery(r, slug, nil)
+	if err != nil {
+		return DiscoveryState{}, err
+	}
+	defer unlock()
+	if err := d.resume(); err != nil {
+		return d.snapshot(), err
+	}
+	round, q, err := d.findQuestion(qid)
+	if err != nil {
+		return *d.state, err
+	}
+	switch {
+	case q.Blocking:
+		return *d.state, fmt.Errorf("%s is a blocking question; answer it: aeh discover answer %s %s \"...\"", qid, slug, qid)
+	case len(q.Answers) > 0:
+		return *d.state, fmt.Errorf("%s is already answered", qid)
+	case q.Skipped:
+		return *d.state, nil
+	}
+	q.Skipped = true
+	return d.recordQuestion(round, fmt.Sprintf("skip %s", qid))
+}
+
+func (d *discoverySession) recordQuestion(round *DiscoveryRound, what string) (DiscoveryState, error) {
+	st := d.state
+	if st.Phase != DiscoveryDraft {
+		st.Phase = d.phase()
+	}
+	files := map[string][]byte{d.roundRel(round.N): []byte(d.renderRound(*round))}
+	if err := d.record(files, fmt.Sprintf("discover %s: %s", st.Slug, what), what); err != nil {
+		return *st, err
+	}
+	return *st, nil
+}
+
+// prompt renders the discovery prompt for a round.
+func (d *discoverySession) prompt(round int, feedback string) (string, error) {
+	text, err := loadPrompt(d.repo, "discover.md")
+	if err != nil {
+		return "", err
+	}
+	memory, err := LoadMemory(d.repo)
+	if err != nil {
+		return "", err
+	}
+	data := promptData{
+		Idea:         d.state.Idea,
+		History:      d.history(),
+		Features:     featureIndexBlock(memory),
+		Research:     d.dcfg.Research,
+		Round:        round,
+		MaxQuestions: d.dcfg.MaxQuestions,
+		MaxFeatures:  d.dcfg.MaxFeatures,
+		MaxBytes:     d.dcfg.MaxMockupBytes,
+		Feedback:     feedback,
+	}
+	return renderPrompt("discover.md", text, data)
+}
+
+// history lists earlier questions with the latest answer of each, or that the owner skipped
+// or has not answered it.
+func (d *discoverySession) history() string {
+	var b strings.Builder
+	for _, r := range d.state.Rounds {
+		if r.Kind != roundQuestions {
+			continue
+		}
+		for _, q := range r.Questions {
+			fmt.Fprintf(&b, "%s: %s\n", q.ID, q.Text)
+			switch {
+			case len(q.Answers) > 0:
+				fmt.Fprintf(&b, "Answer: %s\n\n", q.Answers[len(q.Answers)-1].Text)
+			case q.Skipped:
+				b.WriteString("Skipped by the owner.\n\n")
+			default:
+				b.WriteString("Not answered.\n\n")
+			}
+		}
+	}
+	return b.String()
+}

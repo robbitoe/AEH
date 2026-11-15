@@ -51,6 +51,40 @@ For small changes that don't need sealed tests:
 aeh do "fix the null check in FeeService.Calculate" --paths src/Fees/
 ```
 
+## From an idea to a draft book
+
+Discovery turns an idea into a draft book of specs in memory, through rounds of an agent's questions and your answers. It needs initialized memory and a configured ladder.
+
+```sh
+aeh discover new shop "A small online shop for handmade goods"
+aeh discover run shop                 # round 1: the agent asks, or writes the book
+aeh discover show shop                # questions R1-Q1, R1-Q2, ... with why and options
+aeh discover answer shop R1-Q1 "Consumers only"
+aeh discover skip shop R1-Q2          # optional questions only
+aeh discover run shop                 # next round, with the latest answer to each question
+```
+
+A round ends with questions or with the draft book. Blocking questions must be answered before the next round. Answering again records a revision, and the next round receives only the latest one. The book has `vision.md`, `data.md`, one `features/<feature>.md` per feature with acceptance criteria, and optional HTML mockups. It is stored under `wiki/discovery/<slug>/drafts/` in memory. Drafts are not features: they claim no paths, and no run sees them.
+
+The agent writes only into an output directory that aeh opened before the agent ran. aeh freezes that output against an exact list of allowed files and limits. Then it checks the output:
+
+- Text: restricted Markdown, with no HTML, no character references and no external images.
+- Secrets: known secret formats are rejected. A diagnostic gives the line and kind, never the value.
+- Mockups: each mockup is rebuilt from an allowlisted HTML fragment inside a page with a restrictive Content Security Policy.
+
+A rejected attempt goes back to the agent as feedback, and the discovery ladder works like the build ladder. Each step is one marked memory commit. A step interrupted after aeh saved it finishes on the next discovery command.
+
+The idea and your answers go to the configured agent provider inside the prompt. Web research is off by default (`discovery.research`). aeh cannot stop a CLI from using the web if its profile allows it, so choose discovery profiles without web tools.
+
+```yaml
+discovery:
+  ladder: [strong]           # defaults to the build ladder
+  max_questions: 7
+  max_features: 12
+  max_mockup_bytes: 204800
+  research: false
+```
+
 ## From an approved spec to code
 
 Initialize product memory and create a feature spec with literal ownership paths (see [Product memory](#product-memory)). The spec must have structured criteria:
@@ -195,6 +229,7 @@ aeh/                      committed
   runs/<ID>/<task>-a<n>/  prompt, agent output, candidate SHA, diff, gate results
   reports/<ID>.md         evidence report
   pending/<ID>.json       accepted changes still to be written to memory
+  discovery/<slug>/       discovery session state and frozen agent outputs
   memory/                 product memory: its own local Git repository, no remote
 ```
 
@@ -209,6 +244,11 @@ Make sure your project's `.gitignore` covers build output (`bin/`, `obj/`, `node
 | Command | What it does |
 | --- | --- |
 | `aeh init` | Creates `aeh/config.yaml`, an example outcome, and ignores `.aeh/`. |
+| `aeh discover new <slug> "<idea>"` | Starts a discovery session and records the idea in memory. |
+| `aeh discover run <slug>` | Runs one discovery round: questions, or the draft book. Exit code 3 when the ladder is exhausted. |
+| `aeh discover show <slug>` | Phase, questions and answers of a session. |
+| `aeh discover answer <slug> <QID> "<text>"` | Answers a question; answering again records a revision. |
+| `aeh discover skip <slug> <QID>` | Skips an optional question. |
 | `aeh tests approve <ID>` | Seals a manual outcome's acceptance tests; refuses generated outcomes. |
 | `aeh plan <feature>` | Plans an approved spec, reviews and seals its tests, and publishes `aeh/<ID>`; resumes an unfinished plan. |
 | `aeh run <ID>` | Runs the outcome. Exit code 0 accepted, 3 blocked, 1 error. |
@@ -240,11 +280,11 @@ The engine above is the build stage of the [vision](docs/vision.md). Next, in or
 1. **Memory.** A private wiki in `.aeh/memory/` with versioned specs, kept in sync with the code by a deterministic drift gate.
 2. **Triage and reviewers (implemented).** Trivial, change and new routes, with QA, security and DBA reviewers chosen by route and rules.
 3. **Specs to code (implemented).** An approved feature produces one task and independently reviewed, runner-sealed acceptance tests with `aeh plan`.
-4. **Discovery.** From a vague idea to a spec book with HTML mockups.
+4. **Discovery (in progress).** From a vague idea to a spec book with HTML mockups: rounds of questions and the draft book are implemented; review, promotion to features, and adoption of existing systems come next.
 5. **Live review.** Specs keep evolving while approved features are built.
 6. **Sandbox.** Agents in a container with no network by default.
 
-Discovery and live spec/test revision remain future work. Manual outcomes, tasks and acceptance tests can also be written by hand or with your agent CLI.
+Promoting drafts, adopting existing systems and live spec/test revision remain future work. Manual outcomes, tasks and acceptance tests can also be written by hand or with your agent CLI.
 
 ## Development
 
