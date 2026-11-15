@@ -485,13 +485,14 @@ func discardPartialImport(dir string, p *pendingImport, session string) error {
 	}
 	var paths []string
 	for _, e := range strings.Split(strings.TrimRight(out, "\x00"), "\x00") {
-		if len(e) < 4 || e[0] == 'R' || e[0] == 'C' {
-			return nil // a rename or copy is not aeh's
+		if len(e) < 4 || strings.ContainsAny(e[:2], "RCUD") || e[:2] == "AA" {
+			return nil // renames, copies, deletions and conflicts are not aeh's
 		}
 		paths = append(paths, e[3:])
 	}
 	// Both the working file and the index entry must be aeh's: the index may hold HEAD's
-	// content (not staged yet) or exactly what aeh wrote (staged by the import).
+	// content (not staged yet) or exactly what aeh wrote (staged by the import). A path in
+	// HEAD must still be in the index: removing it from the index was someone's decision.
 	for _, rel := range paths {
 		disk, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(rel)))
 		if err != nil {
@@ -508,6 +509,9 @@ func discardPartialImport(dir string, p *pendingImport, session string) error {
 			return nil
 		}
 		if !bytes.Equal(disk, want) {
+			return nil
+		}
+		if inHead && !inIndex {
 			return nil
 		}
 		if inIndex && !(inHead && index == head) && index != string(want) {

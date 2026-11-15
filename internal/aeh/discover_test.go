@@ -280,6 +280,38 @@ func TestDiscoveryLadderResetsEachRound(t *testing.T) {
 	}
 }
 
+// discardPartialImport removes a new batch file the import already staged, and leaves every
+// index decision of the owner alone.
+func TestDiscardPartialImportIndexStates(t *testing.T) {
+	r := newMemoryProject(t)
+	mem := memDir(t, r)
+	newRel, oldRel := "wiki/discovery/shop/drafts/vision.md", "wiki/index.md"
+	head := mustGit(t, mem, "show", "HEAD:"+oldRel)
+	p := &pendingImport{Log: "l", Files: map[string][]byte{newRel: []byte("# Vision\n"), oldRel: []byte(head + "changed\n")}}
+
+	write(t, mem, newRel, "# Vision\n")
+	mustGit(t, mem, "add", newRel)
+	if err := discardPartialImport(mem, p, "discover/shop"); err != nil {
+		t.Fatal(err)
+	}
+	if err := memoryClean(mem); err != nil {
+		t.Fatalf("a staged new batch file was not discarded: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(mem, "wiki", "discovery")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("empty directories left: %v", err)
+	}
+
+	// The owner removed a tracked batch path from the index: kept.
+	write(t, mem, oldRel, head+"changed\n")
+	mustGit(t, mem, "rm", "-q", "--cached", "--", oldRel)
+	if err := discardPartialImport(mem, p, "discover/shop"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gitRaw(mem, "cat-file", "-e", ":"+oldRel); err == nil {
+		t.Fatal("the owner's index removal was undone")
+	}
+}
+
 func TestRedactDiagnostic(t *testing.T) {
 	secret := "ghp_" + strings.Repeat("B", 36)
 	got := redactDiagnostic("x" + secret + ".md\x1b[2J\u202e is not an expected file\nline two")
