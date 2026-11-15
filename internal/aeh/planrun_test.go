@@ -481,3 +481,128 @@ func TestPlanRefusesAnUntrackedTestDirectory(t *testing.T) {
 		t.Fatalf("untracked test directory not detected: %v", err)
 	}
 }
+
+func TestPlanRulesOnFilesAndTaskPathsAddReviewersForGood(t *testing.T) {
+	// Attempt 1 plans src/db/ (a rule adds DBA) and fails red; attempt 2 plans src/ and passes.
+	author := `d=` + planDir + `; mkdir -p $d
+case "$1" in
+*"previous attempt"*) printf 'grep -q "paid" src/pay.txt\n' > $d/pay.sh; p="src/" ;;
+*) printf 'exit 0\n' > $d/pay.sh; p="src/db/" ;;
+esac
+printf 'task:\n  goal: Write src/pay.txt saying paid\n  paths: [%s]\ntrace:\n  AC-1: [pay.sh]\n' "$p" > $d/plan.yaml
+echo "PLAN: READY"`
+	f := newPlanFixture(t, author, reviewOK)
+	f.writeConfig("triage:\n  rules:\n    - name: db\n      paths: [src/db]\n      reviewers: [dba]\n    - name: suite\n      paths: [\"tests/acceptance/**\"]\n      reviewers: [security]\n")
+	f.commitAll("rules")
+	st := f.plan()
+	if st.Phase != PlanLogged || len(st.Attempts) != 2 || st.Attempts[0].FailedStep != "red" {
+		t.Fatalf("setup: %+v", st.Attempts)
+	}
+	if reviewRolesOf(st.Reviews) != "qa,security,dba" {
+		t.Fatalf("the DBA review added by attempt 1 must stay: %s", reviewRolesOf(st.Reviews))
+	}
+	outcome, _ := gitBlob(f.dir, st.PlanCommit, "aeh/outcomes/"+planID+".yaml")
+	if !strings.Contains(outcome, "route: new") {
+		t.Fatalf("outcome route: %s", outcome)
+	}
+}
+
+func reviewRolesOf(vs []ReviewVerdict) string {
+	var roles []string
+	for _, v := range vs {
+		roles = append(roles, v.Role)
+	}
+	return strings.Join(roles, ",")
+}
+
+func TestPlanFingerprintCoversEffectiveReviewers(t *testing.T) {
+	f := newPlanFixture(t, `echo "PLAN: TOO-LARGE"`, reviewOK)
+	// Legacy configuration: no reviewers section, one reviewer for every role.
+	original := readFile(t, f.repo.ConfigPath())
+	legacy := func(name string) {
+		cfg := original
+		i := strings.Index(cfg, "reviewers:\n")
+		j := strings.Index(cfg, "profiles:\n")
+		write(t, f.dir, "aeh/config.yaml", cfg[:i]+"reviewer: "+name+"\n"+cfg[j:]+
+			"  qa2:\n    provider: qa2\n    command: [\"sh\", \""+filepath.ToSlash(filepath.Join(f.tmp, "qa.sh"))+"\", \"{{prompt}}\"]\n")
+	}
+	legacy("qa")
+	if st := f.plan(); st.Status != StatusBlocked {
+		t.Fatalf("setup: %+v", st)
+	}
+	if err := Answer(f.repo, planID, "Retry."); err != nil {
+		t.Fatal(err)
+	}
+	legacy("qa2")
+	if _, err := PlanFeature(context.Background(), f.repo, "pay", nil); err == nil || !strings.Contains(err.Error(), "inputs changed") {
+		t.Fatalf("a different effective reviewer must not resume: %v", err)
+	}
+}
+
+func TestPlanBlocksWhenARecordedSealedTestIsMissing(t *testing.T) {
+	f := newPlanFixture(t, countCall+authorOK, reviewOK)
+	snap, _ := LoadMemory(f.repo)
+	spec, _ := snap.Spec("pay")
+	recordImplementation(t, f.repo, spec, "pay-v0_1_0", mustGit(t, f.dir, "rev-parse", "HEAD"))
+	editSpec(t, f.repo, "pay", "then src/pay.txt says paid.\n", "then src/pay.txt says paid.\n- AC-2: Given a paid cart, when paid again, then nothing changes.\n")
+	if _, _, err := ApproveSpec(f.repo, "pay"); err != nil {
+		t.Fatal(err)
+	}
+	st, err := PlanFeature(context.Background(), f.repo, "pay", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Status != StatusBlocked || !strings.Contains(st.Question, "lacks sealed tests") || f.count("author") != 0 {
+		t.Fatalf("a missing sealed test must block the baseline: %+v", st)
+	}
+}
+
+func TestPlanResumesInterruptedReviewsOnTheSameCommit(t *testing.T) {
+	f := newPlanFixture(t, countCall+authorOK, countCall+reviewOK)
+	st := f.plan()
+	authors, reviews := f.count("author"), f.count("qa")
+	// Rewind to "QA approved, security still to review", as if the process stopped there.
+	a := &st.Attempts[len(st.Attempts)-1]
+	a.FailedStep, a.Reviews = "reviewing", a.Reviews[:1]
+	st.Phase, st.Status, st.PlanCommit, st.Reviews = PlanAuthoring, StatusRunning, "", nil
+	mustGit(t, f.dir, "branch", "-D", IntegrationBranch(planID))
+	if err := savePlanState(f.repo, &st); err != nil {
+		t.Fatal(err)
+	}
+	got := f.plan()
+	if got.Phase != PlanLogged || got.PlanCommit != a.Frozen || f.count("author") != authors || f.count("qa") != reviews+1 {
+		t.Fatalf("resume must ask only the missing reviewer on the same commit: %+v (authors %d, reviews %d)", got, f.count("author")-authors, f.count("qa")-reviews)
+	}
+	if reviewRolesOf(got.Reviews) != "qa,security" {
+		t.Fatalf("reviews: %+v", got.Reviews)
+	}
+	// A successful attempt whose publication was not recorded goes straight to publication.
+	got.Phase, got.Status, got.PlanCommit = PlanAuthoring, StatusRunning, ""
+	mustGit(t, f.dir, "branch", "-D", IntegrationBranch(planID))
+	if err := savePlanState(f.repo, &got); err != nil {
+		t.Fatal(err)
+	}
+	if again := f.plan(); again.PlanCommit != a.Frozen || f.count("qa") != reviews+1 || f.count("author") != authors {
+		t.Fatalf("a finished attempt ran again: %+v", again)
+	}
+}
+
+func TestPlanLogRecoveryAfterStagedWrite(t *testing.T) {
+	f := newPlanFixture(t, authorOK, reviewOK)
+	st := f.plan()
+	mem := memDir(t, f.repo)
+	mustGit(t, mem, "reset", "-q", "--soft", "HEAD~1") // the entry is staged, not committed
+	st.Phase, st.Status = PlanPublished, StatusRunning
+	if err := savePlanState(f.repo, &st); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.plan(); got.Phase != PlanLogged {
+		t.Fatalf("staged log entry not recovered: %+v", got)
+	}
+	if strings.Count(readFile(t, filepath.Join(mem, "wiki", "log.md")), "plan | pay 0.1.0 -> "+planID) != 1 {
+		t.Fatal("log entry duplicated")
+	}
+	if err := memoryClean(mem); err != nil {
+		t.Fatal(err)
+	}
+}
