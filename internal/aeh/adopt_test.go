@@ -207,7 +207,7 @@ printf '%s\n' "$1" | grep -F 'Excluded as possible secrets' >/dev/null
 	if b, _ := os.ReadFile(filepath.Join(f.dir, ".ENV.prod")); !strings.Contains(string(b), "ghp_") {
 		t.Fatal("main checkout secret changed")
 	}
-	prompt, err := os.ReadFile(filepath.Join(f.dir, ".aeh", "runs", "adopt-system", "a1", "adopt.prompt.md"))
+	prompt, err := os.ReadFile(filepath.Join(f.dir, ".aeh", "runs", "adopt", "a1", "adopt.prompt.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -572,7 +572,7 @@ echo 'INVENTORY: READY'
 	if len(st.Attempts) != 3 || st.Attempts[0].Profile != "bad" || st.Attempts[1].Profile != "bad" || st.Attempts[2].Profile != "agent" {
 		t.Fatalf("ladder: %+v", st.Attempts)
 	}
-	for _, p := range []string{filepath.Join(f.dir, ".aeh", "adopt", "state.json"), f.repo.ReportPath("adopt"), filepath.Join(f.dir, ".aeh", "runs", "adopt-system", "a3", "adopt.prompt.md")} {
+	for _, p := range []string{filepath.Join(f.dir, ".aeh", "adopt", "state.json"), f.repo.ReportPath("adopt"), filepath.Join(f.dir, ".aeh", "runs", "adopt", "a3", "adopt.prompt.md")} {
 		b, err := os.ReadFile(p)
 		if err != nil || strings.Contains(string(b), secret) {
 			t.Fatalf("unsafe feedback in %s: %v", p, err)

@@ -245,9 +245,20 @@ func checkSuggested(b []byte) error {
 	if err := checkNoSecrets("config.suggested.yaml", b); err != nil {
 		return err
 	}
-	// Also inspect decoded scalars: YAML escapes must not conceal a token or terminal control.
+	// Also inspect decoded scalars, before any typed decoding: YAML escapes must not conceal a
+	// token or terminal control, and a type error quotes a (truncated) value that redaction
+	// could no longer recognize.
 	var doc yaml.Node
 	if err := yaml.Unmarshal(b, &doc); err != nil {
+		return err
+	}
+	if len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
+		return errors.New("config.suggested.yaml must be one YAML mapping")
+	}
+	if err := checkYAMLScalars("config.suggested.yaml", &doc, func(v string) error {
+		fence := promptFence(v)
+		return checkDisplayMarkdown(fence+"\n"+v+"\n"+fence, 16384+2*len(fence)+2)
+	}); err != nil {
 		return err
 	}
 	var suggested Config
@@ -256,28 +267,27 @@ func checkSuggested(b []byte) error {
 	if err := dec.Decode(&suggested); err != nil {
 		return fmt.Errorf("config.suggested.yaml must use only aeh/config.yaml keys, unique mappings and valid value types: %v", err)
 	}
-	var visit func(*yaml.Node) error
-	visit = func(n *yaml.Node) error {
-		if n.Kind == yaml.ScalarNode {
-			if err := checkNoSecrets("config.suggested.yaml scalar", []byte(n.Value)); err != nil {
-				return err
-			}
-			fence := promptFence(n.Value)
-			if err := checkDisplayMarkdown(fence+"\n"+n.Value+"\n"+fence, 16384+2*len(fence)+2); err != nil {
+	return nil
+}
+
+// checkYAMLScalars checks every decoded scalar of a document for secrets, then with check.
+func checkYAMLScalars(name string, n *yaml.Node, check func(string) error) error {
+	if n.Kind == yaml.ScalarNode {
+		if err := checkNoSecrets(name+" scalar", []byte(n.Value)); err != nil {
+			return err
+		}
+		if check != nil {
+			if err := check(n.Value); err != nil {
 				return err
 			}
 		}
-		for _, child := range n.Content {
-			if err := visit(child); err != nil {
-				return err
-			}
+	}
+	for _, child := range n.Content {
+		if err := checkYAMLScalars(name, child, check); err != nil {
+			return err
 		}
-		return nil
 	}
-	if len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
-		return errors.New("config.suggested.yaml must be one YAML mapping")
-	}
-	return visit(&doc)
+	return nil
 }
 
 func resolveAdoptBase(r Repo, rev string) (string, error) {
@@ -373,12 +383,13 @@ func newInspectionWorktree(r Repo, base string, exclude []string, strip bool, na
 
 func (w *inspectionWorktree) close() { removeWorktree(w.repo.Root, w.dir) }
 
-// runName names the run directory of an inspection: the area, or "system" for the inventory.
+// runName names the run directory of an inspection: adopt-<feature> for an area, and adopt
+// for the inventory, which no feature name can produce.
 func (a *adoptSession) runName() string {
 	if a.feature == "" {
-		return "system"
+		return "adopt"
 	}
-	return a.feature
+	return "adopt-" + a.feature
 }
 
 func (a *adoptSession) inspectionName(n int) string {
@@ -696,7 +707,7 @@ func (a *adoptSession) inspectAttempt(ctx context.Context, n int, base, profile 
 		return frozenOutput{}, info, false, err
 	}
 	outPath, runErr := runAgentWithOutput(ctx, cfg.Profiles[profile], cfg.PassEnv, w.dir, outDir, prompt,
-		a.repo.RunDir("adopt-"+a.runName(), fmt.Sprintf("a%d", n)), "adopt")
+		a.repo.RunDir(a.runName(), fmt.Sprintf("a%d", n)), "adopt")
 	if err := w.integrity(false); err != nil {
 		if uncertainExit(runErr) {
 			return frozenOutput{}, info, true, fmt.Errorf("agent wrote into the code; execution was interrupted: %w", runErr)
@@ -995,6 +1006,13 @@ func AdoptInspectArea(ctx context.Context, r Repo, feature string, paths []strin
 	}
 	return a.runInspection(ctx, base, cfg, promptData{AreaPaths: strings.Join(paths, "\n"), Observations: reference.String(), AreaTitle: title}, areaManifest(),
 		func(f frozenOutput, info AdoptInspection) error {
+			var tree yaml.Node
+			if err := yaml.Unmarshal(f.Files["observations.yaml"], &tree); err != nil {
+				return fmt.Errorf("observations.yaml: %v", err)
+			}
+			if err := checkYAMLScalars("observations.yaml", &tree, nil); err != nil {
+				return err
+			}
 			var doc areaOutput
 			dec := yaml.NewDecoder(bytes.NewReader(f.Files["observations.yaml"]))
 			dec.KnownFields(true)
