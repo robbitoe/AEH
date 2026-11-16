@@ -242,11 +242,18 @@ func TestAdoptSealRejectsTestsThatFailOnTheExistingCode(t *testing.T) {
 		t.Fatalf("state: %s", got)
 	}
 	// An answer retries; a fixed author finishes the same plan.
-	if err := Answer(f.repo, planID, "pin only what the code does"); err != nil {
+	// The answer is redacted before it is saved and before the next author sees it.
+	if err := Answer(f.repo, planID, "pin only what the code does, token "+charSecret); err != nil {
 		t.Fatal(err)
 	}
-	f.setScript("author", charAuthorOK)
-	if st, log, err := f.seal(); err != nil || st.Phase != PlanLogged {
+	if strings.Contains(readFile(t, statePath), charSecret) {
+		t.Fatal("the answer reached the state unredacted")
+	}
+	// The retrying author records its prompt, which carries the owner's answer as feedback.
+	prompt := filepath.Join(f.tmp, "author.prompt")
+	f.setScript("author", `printf '%s' "$1" > "`+filepath.ToSlash(prompt)+`"`+"\n"+charAuthorOK)
+	if st, log, err := f.seal(); err != nil || st.Phase != PlanLogged || strings.Contains(log, charSecret) ||
+		!strings.Contains(readFile(t, prompt), "pin only what the code does") || strings.Contains(readFile(t, prompt), charSecret) {
 		t.Fatalf("retry: %v %+v\n%s", err, st, log)
 	}
 }

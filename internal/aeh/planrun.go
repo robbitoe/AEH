@@ -131,6 +131,9 @@ func savePlanState(r Repo, s *PlanState) error {
 // terminal only from here, so no path can skip it. The in-memory state is redacted too.
 func redactPlanState(s *PlanState) {
 	s.Question = redactDiagnostic(s.Question)
+	for i := range s.Answers {
+		s.Answers[i] = redactDiagnostic(s.Answers[i]) // the owner's replies reach the next author
+	}
 	for i := range s.Attempts {
 		s.Attempts[i].Feedback = redactDiagnostic(s.Attempts[i].Feedback)
 	}
