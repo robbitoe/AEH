@@ -18,7 +18,7 @@ import (
 // A characterization plan (kind: characterize) has no task: it only seals tests of
 // behavior the code already has.
 type PlanFile struct {
-	Kind  string              `yaml:"kind,omitempty"`
+	Kind  string              `yaml:"kind,omitempty" json:",omitempty"`
 	Task  PlanTask            `yaml:"task,omitempty"`
 	Trace map[string][]string `yaml:"trace"`
 }

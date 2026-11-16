@@ -293,7 +293,7 @@ type Implementation struct {
 	MaxCriterion int                    `yaml:"max_criterion"`           // highest criterion ID ever approved, retired ones included
 	// ObservedBase, for a characterization, is the commit an adoption agent inspected. Code is
 	// still the published commit that holds the sealed tests.
-	ObservedBase string `yaml:"observed_base_sha,omitempty"`
+	ObservedBase string `yaml:"observed_base_sha,omitempty" json:",omitempty"`
 }
 
 // ImplementedCriterion is one criterion as implemented, with the sealed tests that check it.

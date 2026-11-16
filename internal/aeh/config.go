@@ -150,7 +150,7 @@ type Task struct {
 // Outcome is the contract: what an actor achieves, how it is verified, and how it is split.
 type Outcome struct {
 	ID          string      `yaml:"id"`
-	Kind        string      `yaml:"kind,omitempty"` // "" or characterize: tests only, nothing to implement
+	Kind        string      `yaml:"kind,omitempty" json:",omitempty"` // "" or characterize: tests only, nothing to implement
 	Title       string      `yaml:"title"`
 	Level       int         `yaml:"level"`
 	Actor       string      `yaml:"actor"`

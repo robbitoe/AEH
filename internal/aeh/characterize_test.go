@@ -2,6 +2,7 @@ package aeh
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -17,9 +18,11 @@ printf 'grep -q "paid" src/pay.txt\n' > $d/pay.sh
 printf 'grep -q "EUR" src/pay.txt\n' > $d/currency.sh
 printf 'kind: characterize\ntrace:\n  AC-1: [pay.sh]\n  AC-3: [currency.sh]\n' > $d/plan.yaml
 echo "PLAN: READY"`
-	// A test of behavior the code does not have: it fails on the existing code.
+	// A test of behavior the code does not have: it fails on the existing code, printing a
+	// credential the way a misconfigured system might.
+	charSecret    = "ghp_CHARACTERIZATIONSECRETAAAAAAAAAAAAAA" // ghp_ and 36 characters
 	charAuthorRed = `d=` + planDir + `; mkdir -p $d
-printf 'grep -q "refunded" src/pay.txt\n' > $d/pay.sh
+printf 'echo token ` + charSecret + `; grep -q "refunded" src/pay.txt\n' > $d/pay.sh
 printf 'grep -q "EUR" src/pay.txt\n' > $d/currency.sh
 printf 'kind: characterize\ntrace:\n  AC-1: [pay.sh]\n  AC-3: [currency.sh]\n' > $d/plan.yaml
 echo "PLAN: READY"`
@@ -219,6 +222,19 @@ func TestAdoptSealRejectsTestsThatFailOnTheExistingCode(t *testing.T) {
 	if a.FailedStep != "green" || !strings.Contains(a.Feedback, "fails on the existing code") || f.count("qa") != 0 {
 		t.Fatalf("attempt: %+v", a)
 	}
+	// The command's output is redacted wherever it goes: feedback, state, terminal.
+	statePath, err := planStatePath(f.repo, planID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for where, text := range map[string]string{"state": readFile(t, statePath), "log": log, "question": st.Question} {
+		if strings.Contains(text, charSecret) {
+			t.Fatalf("the secret reached the %s", where)
+		}
+	}
+	if !strings.Contains(a.Feedback, "[redacted") {
+		t.Fatalf("feedback should show the redaction: %s", a.Feedback)
+	}
 	if _, ok := branchCommit(f.dir, IntegrationBranch(planID)); ok {
 		t.Fatal("nothing may be published")
 	}
@@ -258,6 +274,40 @@ func TestAdoptSealRefusesFeaturesThatAreNotAdopted(t *testing.T) {
 	st := f.plan()
 	if st.Status != StatusBlocked || st.Attempts[0].FailedStep != "scope" || !strings.Contains(st.Attempts[0].Feedback, "must not declare a kind") {
 		t.Fatalf("a normal plan must refuse kind: characterize: %+v", st)
+	}
+}
+
+// Empty new fields keep the JSON that execution contracts and plan input digests hashed
+// before characterization existed, so unfinished normal runs and plans still resume.
+func TestCharacterizeFieldsKeepOldJSON(t *testing.T) {
+	for name, v := range map[string]any{
+		"outcome":        Outcome{ID: "X", Title: "x"},
+		"implementation": Implementation{Outcome: "X", Code: obsSHA},
+		"plan":           PlanFile{Task: PlanTask{Goal: "g"}},
+		"state":          PlanState{ID: "X"},
+	} {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s := string(b); strings.Contains(s, "Kind") || strings.Contains(s, "kind") || strings.Contains(s, "bserved") {
+			t.Errorf("%s: %s", name, s)
+		}
+	}
+}
+
+func TestCharacterizationRulesAreConservative(t *testing.T) {
+	rules := []TriageRule{
+		{Name: "migrations", Paths: []string{"src/db/*.sql"}, Route: RouteNew, Reviewers: []string{RoleDBA}},
+		{Name: "auth", Paths: []string{"src/auth/**"}, Route: RouteNew},
+		{Name: "docs", Paths: []string{"docs/**"}, Route: RouteNew},
+	}
+	got := ruleNames(rulesForArea(rules, []string{"src/db/migration*.sql"}))
+	if strings.Join(got, ",") != "migrations" {
+		t.Fatalf("a glob area must raise overlapping glob rules: %v", got)
+	}
+	if got := ruleNames(rulesForArea(rules, []string{"src/**"})); strings.Join(got, ",") != "migrations,auth" {
+		t.Fatalf("an enclosing area raises every rule inside it: %v", got)
 	}
 }
 

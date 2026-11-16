@@ -343,6 +343,24 @@ func planFeature(ctx context.Context, r Repo, feature, kind string, log io.Write
 	return st, nil
 }
 
+// rulesForArea returns every rule that may touch a file of the area: a rule pattern compatible
+// with the literal prefix of any area path counts. Uncertainty raises the route, never lowers it.
+func rulesForArea(rules []TriageRule, paths []string) []TriageRule {
+	var hit []TriageRule
+	for _, rule := range rules {
+	next:
+		for _, rp := range rule.Paths {
+			for _, ap := range paths {
+				if ruleMayTouch(rp, ap) || ruleMayTouch(ap, rp) {
+					hit = append(hit, rule)
+					break next
+				}
+			}
+		}
+	}
+	return hit
+}
+
 // finishPublishedCharacterization completes or reports a characterization of the feature that
 // is already published on its branch: it records it in memory if a crash interrupted that
 // (RecordChange is idempotent by outcome and commit), and is otherwise a no-op. The caller
@@ -464,15 +482,10 @@ func (p *planner) reserve(id, observed string) (PlanState, error) {
 	}
 	st.Roles = requiredRoles(st.Route)
 	if p.kind == PlanCharacterize {
-		// The route and reviewers come from the adopted area: every rule whose paths overlap
-		// the feature's paths raises them. The candidate's real files may raise them further.
-		var hit []TriageRule
-		for _, rule := range p.cfg.Triage.Rules {
-			if pathsOverlap(rule.Paths, p.spec.Paths) {
-				hit = append(hit, rule)
-			}
-		}
-		st.Route, st.Roles = applyRules(st.Route, st.Roles, hit)
+		// The route and reviewers come from the adopted area: every rule that may match
+		// anything below the feature's paths raises them (conservatively, with triage's glob
+		// semantics). The candidate's real files may raise them further.
+		st.Route, st.Roles = applyRules(st.Route, st.Roles, rulesForArea(p.cfg.Triage.Rules, p.spec.Paths))
 	}
 	if st.Inputs, err = p.inputsDigestFor(&st); err != nil {
 		return st, err
@@ -1275,7 +1288,7 @@ func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile
 		return checks, "build", damaged, false, nil
 	}
 	if !g.Passed {
-		return checks, "build", "the build fails with the new tests:\n" + g.Output, false, nil
+		return checks, "build", "the build fails with the new tests:\n" + redactDiagnostic(g.Output), false, nil
 	}
 	dir := p.testDir()
 	seen := map[string]bool{}
@@ -1344,14 +1357,17 @@ func (p *planner) green(ctx context.Context, wt string, files []string, checks [
 		if err != nil {
 			return "", "", false, err
 		}
-		checks = append(checks, PlanCheckEntry{Name: what, Passed: g.Passed && !g.Uncertain, Detail: tail(g.Output, 500)})
+		// Output of the owner's commands on adopted code may carry secrets: it is redacted
+		// before it becomes feedback for the next author, state or a question on the terminal.
+		output := redactDiagnostic(g.Output)
+		checks = append(checks, PlanCheckEntry{Name: what, Passed: g.Passed && !g.Uncertain, Detail: tail(output, 500)})
 		if uncertain, damaged := settle(g); uncertain {
-			return step, g.Output, true, nil
+			return step, output, true, nil
 		} else if damaged != "" {
-			return step, damaged, false, nil
+			return step, redactDiagnostic(damaged), false, nil
 		}
 		if !g.Passed {
-			return step, what + " fails on the existing code; a characterization test must pass without any change:\n" + g.Output, false, nil
+			return step, what + " fails on the existing code; a characterization test must pass without any change:\n" + output, false, nil
 		}
 		return "", "", false, nil
 	}
