@@ -67,12 +67,21 @@ printf 'grep -q "paid" src/pay.txt\n' > $d/`+charSecret+`.sh
 printf 'grep -q "EUR" src/pay.txt\n' > $d/currency.sh
 printf 'kind: characterize\ntrace:\n  AC-1: [`+charSecret+`.sh]\n  AC-3: [currency.sh]\n' > $d/plan.yaml
 echo "PLAN: READY"`)
-	f.setScript("qa", `echo "VERDICT: REJECT"`)
 	st, log, err := f.seal()
-	if err != nil || st.Status != StatusBlocked {
-		t.Fatalf("seal: %v %+v", err, st)
+	if err != nil || st.Status != StatusBlocked || st.Attempts[0].FailedStep != "scope" ||
+		!strings.Contains(st.Attempts[0].Feedback, "contains a credential") || f.count("qa") != 0 {
+		t.Fatalf("a credential in a test path must be rejected before checks and publication: %v %+v", err, st)
+	}
+	if _, ok := branchCommit(f.dir, IntegrationBranch(planID)); ok {
+		t.Fatal("nothing may be published")
 	}
 	noSecretIn(t, f, st, log)
+	// The same rule holds for a normal plan's test files.
+	if err := validatePlanCandidate(PlanInput{OutcomeID: "pay-v0_1_0", Config: Config{}},
+		[]PlanCandidateFile{{Path: "tests/acceptance/pay-v0_1_0/" + charSecret + ".sh", Mode: "100644", Status: 'A'}},
+		PlanFile{}); err == nil || !strings.Contains(err.Error(), "credential") || strings.Contains(err.Error(), charSecret) {
+		t.Fatalf("validatePlanCandidate: %v", err)
+	}
 }
 
 // Errors returned by aeh plan are redacted: a memory change named after a credential appears

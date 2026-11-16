@@ -194,6 +194,11 @@ func validatePlanCandidate(in PlanInput, files []PlanCandidateFile, plan PlanFil
 	folded := map[string]bool{}
 	var total int64
 	for _, f := range ordered {
+		// A test path is published, recorded in memory's implementation history and shown in
+		// later plans: it must not carry a credential. The message never repeats the path.
+		if len(findSecrets([]byte(f.Path))) > 0 {
+			return errors.New("plan: a changed path looks like it contains a credential; rename the file")
+		}
 		if err := checkPlanTestPath(f.Path); err != nil {
 			return fmt.Errorf("plan: changed path %q: %w", f.Path, err)
 		}
