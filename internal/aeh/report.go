@@ -236,3 +236,97 @@ func short(s string) string {
 	}
 	return s
 }
+
+// reportCommand runs while the project lock is still held, including on failed commands.
+func (a *adoptSession) reportCommand(commandErr *error) {
+	st, err := adoptionStatus(a)
+	if err == nil {
+		err = writeAdoptReport(a, st)
+	}
+	if err != nil && *commandErr == nil {
+		*commandErr = redactErr(fmt.Errorf("adopt report: %w", err))
+	}
+}
+
+func writeAdoptReport(a *adoptSession, st AdoptStatusSnapshot) error {
+	var b strings.Builder
+	b.WriteString("# Adoption\n\nSecret filtering is best effort. Excluded files minimize agent input; cooperative read-only checks detect changes and do not isolate agent processes.\n\n")
+	fmt.Fprintf(&b, "Inventory: %s\n\n", st.Inventory)
+	if st.Base != "" {
+		fmt.Fprintf(&b, "Accepted inventory base SHA: %s; date: %s.\n\n", st.Base, st.Date)
+	}
+	root, err := loadAdoptState(a.repo, "")
+	if err != nil {
+		return err
+	}
+	if root.state.Next != nil {
+		fmt.Fprintf(&b, "Pending inventory base SHA: %s; date: %s. Accept with `aeh adopt accept system`.\n\n", root.state.Next.Base, root.state.Next.Date)
+	}
+	for _, area := range st.Areas {
+		fmt.Fprintf(&b, "- %s: %s; paths: %s\n", area.Feature, area.State, strings.Join(area.Paths, ", "))
+	}
+	b.WriteString("\n## Inspections\n\n")
+	sessions := []*adoptSession{root}
+	for _, area := range st.Areas {
+		session, err := loadAdoptSession(a.repo, area.Feature)
+		if err != nil {
+			return err
+		}
+		sessions = append(sessions, session)
+	}
+	// Failed first area attempts have state but no memory area yet.
+	entries, err := os.ReadDir(filepath.Join(a.repo.Root, ".aeh", "adopt"))
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	for _, e := range entries {
+		if !e.IsDir() || checkSlug(e.Name()) != nil {
+			continue
+		}
+		found := false
+		for _, session := range sessions {
+			if session.feature == e.Name() {
+				found = true
+			}
+		}
+		if !found {
+			session, err := loadAdoptSession(a.repo, e.Name())
+			if err != nil {
+				return err
+			}
+			sessions = append(sessions, session)
+		}
+	}
+	for _, session := range sessions {
+		label := session.feature
+		if label == "" {
+			label = "system"
+		}
+		for _, attempt := range session.state.Attempts {
+			fmt.Fprintf(&b, "- %s attempt %d: %s; base %s; profile %s; excluded paths %d; wrote into code: %t.\n", label, attempt.N,
+				attempt.Result, attempt.Base, discoveryDiagnostic(attempt.Profile), attempt.Excluded, attempt.WroteCode)
+			if attempt.Feedback != "" {
+				fmt.Fprintf(&b, "\n%s\n\n", discoveryDiagnostic(attempt.Feedback))
+			}
+		}
+		if p := session.state.Promotion; p != nil {
+			fmt.Fprintf(&b, "\nPromoted %s to %s (%s). Owner approval is still required.\n", p.Name, p.Target, p.Date)
+		}
+	}
+	if v := st.Verification; v != nil {
+		fmt.Fprintf(&b, "\n## Verification\n\nBase SHA: %s; date: %s; config SHA-256: %s; passed: %t.\n\n", v.Base, v.Date, v.ConfigSHA, v.Passed)
+		for _, c := range v.Commands {
+			fmt.Fprintf(&b, "- %s: exit %d; %.3fs; passed: %t; command: %s; integrity: %s\n", c.Name, c.Exit, c.Seconds, c.Passed,
+				discoveryDiagnostic(c.Command), discoveryDiagnostic(c.Integrity))
+		}
+	}
+	b.WriteString("\n## Uncovered groups at the accepted inventory base\n\n")
+	for _, group := range st.Uncovered {
+		fmt.Fprintf(&b, "- %s\n", group)
+	}
+	text := b.String()
+	if err := gateBatchFiles(map[string][]byte{"adopt.md": []byte(text)}); err != nil {
+		return err
+	}
+	return writeFileAtomic(a.repo.ReportPath("adopt"), []byte(text))
+}

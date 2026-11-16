@@ -36,6 +36,13 @@ Discovery (from an idea to a draft book of specs in memory)
                                     accept an advisory document (existing documents use .next.md)
 
 Adoption (an existing system, area by area)
+  aeh adopt inventory [--base <rev>] inspect a pinned base and propose system documentation
+  aeh adopt accept system           accept the pending system inventory
+  aeh adopt area <feature> --paths src/billing/,... [--title "..."] [--base <rev>]
+                                     inspect an area and record observations
+  aeh adopt verify [--base <rev>]    verify only the commands in aeh/config.yaml
+  aeh adopt promote <feature>       create an unapproved spec from keep observations
+  aeh adopt status                  inventory, area states and uncovered path groups
   aeh adopt show <feature>          observations of an area, with their state and decision token
   aeh adopt confirm <feature> AC-<n> keep|bug|drop --seen <token>
                                     decide on an observation as you saw it
@@ -156,7 +163,7 @@ func dispatch(ctx context.Context, args []string) (int, error) {
 		return discoverCommand(ctx, repo, args[1:])
 
 	case "adopt":
-		return adoptCommand(repo, args[1:])
+		return adoptCommand(ctx, repo, args[1:])
 
 	case "plan":
 		if len(args) != 2 {
@@ -314,7 +321,91 @@ func memoryCommand(repo aeh.Repo, args []string) (int, error) {
 	return 2, fmt.Errorf("unknown memory command %q; run `aeh help`", args[0])
 }
 
-func adoptCommand(repo aeh.Repo, args []string) (int, error) {
+func adoptCommand(ctx context.Context, repo aeh.Repo, args []string) (int, error) {
+	if len(args) == 0 {
+		return 2, errors.New("usage: aeh adopt inventory|accept|area|verify|promote|status|show|confirm")
+	}
+	switch args[0] {
+	case "inventory", "verify", "area":
+		fs := flag.NewFlagSet("adopt "+args[0], flag.ContinueOnError)
+		base := fs.String("base", "", "commit to inspect (default: main checkout HEAD)")
+		paths := fs.String("paths", "", "comma-separated fixed area paths")
+		title := fs.String("title", "", "title of a new area")
+		if err := fs.Parse(reorder(args[1:])); err != nil {
+			return 2, err
+		}
+		if args[0] == "verify" {
+			if fs.NArg() != 0 || *paths != "" || *title != "" {
+				return 2, errors.New("usage: aeh adopt verify [--base <rev>]")
+			}
+			v, err := aeh.AdoptVerify(ctx, repo, *base, os.Stdout)
+			if err != nil {
+				return 1, err
+			}
+			fmt.Println("Verification evidence: .aeh/adopt/verify.json")
+			if !v.Passed {
+				return 1, nil
+			}
+			return 0, nil
+		}
+		var st aeh.AdoptRun
+		var err error
+		if args[0] == "inventory" {
+			if fs.NArg() != 0 || *paths != "" || *title != "" {
+				return 2, errors.New("usage: aeh adopt inventory [--base <rev>]")
+			}
+			st, err = aeh.AdoptInventory(ctx, repo, *base, os.Stdout)
+		} else {
+			if fs.NArg() != 1 || *paths == "" {
+				return 2, errors.New("usage: aeh adopt area <feature> --paths src/billing/,... [--title ...] [--base <rev>]")
+			}
+			st, err = aeh.AdoptInspectArea(ctx, repo, fs.Arg(0), splitList(*paths), *title, *base, os.Stdout)
+		}
+		if err != nil {
+			return 1, err
+		}
+		if st.Status == aeh.StatusBlocked {
+			fmt.Println("Adoption blocked: adjust the profile or prompt, then run the command again to retry.")
+			return 3, nil
+		}
+		fmt.Println("Adoption recorded; report: .aeh/reports/adopt.md")
+		return 0, nil
+	case "accept":
+		if len(args) != 2 || args[1] != "system" {
+			return 2, errors.New("usage: aeh adopt accept system")
+		}
+		if err := aeh.AdoptAcceptSystem(repo); err != nil {
+			return 1, err
+		}
+		fmt.Println("Current system inventory accepted in memory.")
+		return 0, nil
+	case "promote":
+		if len(args) != 2 {
+			return 2, errors.New("usage: aeh adopt promote <feature>")
+		}
+		if err := aeh.AdoptPromote(repo, args[1]); err != nil {
+			return 1, err
+		}
+		fmt.Printf("Feature %s promoted; approve with: aeh memory approve %s\n", args[1], args[1])
+		return 0, nil
+	case "status":
+		if len(args) != 1 {
+			return 2, errors.New("usage: aeh adopt status")
+		}
+		st, err := aeh.AdoptStatus(repo)
+		if err != nil {
+			return 1, err
+		}
+		fmt.Printf("Inventory: %s; base %s; date %s\n", st.Inventory, st.Base, st.Date)
+		for _, area := range st.Areas {
+			fmt.Printf("%s: %s (%s)\n", area.Feature, area.State, strings.Join(area.Paths, ", "))
+		}
+		fmt.Println("Uncovered groups at the accepted inventory base:")
+		for _, group := range st.Uncovered {
+			fmt.Println("  " + group)
+		}
+		return 0, nil
+	}
 	if len(args) < 2 {
 		return 2, errors.New("usage: aeh adopt show|confirm <feature> ...")
 	}

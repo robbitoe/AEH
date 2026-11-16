@@ -115,6 +115,62 @@ discovery:
 
 ## Adopting an existing system
 
+Initialize local memory with `aeh memory init`, then run `aeh adopt inventory` to inspect
+the main checkout's HEAD in a disposable detached worktree. Use `--base <rev>` to inspect
+another commit. The runner pins its full SHA, removes possible secret files before the
+agent runs, and checks that the agent changed no checkout files, including ignored files.
+These checks detect changes; agent profiles remain cooperative until sandboxing is added.
+Secret filtering is best effort. Configure read-only agent profiles for adoption.
+
+```yaml
+adopt:
+  ladder: [codex-review] # defaults to the build ladder; profiles must exist
+  exclude: [private/**] # additional repository-relative secret file patterns
+```
+
+Basenames `.env*`, `*.pem`, `*.key`, `id_*`, `*.pfx`, `credentials*`, and `secrets*` are
+excluded case-insensitively. Tracked symbolic links and reparse points are also removed
+before inspection. Agents receive only excluded paths, never link targets. Each profile gets two
+tries; an exhausted ladder blocks, and running the command again retries it.
+
+The inventory becomes `wiki/system.md` in private memory, with base SHA, date and profile.
+Later inventories become `wiki/system.next.md`; `aeh adopt accept system` replaces current
+with next in one memory commit. Repeating acceptance is a no-op. The retained next file is
+an audit copy after acceptance; local state marks whether it is pending.
+Suggested configuration stays in `.aeh/adopt/config.suggested.yaml`. AEH never executes it.
+The owner copies accepted settings into `aeh/config.yaml`, then runs `aeh adopt verify`.
+Verification runs only configured build and test commands, through the gate shell runner
+with its timeout and process-tree cleanup, at the pinned base. It rejects tracked changes
+and new files unless project `.gitignore` files ignore them. Links are recorded by target
+without following them; new ignored links are allowed, while changed or removed existing
+links and links replacing tracked files or directories fail verification. Evidence, including command
+exit codes, duration and the configuration digest, is saved in `.aeh/adopt/verify.json`.
+
+```sh
+aeh adopt area billing --paths src/billing/ --title "Billing"
+aeh adopt show billing
+aeh adopt confirm billing AC-1 keep --seen <token-from-show>
+aeh adopt promote billing
+aeh memory approve billing
+aeh adopt status
+```
+
+Area observations cite regular files inside the supplied paths at the pinned base, with
+start and end lines within the file's line count. Refreshing an area can re-observe active
+IDs; paths stay fixed. `--title` is only for a new area; edit `area.md` to change an existing
+title. Confirm every observation
+as `keep`, `bug` or `drop` before promoting. Promotion requires at least one keep, preserves
+its original AC numbers (gaps included), and permanently reserves retired observation IDs.
+It creates an unapproved 0.1.0 spec; it does not claim implementation or characterization.
+Repeating promotion is a no-op only while the promoted spec's exact bytes remain at memory HEAD.
+Characterization with `aeh adopt seal` belongs to the next stage.
+
+`aeh adopt status` lists observed, confirmed and promoted areas and uncovered groups of
+tracked files at the accepted inventory's base and date. Files not matched by any feature
+or area path are grouped by their first two path segments; partially covered groups remain visible.
+Every adoption command regenerates `.aeh/reports/adopt.md` with inventory, inspection,
+verification and promotion evidence. All memory changes use recoverable pending imports.
+
 An existing system without documentation is adopted area by area. An agent reads an area of the code at a pinned commit and reports observations: behavior with the code locations behind it. Each observation gets its own number, AC-<n>, in an append-only event log in memory (`wiki/adopt/<feature>/observations.log.yaml`). `area.md` holds the area's title, paths and description, and a criteria section that aeh renders from the log: `- AC-<n> (observed): ...` until you decide, then `- AC-<n>: ...` for behavior you confirm.
 
 ```sh
@@ -124,7 +180,7 @@ aeh adopt confirm billing AC-2 bug --seen 81d2c4e5f6a7    # recorded in defects.
 aeh adopt confirm billing AC-3 drop --seen 0c1d2e3f4a5b   # not worth keeping
 ```
 
-The token binds your decision to the observation as you saw it. If an agent observed it again in the meantime, the command fails and shows the new text. The same decision again is a no-op; a different one is refused. A bug or a drop retires the number for good. The log is checked against the memory history, so a rewritten or restored log is refused. A criterion added or changed by hand in `area.md` is reported, not accepted; edit the description freely. Taking an area's inventory and observations with an agent, promoting it to a feature and characterization tests come next.
+The token binds your decision to the observation as you saw it. If an agent observed it again in the meantime, the command fails and shows the new text. The same decision again is a no-op; a different one is refused. A bug or a drop retires the number for good. The log is checked against the memory history, so a rewritten or restored log is refused. A criterion added or changed by hand in `area.md` is reported, not accepted; edit the description freely. Characterization tests come in the next stage.
 
 ## From an approved spec to code
 
@@ -292,6 +348,12 @@ Make sure your project's `.gitignore` covers build output (`bin/`, `obj/`, `node
 | `aeh discover skip <slug> <QID>` | Skips an optional question. |
 | `aeh discover promote <slug> <feature>` | Creates an unapproved spec at 0.1.0 from a committed draft. |
 | `aeh discover accept <slug> vision\|data` | Accepts an advisory document; existing documents use `.next.md`. |
+| `aeh adopt inventory [--base <rev>]` | Inspects a pinned base; proposes system documentation and local configuration. |
+| `aeh adopt accept system` | Accepts the pending system inventory. |
+| `aeh adopt area <feature> --paths a/,... [--title "..."] [--base <rev>]` | Creates or refreshes observations within fixed area paths. |
+| `aeh adopt verify [--base <rev>]` | Runs configured build/test commands in a disposable worktree; saves provenance. |
+| `aeh adopt promote <feature>` | Creates an unapproved 0.1.0 spec from keep observations, retaining criterion numbers. |
+| `aeh adopt status` | Lists inventory state, area states and uncovered path groups. |
 | `aeh adopt show <feature>` | Observations of an adopted area: state, decision and the token to decide on each. |
 | `aeh adopt confirm <feature> AC-<n> keep\|bug\|drop --seen <token>` | Decides on an observation as you saw it; refuses if it changed since. |
 | `aeh tests approve <ID>` | Seals a manual outcome's acceptance tests; refuses generated outcomes. |
@@ -325,11 +387,11 @@ The engine above is the build stage of the [vision](docs/vision.md). Next, in or
 1. **Memory.** A private wiki in `.aeh/memory/` with versioned specs, kept in sync with the code by a deterministic drift gate.
 2. **Triage and reviewers (implemented).** Trivial, change and new routes, with QA, security and DBA reviewers chosen by route and rules.
 3. **Specs to code (implemented).** An approved feature produces one task and independently reviewed, runner-sealed acceptance tests with `aeh plan`.
-4. **Discovery (implemented); adoption next.** From a vague idea to a validated spec book with HTML mockups, advisory independent review, owner promotion to features, and acceptance of vision/data. Adoption of existing systems comes next.
+4. **Discovery and adoption inventory/areas (implemented).** From a vague idea to a validated spec book with HTML mockups, advisory independent review, owner promotion to features, and acceptance of vision/data. Characterization of adopted behavior comes next.
 5. **Live review.** Specs keep evolving while approved features are built.
 6. **Sandbox.** Agents in a container with no network by default.
 
-Adopting existing systems and live spec/test revision remain future work. Manual outcomes, tasks and acceptance tests can also be written by hand or with your agent CLI.
+Adoption characterization and live spec/test revision remain future work. Manual outcomes, tasks and acceptance tests can also be written by hand or with your agent CLI.
 
 ## Development
 

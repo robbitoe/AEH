@@ -42,6 +42,14 @@ type promptData struct {
 	MaxQuestions int
 	MaxFeatures  int
 	Book         string // book review: frozen, validated draft files as reference data
+
+	// Adoption: pinned inspection and an output directory opened before the agent runs.
+	BaseSHA      string
+	OutputDir    string
+	Excluded     string
+	AreaPaths    string
+	AreaTitle    string
+	Observations string
 }
 
 // memorySpecBlock exposes only the declared feature as reference data.
