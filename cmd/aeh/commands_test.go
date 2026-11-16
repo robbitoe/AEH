@@ -75,44 +75,82 @@ func TestUsageListsEveryDispatchedCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	dispatched := dispatchedCommands(string(src))
+	listed := map[string]bool{}
+	for _, c := range usageCommands() {
+		listed[c] = true
+		if !dispatched[c] {
+			t.Errorf("aeh help lists %q, which the CLI does not dispatch", c)
+		}
+	}
+	for c := range dispatched {
+		if !listed[c] {
+			t.Errorf("the CLI dispatches %q, but aeh help does not list it", c)
+		}
+	}
+}
+
+// dispatchedCommands reads the command names main.go accepts: the cases of dispatch and of the
+// memory, adopt and discover commands; a fixed sub-word a case checks inline
+// (`args[1] != "approve"`) completes that case's name; and the words dispatch checks before
+// its switch (`args[0] == "help"`).
+func dispatchedCommands(src string) map[string]bool {
 	groups := map[string]string{"dispatch": "aeh", "memoryCommand": "aeh memory", "adoptCommand": "aeh adopt", "discoverCommand": "aeh discover"}
 	funcRe := regexp.MustCompile(`^func (\w+)\(`)
-	caseRe := regexp.MustCompile(`"([a-z-]+)"`)
-	dispatched := map[string]bool{"aeh help": true, "aeh version": true}
+	wordRe := regexp.MustCompile(`"([a-z-]+)"`)
+	subRe := regexp.MustCompile(`args\[1\] != "([a-z-]+)"`)
+	topRe := regexp.MustCompile(`args\[0\] == "([a-z]+)"`)
+	dispatched, completed := map[string]bool{}, map[string]bool{}
 	prefix := ""
-	for _, line := range strings.Split(string(src), "\n") {
+	var cases []string
+	for _, line := range strings.Split(src, "\n") {
 		if m := funcRe.FindStringSubmatch(line); m != nil {
-			prefix = groups[m[1]]
+			prefix, cases = groups[m[1]], nil
+			continue
+		}
+		if prefix == "" {
 			continue
 		}
 		trimmed := strings.TrimSpace(line)
-		if prefix == "" || !strings.HasPrefix(trimmed, "case \"") {
+		if strings.HasPrefix(trimmed, "case \"") {
+			cases = nil
+			for _, m := range wordRe.FindAllStringSubmatch(trimmed, -1) {
+				cases = append(cases, prefix+" "+m[1])
+				dispatched[prefix+" "+m[1]] = true
+			}
 			continue
 		}
-		for _, m := range caseRe.FindAllStringSubmatch(trimmed, -1) {
-			dispatched[prefix+" "+m[1]] = true
-		}
-	}
-	listed := usageCommands()
-	for name := range dispatched {
-		found := false
-		for _, c := range listed {
-			if c == name || strings.HasPrefix(c, name+" ") {
-				found = true
+		if m := subRe.FindStringSubmatch(trimmed); m != nil && len(cases) > 0 {
+			for _, c := range cases {
+				completed[c] = true
+				dispatched[c+" "+m[1]] = true
 			}
 		}
-		if !found {
-			t.Errorf("the CLI dispatches %q, but aeh help does not list it", name)
+		if prefix == "aeh" && len(cases) == 0 {
+			for _, m := range topRe.FindAllStringSubmatch(trimmed, -1) {
+				dispatched["aeh "+m[1]] = true
+			}
 		}
 	}
-	for _, c := range listed {
-		words := strings.Fields(c)
-		key := strings.Join(words[:min(2, len(words))], " ")
-		if groups := words[1]; (groups == "memory" || groups == "adopt" || groups == "discover") && len(words) > 2 {
-			key = strings.Join(words[:3], " ")
-		}
-		if !dispatched[key] {
-			t.Errorf("aeh help lists %q, which the CLI does not dispatch (%q)", c, key)
-		}
+	for c := range completed {
+		delete(dispatched, c)
+	}
+	for _, g := range groups {
+		delete(dispatched, g) // "aeh memory" only hands over to memoryCommand
+	}
+	return dispatched
+}
+
+// The dispatch parser itself: inline sub-words and pre-switch words are exact, not prefixes.
+func TestDispatchedCommandsParser(t *testing.T) {
+	src := "func dispatch(ctx context.Context, args []string) (int, error) {\n" +
+		"\tif args[0] == \"help\" || args[0] == \"version\" {\n\t}\n" +
+		"\tswitch args[0] {\n\tcase \"notify\":\n\t\tif len(args) != 2 || args[1] != \"test\" {\n\t\t}\n\tcase \"run\":\n\t}\n}\n" +
+		"func adoptCommand(ctx context.Context, repo aeh.Repo, args []string) (int, error) {\n" +
+		"\tcase \"accept\":\n\t\tif len(args) != 2 || args[1] != \"system\" {\n\t\t}\n\tcase \"area\", \"seal\":\n}\n"
+	got := sortedSet(dispatchedCommands(src))
+	want := "aeh adopt accept system,aeh adopt area,aeh adopt seal,aeh help,aeh notify test,aeh run,aeh version"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("parsed %v", got)
 	}
 }

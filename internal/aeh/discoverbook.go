@@ -599,6 +599,16 @@ func DiscoverReview(ctx context.Context, r Repo, slug string, log io.Writer) (_ 
 	if err != nil {
 		return *st, err
 	}
+	// The owner may have edited the drafts since they were imported: the reviewer receives
+	// them only after the same secrets and display gate as any memory import.
+	for _, rel := range sortedKeys(files) {
+		if err := checkNoSecrets("draft path", []byte(rel)); err != nil {
+			return *st, err
+		}
+	}
+	if err := gateBatchFiles(files); err != nil {
+		return *st, fmt.Errorf("the draft book in memory cannot go to the reviewer: %w", err)
+	}
 	p := &pendingBook{Attempt: attempt, Round: round.N, Review: &DiscoveryBookReview{Book: d.bookDigest(files), Status: "not_run"}}
 	d.logf("  reviewing the draft book of round %d again", round.N)
 	if err := d.reviewBook(ctx, p, files); err != nil {

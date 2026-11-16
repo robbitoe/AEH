@@ -550,10 +550,11 @@ func discoverCommand(ctx context.Context, repo aeh.Repo, args []string) (int, er
 		if err != nil {
 			return 1, err
 		}
-		// One line for the action; aeh discover show prints the whole session.
-		for _, a := range *actions {
-			if a.Name == args[2] {
+		// One line for this action (the latest of its name); aeh discover show prints the rest.
+		for i := len(*actions) - 1; i >= 0; i-- {
+			if a := (*actions)[i]; a.Name == args[2] {
 				fmt.Printf("%sed %s to %s (%s)\n", strings.TrimSuffix(args[0], "e"), a.Name, a.Target, a.Date)
+				break
 			}
 		}
 		if args[0] == "promote" {

@@ -159,3 +159,44 @@ func TestDiscoverReviewRerunsAReviewWithoutVerdict(t *testing.T) {
 		t.Fatalf("no book: %v", err)
 	}
 }
+
+// A draft the owner edited in memory goes to the reviewer only through the import gate.
+func TestDiscoverReviewGatesEditedDrafts(t *testing.T) {
+	endToEnd(t)
+	secret := "ghp_" + strings.Repeat("R", 36)
+	for name, edit := range map[string][2]string{
+		"secret":      {"vision.md", "# Vision\n\ntoken " + secret + "\n"},
+		"html":        {"vision.md", "# Vision\n\n<script>x</script>\n"},
+		"secret path": {"features/" + secret + ".md", "# x\n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newDiscoveryFixture(t, writeBook)
+			f.setReviewer(`exit 3`, "b")
+			f.start()
+			f.run()
+			marker := filepath.ToSlash(filepath.Join(f.tmp, "reviewed"))
+			write(t, f.tmp, "review.sh", "#!/bin/sh\necho x > \""+marker+"\"\n"+approveBook+"\n")
+			f.commitDraft(edit[0], edit[1])
+			_, err := DiscoverReview(context.Background(), f.repo, "shop", nil)
+			if err == nil || strings.Contains(err.Error(), secret) {
+				t.Fatalf("an unsafe edited draft must stop the review: %v", err)
+			}
+			if _, statErr := os.Stat(marker); statErr == nil {
+				t.Fatal("the reviewer ran on an unsafe draft")
+			}
+		})
+	}
+}
+
+// A repository without any commit starts from scratch.
+func TestDetectStackWithoutCommits(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "unborn")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, dir, "init", "-q", "-b", "main")
+	st, err := detectStack(Repo{Root: dir})
+	if err != nil || !st.Greenfield {
+		t.Fatalf("an unborn repository starts from scratch: %+v %v", st, err)
+	}
+}
