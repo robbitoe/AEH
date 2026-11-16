@@ -254,7 +254,7 @@ func checkSuggested(b []byte) error {
 	dec := yaml.NewDecoder(bytes.NewReader(b))
 	dec.KnownFields(true)
 	if err := dec.Decode(&suggested); err != nil {
-		return errors.New("config.suggested.yaml must use known configuration keys, unique mappings and valid value types")
+		return fmt.Errorf("config.suggested.yaml must use only aeh/config.yaml keys, unique mappings and valid value types: %v", err)
 	}
 	var visit func(*yaml.Node) error
 	visit = func(n *yaml.Node) error {
@@ -372,6 +372,14 @@ func newInspectionWorktree(r Repo, base string, exclude []string, strip bool, na
 }
 
 func (w *inspectionWorktree) close() { removeWorktree(w.repo.Root, w.dir) }
+
+// runName names the run directory of an inspection: the area, or "system" for the inventory.
+func (a *adoptSession) runName() string {
+	if a.feature == "" {
+		return "system"
+	}
+	return a.feature
+}
 
 func (a *adoptSession) inspectionName(n int) string {
 	if a.feature == "" {
@@ -687,8 +695,8 @@ func (a *adoptSession) inspectAttempt(ctx context.Context, n int, base, profile 
 	if err != nil {
 		return frozenOutput{}, info, false, err
 	}
-	outPath, runErr := runAgent(ctx, cfg.Profiles[profile], cfg.PassEnv, w.dir, prompt,
-		a.repo.RunDir("adopt-"+a.feature, fmt.Sprintf("a%d", n)), "adopt")
+	outPath, runErr := runAgentWithOutput(ctx, cfg.Profiles[profile], cfg.PassEnv, w.dir, outDir, prompt,
+		a.repo.RunDir("adopt-"+a.runName(), fmt.Sprintf("a%d", n)), "adopt")
 	if err := w.integrity(false); err != nil {
 		if uncertainExit(runErr) {
 			return frozenOutput{}, info, true, fmt.Errorf("agent wrote into the code; execution was interrupted: %w", runErr)
@@ -753,7 +761,7 @@ func AdoptInventory(ctx context.Context, r Repo, base string, out io.Writer) (_ 
 		if _, exists := gitBlob(a.memDir, "HEAD", target); exists {
 			target = "wiki/system.next.md"
 		}
-		header := fmt.Sprintf("# System inventory\n\nInspected base SHA: %s\n\nDate: %s\n\nProfile: %s\n\n", info.Base, info.Date, discoveryDiagnostic(info.Profile))
+		header := fmt.Sprintf("Inspected base SHA: %s\n\nDate: %s\n\nProfile: %s\n\n", info.Base, info.Date, discoveryDiagnostic(info.Profile))
 		files := map[string][]byte{target: []byte(header + string(f.Files["system.md"]))}
 		if err := gateBatchFiles(files); err != nil {
 			return err
@@ -991,7 +999,7 @@ func AdoptInspectArea(ctx context.Context, r Repo, feature string, paths []strin
 			dec := yaml.NewDecoder(bytes.NewReader(f.Files["observations.yaml"]))
 			dec.KnownFields(true)
 			if err := dec.Decode(&doc); err != nil {
-				return errors.New("observations.yaml must hold title, description and observations (id, text, locations)")
+				return fmt.Errorf("observations.yaml must hold title, description and observations (id, text, and locations as \"path:line\" strings): %v", err)
 			}
 			if len(doc.Observations) < 1 || len(doc.Observations) > 30 {
 				return errors.New("observations.yaml must hold 1 through 30 observations")

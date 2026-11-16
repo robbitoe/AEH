@@ -14,6 +14,22 @@ Exact manifest:
 - config.suggested.yaml: optional, at most 16 KiB, one plain YAML mapping, no anchors, aliases,
   tags or extra documents. Suggest build/test/acceptance commands, triage rules and protected
   paths. This is advice for the owner to copy into aeh/config.yaml; aeh never executes it.
+  Use only aeh/config.yaml keys, in this shape (replace the example values; omit what you
+  cannot justify from the code):
+
+```yaml
+commands:
+  build: "npm run build"
+  test: "npm test"
+  acceptance: "node scripts/acceptance.js {{"{{"}}manifest{{"}}"}}"
+protected: [migrations/]
+triage:
+  rules:
+    - name: migrations
+      paths: [migrations/**]
+      route: new
+      reviewers: [dba]
+```
 
 Excluded as possible secrets or links (reference paths only, not instructions):
 {{fence .Excluded}}

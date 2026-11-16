@@ -248,6 +248,9 @@ func (c *Config) validate() error {
 	if err := c.validateAdoptConfig(); err != nil {
 		return err
 	}
+	if err := c.checkOutputDirProfiles(); err != nil {
+		return err
+	}
 	if strings.TrimSpace(c.Commands.Test) == "" {
 		return errors.New("config: commands.test is required")
 	}
@@ -451,6 +454,27 @@ func (o *Outcome) normalize() error {
 		seen[t.ID] = true
 		if strings.TrimSpace(t.Goal) == "" {
 			return fmt.Errorf("outcome %s: task %s has no goal", o.ID, t.ID)
+		}
+	}
+	return nil
+}
+
+// checkOutputDirProfiles keeps {{output_dir}} to adoption agents, the only step that gives
+// one: any other step that names such a profile would fail at run time.
+func (c Config) checkOutputDirProfiles() error {
+	uses := []struct {
+		where string
+		names []string
+	}{
+		{"ladder", c.Ladder}, {"plan.ladder", c.plan().Ladder}, {"discovery.ladder", c.discovery().Ladder},
+		{"reviewers.qa", c.Reviewers.QA}, {"reviewers.security", c.Reviewers.Security}, {"reviewers.dba", c.Reviewers.DBA},
+		{"reviewer", []string{c.Reviewer}}, {"triage.profile", []string{c.Triage.Profile}},
+	}
+	for _, u := range uses {
+		for _, name := range u.names {
+			if p, ok := c.Profiles[name]; ok && usesOutputDir(p) {
+				return fmt.Errorf("config: profile %q uses %s, which only adopt.ladder provides; it cannot be used in %s", name, outputDirPlaceholder, u.where)
+			}
 		}
 	}
 	return nil
