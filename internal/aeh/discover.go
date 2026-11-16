@@ -152,6 +152,7 @@ type DiscoveryQuestion struct {
 	Why         string            `json:"why"`
 	Blocking    bool              `json:"blocking"`
 	Options     []string          `json:"options,omitempty"`
+	Topic       string            `json:"topic,omitempty"` // "stack": the technology stack, always blocking
 	Answers     []DiscoveryAnswer `json:"answers,omitempty"`
 	Skipped     bool              `json:"skipped,omitempty"`
 	Attribution string            `json:"attribution,omitempty"`
@@ -270,6 +271,7 @@ type discoverySession struct {
 	dir    string // .aeh/discovery/<slug>
 	state  *DiscoveryState
 	log    io.Writer
+	stack  *projectStack // detected when the round's prompt is rendered
 }
 
 func (d *discoverySession) logf(format string, args ...any) {
@@ -708,6 +710,9 @@ func (d *discoverySession) attempt(ctx context.Context, a *DiscoveryAttempt, rou
 	if err != nil {
 		return fail(err.Error())
 	}
+	if msg := d.checkStackRule(res); msg != "" {
+		return fail(msg)
+	}
 	if err := saveFrozen(filepath.Join(d.dir, "snapshots", fmt.Sprintf("a%d.json", a.N)), frozen); err != nil {
 		return nil, "", err
 	}
@@ -755,6 +760,7 @@ type questionsFile struct {
 		Why      string   `yaml:"why"`
 		Blocking *bool    `yaml:"blocking"`
 		Options  []string `yaml:"options"`
+		Topic    string   `yaml:"topic"`
 	} `yaml:"questions"`
 }
 
@@ -781,6 +787,15 @@ func parseDiscoveryQuestions(b []byte, round, max int) ([]DiscoveryQuestion, err
 		if q.Blocking == nil {
 			return nil, fmt.Errorf("question %d must say blocking: true or false", n)
 		}
+		switch q.Topic {
+		case "":
+		case topicStack:
+			if !*q.Blocking {
+				return nil, fmt.Errorf("question %d is about the technology stack (topic: stack) and must be blocking", n)
+			}
+		default:
+			return nil, fmt.Errorf("question %d: topic must be empty or stack", n)
+		}
 		if len(q.Options) > discoveryMaxOptions {
 			return nil, fmt.Errorf("question %d has more than %d options", n, discoveryMaxOptions)
 		}
@@ -795,7 +810,7 @@ func parseDiscoveryQuestions(b []byte, round, max int) ([]DiscoveryQuestion, err
 			return nil, err
 		}
 		out = append(out, DiscoveryQuestion{ID: fmt.Sprintf("R%d-Q%d", round, n), Text: strings.TrimSpace(q.Text),
-			Why: strings.TrimSpace(q.Why), Blocking: *q.Blocking, Options: q.Options})
+			Why: strings.TrimSpace(q.Why), Blocking: *q.Blocking, Options: q.Options, Topic: q.Topic})
 	}
 	return out, nil
 }
@@ -1041,7 +1056,16 @@ func (d *discoverySession) prompt(round int, feedback string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	stack, err := detectStack(d.repo)
+	if err != nil {
+		return "", err
+	}
+	d.stack = &stack
 	data := promptData{
+		Greenfield:   stack.Greenfield,
+		Stack:        stack.Evidence,
+		StackAsked:   d.stackQuestion(false),
+		StackAnswer:  d.stackQuestion(true),
 		Idea:         d.state.Idea,
 		History:      d.history(),
 		Features:     featureIndexBlock(memory),
@@ -1055,6 +1079,42 @@ func (d *discoverySession) prompt(round int, feedback string) (string, error) {
 	return renderPrompt("discover.md", text, data)
 }
 
+// stackQuestion reports whether an earlier round asked the owner about the technology stack;
+// with answered, whether the owner answered it.
+func (d *discoverySession) stackQuestion(answered bool) bool {
+	for _, r := range d.state.Rounds {
+		for _, q := range r.Questions {
+			if q.Topic == topicStack && (!answered || len(q.Answers) > 0) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// checkStackRule is the runner's rule for a project that starts from scratch: the owner
+// chooses its technology stack. Until a stack question is answered, a book is refused, and a
+// questions round must ask it unless an earlier round already did. For an existing project
+// the prompt asks the agent to keep the detected stack.
+func (d *discoverySession) checkStackRule(out *discoveryOutput) string {
+	if d.stack == nil || !d.stack.Greenfield || d.stackQuestion(true) {
+		return ""
+	}
+	ask := "this project starts from scratch, so the owner chooses its technology stack: ask it as one blocking question with topic: stack (language, framework, storage and delivery, with the options you recommend)"
+	if out.kind == roundBook {
+		return "the book cannot be written yet: " + ask
+	}
+	if d.stackQuestion(false) {
+		return ""
+	}
+	for _, q := range out.questions {
+		if q.Topic == topicStack {
+			return ""
+		}
+	}
+	return "this round must ask about the stack: " + ask
+}
+
 // history lists earlier questions with the latest answer of each, or that the owner skipped
 // or has not answered it.
 func (d *discoverySession) history() string {
@@ -1064,7 +1124,11 @@ func (d *discoverySession) history() string {
 			continue
 		}
 		for _, q := range r.Questions {
-			fmt.Fprintf(&b, "%s: %s\n", q.ID, q.Text)
+			topic := ""
+			if q.Topic != "" {
+				topic = " (topic: " + q.Topic + ")"
+			}
+			fmt.Fprintf(&b, "%s%s: %s\n", q.ID, topic, q.Text)
 			switch {
 			case len(q.Answers) > 0:
 				fmt.Fprintf(&b, "Answer: %s\n\n", q.Answers[len(q.Answers)-1].Text)

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -187,10 +188,19 @@ func (d *discoverySession) bookDigest(files map[string][]byte) string {
 }
 
 func (d *discoverySession) currentBookDigest() (string, error) {
+	files, err := d.currentBookFiles()
+	if err != nil {
+		return "", err
+	}
+	return d.bookDigest(files), nil
+}
+
+// currentBookFiles reads the draft book as memory's HEAD has it, owner edits included.
+func (d *discoverySession) currentBookFiles() (map[string][]byte, error) {
 	prefix := d.memRel("drafts/")
 	paths, err := gitRaw(d.memDir, "ls-tree", "-r", "--name-only", "-z", "HEAD", "--", prefix)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	files := map[string][]byte{}
 	for _, rel := range strings.Split(paths, "\x00") {
@@ -199,11 +209,11 @@ func (d *discoverySession) currentBookDigest() (string, error) {
 		}
 		b, ok := gitBlob(d.memDir, "HEAD", rel)
 		if !ok {
-			return "", errors.New("cannot read draft from memory HEAD")
+			return nil, errors.New("cannot read draft from memory HEAD")
 		}
 		files[rel] = []byte(b)
 	}
-	return d.bookDigest(files), nil
+	return files, nil
 }
 
 func bookReviewManifest() outputManifest {
@@ -548,6 +558,68 @@ func DiscoverShow(r Repo, slug string) (_ DiscoveryState, err error) {
 		return *d.state, err
 	}
 	return *d.state, nil
+}
+
+// DiscoverReview runs the advisory review again on the draft book as memory has it now. It is
+// for a review without a verdict (invalid, unavailable, interrupted or not run), for example
+// after fixing the reviewer's profile. A review with a verdict is never replaced, so findings
+// the owner already answered are never lost.
+func DiscoverReview(ctx context.Context, r Repo, slug string, log io.Writer) (_ DiscoveryState, err error) {
+	defer func() { err = redactErr(err) }()
+	d, unlock, err := openDiscovery(r, slug, log)
+	if err != nil {
+		return DiscoveryState{}, err
+	}
+	defer unlock()
+	defer d.reportCommand(&err)
+	if err := d.resume(); err != nil {
+		return d.snapshot(), err
+	}
+	st := d.state
+	if st.Book != nil {
+		return *st, fmt.Errorf("discovery %s has a book waiting for its first review; finish it with: aeh discover run %s", slug, slug)
+	}
+	if len(st.Rounds) == 0 || st.Rounds[len(st.Rounds)-1].Kind != roundBook {
+		return *st, fmt.Errorf("discovery %s has no draft book to review", slug)
+	}
+	round := &st.Rounds[len(st.Rounds)-1]
+	if v := round.Review; v != nil && (v.Status == "approve" || v.Status == "reject") {
+		return *st, fmt.Errorf("the review of round %d already has a verdict (%s); it is not run again", round.N, v.Status)
+	}
+	attempt := 0
+	for i, a := range st.Attempts {
+		if a.Round == round.N && a.Result == "accepted" && a.Snapshot == round.Snapshot {
+			attempt = i + 1
+		}
+	}
+	if attempt == 0 {
+		return *st, fmt.Errorf("discovery %s: the author attempt of round %d is not recorded", slug, round.N)
+	}
+	files, err := d.currentBookFiles()
+	if err != nil {
+		return *st, err
+	}
+	// The owner may have edited the drafts since they were imported: the reviewer receives
+	// them only after the same secrets and display gate as any memory import.
+	for _, rel := range sortedKeys(files) {
+		if err := checkNoSecrets("draft path", []byte(rel)); err != nil {
+			return *st, err
+		}
+	}
+	if err := gateBatchFiles(files); err != nil {
+		return *st, fmt.Errorf("the draft book in memory cannot go to the reviewer: %w", err)
+	}
+	p := &pendingBook{Attempt: attempt, Round: round.N, Review: &DiscoveryBookReview{Book: d.bookDigest(files), Status: "not_run"}}
+	d.logf("  reviewing the draft book of round %d again", round.N)
+	if err := d.reviewBook(ctx, p, files); err != nil {
+		return *st, err
+	}
+	// The earlier review had no verdict, so it had no findings: they are replaced, not lost.
+	round.Review, round.Questions = p.Review, p.Review.Findings
+	if _, err := d.recordQuestion(round, fmt.Sprintf("review round %d again", round.N)); err != nil {
+		return *st, err
+	}
+	return *st, d.refreshReview()
 }
 
 func (d *discoverySession) refreshReview() error {

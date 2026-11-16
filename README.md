@@ -66,7 +66,11 @@ aeh discover skip shop R1-Q2          # optional questions only
 aeh discover run shop                 # next round, with the latest answer to each question
 ```
 
-A round ends with questions or with the draft book. Blocking questions must be answered before the next round. Answering again records a revision, and the next round receives only the latest one. The book has `vision.md`, `data.md`, one `features/<feature>.md` per feature with acceptance criteria, and optional HTML mockups. It is stored under `wiki/discovery/<slug>/drafts/` in memory. Drafts are not features: they claim no paths, and no run sees them.
+A round ends with questions or with the draft book. Blocking questions must be answered before the next round.
+
+You choose the technology stack. In a project that starts from scratch (no committed file besides `aeh/` and housekeeping such as `.gitignore`, README and LICENSE), the agent must first ask a blocking question with `topic: stack`; aeh refuses a book until you answered it. In an existing project the agent receives the stack its committed files show (manifests, file types, configured commands) and keeps it, unless the idea or your answers ask for another; then it confirms the change with a stack question first.
+
+If the advisory review of the book has no verdict (for example the reviewer's profile was misconfigured), fix the cause and run `aeh discover review <slug>`. A review with a verdict is never replaced. Answering again records a revision, and the next round receives only the latest one. The book has `vision.md`, `data.md`, one `features/<feature>.md` per feature with acceptance criteria, and optional HTML mockups. It is stored under `wiki/discovery/<slug>/drafts/` in memory. Drafts are not features: they claim no paths, and no run sees them.
 
 Each feature draft starts with strict YAML front matter containing exactly `title` (one display line, at most 200 bytes) and `paths` (1-20 repository-relative paths). Unknown fields, YAML anchors and explicit tags are rejected. Draft slugs must be new, and paths of different drafts must not overlap. Criteria must be present, non-empty, numbered from 1 without gaps, and must not use `observed`:
 
@@ -365,6 +369,8 @@ Make sure your project's `.gitignore` covers build output (`bin/`, `obj/`, `node
 
 ## Commands
 
+[docs/commands.md](docs/commands.md) is the complete reference: every command, with its arguments, flags, exit codes and what it writes. A test keeps it in step with `aeh help`.
+
 | Command | What it does |
 | --- | --- |
 | `aeh init` | Creates `aeh/config.yaml`, an example outcome, and ignores `.aeh/`. |
@@ -373,6 +379,7 @@ Make sure your project's `.gitignore` covers build output (`bin/`, `obj/`, `node
 | `aeh discover show <slug>` | Phase, review validity, questions, answers and owner actions. |
 | `aeh discover answer <slug> <QID> "<text>"` | Answers a question; answering again records a revision. |
 | `aeh discover skip <slug> <QID>` | Skips an optional question. |
+| `aeh discover review <slug>` | Runs the advisory book review again when it has no verdict. |
 | `aeh discover promote <slug> <feature>` | Creates an unapproved spec at 0.1.0 from a committed draft. |
 | `aeh discover accept <slug> vision\|data` | Accepts an advisory document; existing documents use `.next.md`. |
 | `aeh adopt inventory [--base <rev>]` | Inspects a pinned base; proposes system documentation and local configuration. |

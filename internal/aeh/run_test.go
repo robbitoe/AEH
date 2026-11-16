@@ -1154,9 +1154,13 @@ func TestLaterTaskPolicyCompletesEarlierReviews(t *testing.T) {
 		{"reject", reviewReject, "REJECT", false},
 		{"invalid", "echo no-verdict", "INVALID", false},
 		{"mutated", "echo changed > src/fees.txt; " + reviewOK, "INVALID", false},
-		{"timeout", "echo ready; sleep 30", "INVALID", false},
+		{"timeout", "echo ready > \"$AEH_SECURITY_STARTED\"; sleep 30", "INVALID", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// The timeout case cancels the run exactly when T1's security review starts. A wall
+			// clock deadline also had to fit everything before it, which load made unreliable.
+			started := filepath.ToSlash(filepath.Join(t.TempDir(), "security-started"))
+			tc.security = strings.ReplaceAll(tc.security, "$AEH_SECURITY_STARTED", started)
 			// The first T2 candidate unexpectedly touches lib/ outside its scope.
 			// That raises policy after T1, even though scope rejects the candidate.
 			// T2's retry stays in scope and is accepted under the raised policy.
@@ -1188,8 +1192,16 @@ case "$1" in *"role security"*) `+tc.security+` ;; *) `+reviewOK+` ;; esac`)
 			ctx := context.Background()
 			if tc.name == "timeout" {
 				var cancel context.CancelFunc
-				ctx, cancel = context.WithTimeout(ctx, 20*time.Second)
+				ctx, cancel = context.WithCancel(ctx)
 				defer cancel()
+				go func() {
+					for deadline := time.Now().Add(5 * time.Minute); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+						if _, err := os.Stat(started); err == nil {
+							cancel()
+							return
+						}
+					}
+				}()
 			}
 			var output strings.Builder
 			st, err := RunOutcome(ctx, f.repo, "OUT-001", &output)
@@ -1251,7 +1263,7 @@ case "$1" in *"role security"*) `+tc.security+` ;; *) `+reviewOK+` ;; esac`)
 				case "invalid":
 					failure = "reviewer gave no verdict"
 				case "timeout":
-					failure = "context deadline exceeded"
+					failure = "context canceled" // the run is cancelled while the review sleeps
 					guidance = "Confirm all processes stopped and review possible effects before answering to retry"
 					if !gates[len(gates)-1].Uncertain || a.Worktree == "" {
 						t.Fatalf("timeout lost uncertainty or worktree: %+v", a)

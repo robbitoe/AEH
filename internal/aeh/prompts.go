@@ -42,6 +42,10 @@ type promptData struct {
 	MaxQuestions int
 	MaxFeatures  int
 	Book         string // book review: frozen, validated draft files as reference data
+	Greenfield   bool   // discovery: the project starts from scratch
+	Stack        string // discovery: the existing project's stack evidence
+	StackAsked   bool   // discovery: an earlier round asked the stack question
+	StackAnswer  bool   // discovery: the owner answered it
 
 	// Adoption: pinned inspection and an output directory opened before the agent runs.
 	BaseSHA      string
