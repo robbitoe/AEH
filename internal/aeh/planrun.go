@@ -787,6 +787,8 @@ func (p *planner) baseline(ctx context.Context) (bool, string, error) {
 		if cerr := verifyCheckout(wt, st.Base); cerr != nil && g.Passed {
 			g.Passed, g.Output = false, cerr.Error()
 		}
+		// Command output may carry secrets: redact it before it is saved, logged or asked.
+		g.Output = redactDiagnostic(g.Output)
 		results = append(results, g)
 		p.logf("    %-6s %s", g.Name, gateStatus(g))
 		if g.Uncertain {
@@ -1063,6 +1065,7 @@ func (p *planner) verifyFrozen(ctx context.Context, a *PlanAttempt) (string, err
 		if err != nil {
 			return "", err
 		}
+		g.Output = redactDiagnostic(g.Output)
 		// The verdict and what it means for the attempt are saved together: a rejected or
 		// uncertain review never resumes as a review still to ask.
 		a.Reviews = append(a.Reviews, v)
@@ -1281,6 +1284,7 @@ func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile
 		return false, ""
 	}
 	g := gateCommand(ctx, "build", wt, p.cfg.Commands.Build, p.timeout(), p.cfg.PassEnv)
+	g.Output = redactDiagnostic(g.Output) // before it becomes feedback, state or a question
 	checks = append(checks, PlanCheckEntry{Name: "build", Passed: g.Passed && !g.Uncertain})
 	if uncertain, damaged := settle(g); uncertain {
 		return checks, "build", g.Output, true, nil
@@ -1288,7 +1292,7 @@ func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile
 		return checks, "build", damaged, false, nil
 	}
 	if !g.Passed {
-		return checks, "build", "the build fails with the new tests:\n" + redactDiagnostic(g.Output), false, nil
+		return checks, "build", "the build fails with the new tests:\n" + g.Output, false, nil
 	}
 	dir := p.testDir()
 	seen := map[string]bool{}
@@ -1310,6 +1314,7 @@ func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile
 		if err != nil {
 			return checks, "", "", false, err
 		}
+		g.Output = redactDiagnostic(g.Output)
 		checks = append(checks, PlanCheckEntry{Name: "red " + dir + f, Passed: !g.Passed && !g.Uncertain, Detail: tail(g.Output, 500)})
 		if uncertain, damaged := settle(g); uncertain {
 			return checks, "red", g.Output, true, nil
@@ -1332,6 +1337,7 @@ func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile
 		if err != nil {
 			return checks, "", "", false, err
 		}
+		g.Output = redactDiagnostic(g.Output)
 		checks = append(checks, PlanCheckEntry{Name: "previous acceptance suite still passes", Passed: g.Passed && !g.Uncertain})
 		if uncertain, damaged := settle(g); uncertain {
 			return checks, "previous", g.Output, true, nil
