@@ -1,6 +1,7 @@
 package aeh
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -57,6 +58,32 @@ func TestAdoptSealRedactsCheckoutDamage(t *testing.T) {
 		t.Fatalf("a build that damages the checkout must fail the attempt: %v %+v\n%s", err, st, log)
 	}
 	noSecretIn(t, f, st, log)
+}
+
+// A passing test whose file name is a credential: the check names in the state are redacted.
+func TestAdoptSealRedactsTestFileNames(t *testing.T) {
+	f, _ := newCharFixture(t, `d=`+planDir+`; mkdir -p $d
+printf 'grep -q "paid" src/pay.txt\n' > $d/`+charSecret+`.sh
+printf 'grep -q "EUR" src/pay.txt\n' > $d/currency.sh
+printf 'kind: characterize\ntrace:\n  AC-1: [`+charSecret+`.sh]\n  AC-3: [currency.sh]\n' > $d/plan.yaml
+echo "PLAN: READY"`)
+	f.setScript("qa", `echo "VERDICT: REJECT"`)
+	st, log, err := f.seal()
+	if err != nil || st.Status != StatusBlocked {
+		t.Fatalf("seal: %v %+v", err, st)
+	}
+	noSecretIn(t, f, st, log)
+}
+
+// Errors returned by aeh plan are redacted: a memory change named after a credential appears
+// in Git status, which the plan reports when memory is not clean.
+func TestPlanErrorsAreRedacted(t *testing.T) {
+	f := newPlanFixture(t, authorOK, reviewOK)
+	write(t, memDir(t, f.repo), charSecret+".md", "x\n")
+	_, err := PlanFeature(context.Background(), f.repo, "pay", nil)
+	if err == nil || strings.Contains(err.Error(), charSecret) || !strings.Contains(err.Error(), "[redacted") {
+		t.Fatalf("plan error must be redacted: %v", err)
+	}
 }
 
 // A build that fails once the tests exist, printing a credential, gives redacted feedback.

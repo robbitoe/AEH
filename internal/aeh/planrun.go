@@ -135,8 +135,18 @@ func redactPlanState(s *PlanState) {
 		s.Attempts[i].Feedback = redactDiagnostic(s.Attempts[i].Feedback)
 	}
 	for i := range s.Checks {
+		s.Checks[i].Name = redactDiagnostic(s.Checks[i].Name) // names carry test paths
 		s.Checks[i].Detail = redactDiagnostic(s.Checks[i].Detail)
 	}
+}
+
+// redactPlanErr is the error boundary of aeh plan and aeh adopt seal: Git, command and memory
+// diagnostics may carry secrets. Unlike redactErr it keeps the text otherwise as it is.
+func redactPlanErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &redactedError{msg: redactDiagnostic(err.Error()), err: err}
 }
 
 // planner carries one planning session.
@@ -179,7 +189,8 @@ func (p *planner) logf(format string, args ...any) {
 // PlanFeature plans the approved spec of a feature: it pins the inputs, checks the base,
 // lets a test author write acceptance tests and one task, checks and reviews the frozen
 // result, and publishes it on aeh/<ID>. Calling it again resumes an unfinished plan.
-func PlanFeature(ctx context.Context, r Repo, feature string, log io.Writer) (PlanState, error) {
+func PlanFeature(ctx context.Context, r Repo, feature string, log io.Writer) (_ PlanState, err error) {
+	defer func() { err = redactPlanErr(err) }()
 	return planFeature(ctx, r, feature, "", log)
 }
 
