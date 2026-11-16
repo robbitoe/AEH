@@ -43,6 +43,7 @@ type Config struct {
 	Ladder    []string        `yaml:"ladder"`
 	Plan      PlanConfig      `yaml:"plan"`
 	Discovery DiscoveryConfig `yaml:"discovery"`
+	Adopt     AdoptConfig     `yaml:"adopt"`
 	Reviewer  string          `yaml:"reviewer"` // legacy: one reviewer for every role
 	Reviewers ReviewerPolicy  `yaml:"reviewers"`
 	Triage    struct {
@@ -241,6 +242,9 @@ func (c *Config) validate() error {
 		return err
 	}
 	if err := c.validateDiscoveryConfig(); err != nil {
+		return err
+	}
+	if err := c.validateAdoptConfig(); err != nil {
 		return err
 	}
 	if strings.TrimSpace(c.Commands.Test) == "" {

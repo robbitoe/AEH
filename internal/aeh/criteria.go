@@ -405,8 +405,8 @@ func (s Spec) LastImplementation() (Implementation, bool) {
 // criteriaIdentity is what memory's history says about a feature's criterion numbers.
 type criteriaIdentity struct {
 	Latest  map[int]bool // IDs of the newest genuine approval: they keep their place
-	Retired map[int]bool // IDs a genuine approval had and a later genuine approval removed
-	High    int          // highest ID ever approved or implemented
+	Retired map[int]bool // IDs retired by an approval or the adopted area's observation log
+	High    int          // highest ID ever observed, approved or implemented
 }
 
 // gitBlob reads a file at a commit byte for byte (git() trims its output).
@@ -495,6 +495,21 @@ func loadCriteriaIdentity(dir string, s Spec) (criteriaIdentity, error) {
 	if prev != nil {
 		id.Latest = prev
 	}
+	area, exists, err := loadAreaIdentity(dir, s.Feature)
+	if err != nil {
+		return id, fmt.Errorf("adopted criteria history of %s: %w", s.Feature, redactErr(err))
+	}
+	if exists {
+		id.High = max(id.High, area.High)
+		for n, o := range area.Obs {
+			if o.Status == ObservationRetired {
+				id.Retired[n] = true
+			} else if prev == nil && o.Status == ObservationConfirmed {
+				// Before the first approval, kept observations retain their own numbers.
+				id.Latest[n] = true
+			}
+		}
+	}
 	return id, nil
 }
 
@@ -504,7 +519,7 @@ func (id criteriaIdentity) check(crit []SpecCriterion) error {
 	for _, c := range crit {
 		switch {
 		case id.Retired[c.ID]:
-			return fmt.Errorf("AC-%d was removed in an approved version; its number is retired; new criteria start at AC-%d", c.ID, id.High+1)
+			return fmt.Errorf("AC-%d was removed or retired in memory history; its number is retired; new criteria start at AC-%d", c.ID, id.High+1)
 		case !id.Latest[c.ID] && c.ID <= id.High:
 			return fmt.Errorf("AC-%d reuses a retired or skipped number; new criteria start at AC-%d", c.ID, id.High+1)
 		}

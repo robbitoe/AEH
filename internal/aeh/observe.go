@@ -1,6 +1,7 @@
 package aeh
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -264,12 +266,17 @@ func loadAreaIdentity(memDir, feature string) (areaIdentity, bool, error) {
 	if err != nil {
 		return areaIdentity{}, true, fmt.Errorf("%s: %w", rel, err)
 	}
+	oids := make([]string, 0, len(versions))
 	for oid := range versions {
-		b, err := gitRaw(memDir, "cat-file", "blob", oid)
-		if err != nil {
-			return areaIdentity{}, true, fmt.Errorf("observation log history: %w", err)
-		}
-		events, err := parseObservationLog([]byte(b))
+		oids = append(oids, oid)
+	}
+	sort.Strings(oids)
+	blobs, err := areaHistoryBlobs(memDir, oids)
+	if err != nil {
+		return areaIdentity{}, true, err
+	}
+	for _, b := range blobs {
+		events, err := parseObservationLog(b)
 		if err != nil {
 			return areaIdentity{}, true, fmt.Errorf("an earlier version of %s: %w", rel, err)
 		}
@@ -279,6 +286,40 @@ func loadAreaIdentity(memDir, feature string) (areaIdentity, bool, error) {
 	}
 	ident, err := replayObservations(head)
 	return ident, true, err
+}
+
+// areaHistoryBlobs reads all unique historical log objects in one Git process. Every object
+// is still compared with HEAD, including versions on merge parents dropped by the merge.
+func areaHistoryBlobs(dir string, oids []string) ([][]byte, error) {
+	cmd := exec.Command("git", append(append([]string{}, gitSafety...), "cat-file", "--batch")...)
+	cmd.Dir, cmd.Env = dir, commandEnv(nil)
+	cmd.Stdin = strings.NewReader(strings.Join(oids, "\n") + "\n")
+	b, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("observation log history: cat-file: %w", err)
+	}
+	r := bufio.NewReader(bytes.NewReader(b))
+	var out [][]byte
+	for _, oid := range oids {
+		line, err := r.ReadString('\n')
+		fields := strings.Fields(line)
+		if err != nil || len(fields) != 3 || fields[0] != oid || fields[1] != "blob" {
+			return nil, errors.New("observation log history: invalid cat-file header")
+		}
+		n, err := strconv.Atoi(fields[2])
+		if err != nil || n < 0 || n > len(b) {
+			return nil, errors.New("observation log history: invalid blob size")
+		}
+		body := make([]byte, n)
+		if _, err := io.ReadFull(r, body); err != nil {
+			return nil, fmt.Errorf("observation log history: %w", err)
+		}
+		if end, err := r.ReadByte(); err != nil || end != '\n' {
+			return nil, errors.New("observation log history: truncated blob")
+		}
+		out = append(out, body)
+	}
+	return out, nil
 }
 
 // areaFront is the front matter of area.md.
@@ -426,22 +467,38 @@ func reconcileArea(memDir, feature string, a areaIdentity) (areaFront, string, e
 // adoptState is the local record of one adopted area, in the main checkout's
 // .aeh/adopt/<feature>/state.json.
 type adoptState struct {
-	Version   int            `json:"version"`
-	Feature   string         `json:"feature"`
-	Pending   *pendingImport `json:"pending,omitempty"`
-	UpdatedAt time.Time      `json:"updated_at"`
+	Version      int              `json:"version"`
+	Feature      string           `json:"feature"`
+	Pending      *pendingImport   `json:"pending,omitempty"`
+	UpdatedAt    time.Time        `json:"updated_at"`
+	Attempts     []AdoptAttempt   `json:"attempts,omitempty"`
+	Inspection   *AdoptInspection `json:"inspection,omitempty"`
+	Current      *AdoptInspection `json:"current,omitempty"`
+	Next         *AdoptInspection `json:"next,omitempty"`
+	Promotion    *DiscoveryAction `json:"promotion,omitempty"`
+	PromotedSpec string           `json:"promoted_spec_sha256,omitempty"` // exact promoted bytes, checked against memory HEAD
+	Suggested    []byte           `json:"suggested,omitempty"`
+	Input        string           `json:"input_sha256,omitempty"`
+	LadderFrom   int              `json:"ladder_from,omitempty"`
+	RunStatus    string           `json:"run_status,omitempty"`
 }
 
 // adoptSession carries one adoption command on one area.
 type adoptSession struct {
-	repo    Repo
-	memDir  string
-	feature string
-	path    string
-	state   adoptState
+	repo               Repo
+	memDir             string
+	feature            string
+	path               string
+	state              adoptState
+	resumedInspections map[string]bool
 }
 
-func (a *adoptSession) session() string { return "adopt/" + a.feature }
+func (a *adoptSession) session() string {
+	if a.feature == "" {
+		return "adopt/system"
+	}
+	return "adopt/" + a.feature
+}
 
 func (a *adoptSession) save() error {
 	a.state.UpdatedAt = time.Now().UTC()
@@ -453,6 +510,11 @@ func loadAdoptSession(r Repo, feature string) (*adoptSession, error) {
 	if err := checkSlug(feature); err != nil {
 		return nil, fmt.Errorf("adopt: %w", err)
 	}
+	return loadAdoptState(r, feature)
+}
+
+// An empty feature is the inventory session, stored beside the area directories.
+func loadAdoptState(r Repo, feature string) (*adoptSession, error) {
 	main, err := MainCheckout(r)
 	if err != nil {
 		return nil, err
@@ -517,13 +579,16 @@ func (a *adoptSession) resume() error {
 
 func (a *adoptSession) finishPending() error {
 	if a.state.Pending == nil {
-		return nil
+		return a.writeSuggested()
 	}
 	if err := finishImport(a.repo, a.memDir, a.session(), a.state.Pending, a.save); err != nil {
 		return fmt.Errorf("adopt %s: %w", a.feature, err)
 	}
 	a.state.Pending = nil
-	return a.save()
+	if err := a.save(); err != nil {
+		return err
+	}
+	return a.writeSuggested()
 }
 
 // record saves a pending batch with the state, then imports it.
@@ -654,9 +719,15 @@ type AdoptArea struct {
 }
 
 // LoadAdoptArea reads an area and checks it against its log.
-func LoadAdoptArea(r Repo, feature string) (AdoptArea, error) {
-	a, err := loadAdoptSession(r, feature)
+func LoadAdoptArea(r Repo, feature string) (_ AdoptArea, err error) {
+	defer func() { err = redactErr(err) }()
+	a, unlock, err := openAdopt(r, feature)
 	if err != nil {
+		return AdoptArea{}, err
+	}
+	defer unlock()
+	defer a.reportCommand(&err)
+	if err := resumeAdoptImports(a.repo); err != nil {
 		return AdoptArea{}, err
 	}
 	ident, exists, err := loadAreaIdentity(a.memDir, feature)
@@ -695,7 +766,8 @@ func AdoptConfirm(r Repo, feature, ref, decision, seen string) (_ Observation, e
 		return Observation{}, err
 	}
 	defer unlock()
-	if err := a.resume(); err != nil {
+	defer a.reportCommand(&err)
+	if err := resumeAdoptImports(a.repo); err != nil {
 		return Observation{}, err
 	}
 	ident, exists, err := loadAreaIdentity(a.memDir, feature)
