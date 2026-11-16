@@ -122,7 +122,21 @@ func savePlanState(r Repo, s *PlanState) error {
 		return err
 	}
 	s.UpdatedAt = time.Now().UTC()
+	redactPlanState(s)
 	return writePrivateJSON(p, s)
+}
+
+// redactPlanState redacts every diagnostic the state carries before it is saved: command,
+// agent and Git output reach the next author's feedback, the owner's question and the
+// terminal only from here, so no path can skip it. The in-memory state is redacted too.
+func redactPlanState(s *PlanState) {
+	s.Question = redactDiagnostic(s.Question)
+	for i := range s.Attempts {
+		s.Attempts[i].Feedback = redactDiagnostic(s.Attempts[i].Feedback)
+	}
+	for i := range s.Checks {
+		s.Checks[i].Detail = redactDiagnostic(s.Checks[i].Detail)
+	}
 }
 
 // planner carries one planning session.
@@ -155,9 +169,10 @@ func (p *planner) qaPrompt() string {
 	return "review-plan.md"
 }
 
+// logf writes one redacted line to the terminal: arguments may carry command or agent output.
 func (p *planner) logf(format string, args ...any) {
 	if p.log != nil {
-		fmt.Fprintf(p.log, format+"\n", args...)
+		fmt.Fprintln(p.log, redactDiagnostic(fmt.Sprintf(format, args...)))
 	}
 }
 
@@ -1600,7 +1615,7 @@ func (p *planner) restart(question string) error {
 	if err := p.block(question); err != nil {
 		return err
 	}
-	return errors.New(question)
+	return errors.New(p.state.Question) // redacted by the save
 }
 
 // answerPlan records the owner's answer to a blocked plan so aeh plan can retry it.

@@ -34,6 +34,31 @@ func TestAdoptSealRedactsBaselineOutput(t *testing.T) {
 	noSecretIn(t, f, st, log)
 }
 
+// An author that prints a credential before PLAN: TOO-LARGE blocks with a redacted question.
+func TestAdoptSealRedactsAuthorOutput(t *testing.T) {
+	f, _ := newCharFixture(t, `echo "token `+charSecret+`"; echo "PLAN: TOO-LARGE"`)
+	st, log, err := f.seal()
+	if err != nil || st.Status != StatusBlocked || len(st.Attempts) != 1 || !strings.Contains(st.Question, "[redacted") {
+		t.Fatalf("too-large must block with a redacted question: %v %+v", err, st)
+	}
+	noSecretIn(t, f, st, log)
+}
+
+// A build that names an untracked file after a credential: the checkout-damage diagnostic,
+// which comes from Git status, is redacted too.
+func TestAdoptSealRedactsCheckoutDamage(t *testing.T) {
+	f, _ := newCharFixture(t, charAuthorOK)
+	write(t, f.dir, "tests/build.sh", "if [ -d tests/acceptance ]; then touch "+charSecret+".txt; fi\n")
+	cfg := readFile(t, f.dir+"/aeh/config.yaml")
+	write(t, f.dir, "aeh/config.yaml", strings.Replace(cfg, `build: "git --version"`, `build: "sh tests/build.sh"`, 1))
+	f.commitAll("build script")
+	st, log, err := f.seal()
+	if err != nil || st.Status != StatusBlocked || len(st.Attempts) == 0 || st.Attempts[0].FailedStep != "build" {
+		t.Fatalf("a build that damages the checkout must fail the attempt: %v %+v\n%s", err, st, log)
+	}
+	noSecretIn(t, f, st, log)
+}
+
 // A build that fails once the tests exist, printing a credential, gives redacted feedback.
 func TestAdoptSealRedactsBuildOutput(t *testing.T) {
 	f, _ := newCharFixture(t, charAuthorOK)
