@@ -302,7 +302,11 @@ func uncertainExit(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || errors.Is(err, exec.ErrWaitDelay)
 }
 
+// tail keeps the last n bytes of command or agent output. It redacts recognized secrets in the
+// whole text first: a cut made before redaction could drop a credential's prefix and leave the
+// rest unrecognizable.
 func tail(s string, n int) string {
+	s = redactSecrets(s)
 	if len(s) <= n {
 		return s
 	}

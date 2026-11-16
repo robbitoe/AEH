@@ -6,6 +6,22 @@ import (
 	"testing"
 )
 
+// Truncation never splits a credential into an unrecognizable remainder: the whole output is
+// redacted before it is cut.
+func TestTailRedactsBeforeCutting(t *testing.T) {
+	out := charSecret + strings.Repeat("x", 1500)
+	got := tail(out, 1500)
+	if strings.Contains(got, strings.TrimPrefix(charSecret, "ghp_")) {
+		t.Fatalf("the cut left the credential's body: %q", got[:60])
+	}
+	if got := tail("short "+charSecret, 1500); strings.Contains(got, charSecret) || !strings.Contains(got, "[redacted") {
+		t.Fatalf("short output: %q", got)
+	}
+	if got := tail("a\tb\r\n", 100); got != "a\tb\r\n" {
+		t.Fatalf("tail must keep other text unchanged: %q", got)
+	}
+}
+
 // noSecretIn fails when the plan's state file, the command log or the question carries the token.
 func noSecretIn(t *testing.T, f *planFixture, st PlanState, log string) {
 	t.Helper()

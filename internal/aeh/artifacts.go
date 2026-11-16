@@ -248,9 +248,7 @@ func findSecrets(b []byte) []secretFinding {
 // recognized secret is replaced by its kind, and control, bidi and format characters other
 // than LF become "?".
 func redactDiagnostic(s string) string {
-	for _, p := range artifactSecretPatterns {
-		s = p.re.ReplaceAllString(s, "[redacted "+p.kind+"]")
-	}
+	s = redactSecrets(s)
 	return strings.Map(func(r rune) rune {
 		if r == '\n' {
 			return r
@@ -260,6 +258,14 @@ func redactDiagnostic(s string) string {
 		}
 		return r
 	}, strings.ToValidUTF8(s, "?"))
+}
+
+// redactSecrets replaces every recognized secret and leaves the rest of the text unchanged.
+func redactSecrets(s string) string {
+	for _, p := range artifactSecretPatterns {
+		s = p.re.ReplaceAllString(s, "[redacted "+p.kind+"]")
+	}
+	return s
 }
 
 func checkNoSecrets(name string, b []byte) error {
