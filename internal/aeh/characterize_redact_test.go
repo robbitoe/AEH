@@ -9,9 +9,14 @@ import (
 // Truncation never splits a credential into an unrecognizable remainder: the whole output is
 // redacted before it is cut.
 func TestTailRedactsBeforeCutting(t *testing.T) {
-	out := charSecret + strings.Repeat("x", 1500)
+	// The cut falls right after "ghp_": cutting first would keep the token's whole body.
+	body := strings.TrimPrefix(charSecret, "ghp_")
+	out := "start " + charSecret + " " + strings.Repeat("x", 1500-len(body)-1)
+	if len(out)-1500 != len("start ghp_") {
+		t.Fatal("the fixture must cut exactly after the token prefix")
+	}
 	got := tail(out, 1500)
-	if strings.Contains(got, strings.TrimPrefix(charSecret, "ghp_")) {
+	if strings.Contains(got, body) || !strings.Contains(got, "[redacted") {
 		t.Fatalf("the cut left the credential's body: %q", got[:60])
 	}
 	if got := tail("short "+charSecret, 1500); strings.Contains(got, charSecret) || !strings.Contains(got, "[redacted") {

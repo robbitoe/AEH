@@ -11,9 +11,31 @@ import (
 	"time"
 )
 
+// outputDirPlaceholder in a profile's command names the directory an adoption agent writes
+// its output to, outside its working directory (for example codex --add-dir {{output_dir}}).
+const outputDirPlaceholder = "{{output_dir}}"
+
+func usesOutputDir(p Profile) bool {
+	for _, a := range p.Command {
+		if strings.Contains(a, outputDirPlaceholder) {
+			return true
+		}
+	}
+	return false
+}
+
 // runAgent launches one profile's CLI in dir with the prompt and logs its output to runDir.
 // The caller decides how to handle CLI failures.
 func runAgent(ctx context.Context, p Profile, passEnv []string, dir, prompt, runDir, logName string) (string, error) {
+	return runAgentWithOutput(ctx, p, passEnv, dir, "", prompt, runDir, logName)
+}
+
+// runAgentWithOutput also replaces {{output_dir}} with outputDir. A step without an output
+// directory refuses a profile that asks for one.
+func runAgentWithOutput(ctx context.Context, p Profile, passEnv []string, dir, outputDir, prompt, runDir, logName string) (string, error) {
+	if outputDir == "" && usesOutputDir(p) {
+		return "", fmt.Errorf("the profile's command uses %s, but this step has no output directory; use that profile only in adopt.ladder", outputDirPlaceholder)
+	}
 	if err := os.MkdirAll(runDir, 0o700); err != nil {
 		return "", err
 	}
@@ -24,7 +46,8 @@ func runAgent(ctx context.Context, p Profile, passEnv []string, dir, prompt, run
 	args := make([]string, len(p.Command))
 	for i, a := range p.Command {
 		a = strings.ReplaceAll(a, "{{prompt_file}}", promptFile)
-		a = strings.ReplaceAll(a, "{{prompt}}", prompt)
+		a = strings.ReplaceAll(a, outputDirPlaceholder, outputDir)
+		a = strings.ReplaceAll(a, "{{prompt}}", prompt) // last: the prompt's text is never expanded
 		args[i] = a
 	}
 	timeout := time.Duration(p.TimeoutMinutes) * time.Minute

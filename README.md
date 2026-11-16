@@ -27,6 +27,8 @@ The `aeh init` template was checked against Codex CLI 0.167.2 and Claude Code 2.
 - Every profile reads the prompt from stdin (`stdin: true`). On Windows the CLIs are `.cmd` shims, and `cmd.exe` cuts a multi-line argument at the first newline.
 - Claude Code runs with `--safe-mode`, so your personal `CLAUDE.md`, plugins, hooks and MCP servers do not change the run (this also turns off any personal hooks you use as safety checks; managed policies still apply), and with `--permission-prompts none`, so anything that would ask for permission is denied instead of waiting. `acceptEdits` lets it edit files; add `--allowedTools` entries if it should run your build or tests.
 - `claude-review` is a read-only reviewer (`--tools Read,Grep,Glob`) for when Codex implements; `codex-review` is the reverse.
+- Steps whose verdict aeh reads from the agent's last line (discovery, adoption, the plan author and every reviewer) need plain text output: use `--output-format text` for Claude Code there. A profile with `--output-format json` wraps the verdict inside a JSON object, and the step fails.
+- Discovery and its book review run in a fresh output directory that is not a Git repository: Codex needs `--skip-git-repo-check` in those profiles.
 - `local` points Claude Code at LM Studio's Anthropic-compatible endpoint. Set the port your server uses and a model it has loaded.
 - Unattended runs need sign-ins that last. Codex keeps the one from `codex login`. For Claude Code, `claude setup-token` prints a long-lived token without saving it: put it in the `CLAUDE_CODE_OAUTH_TOKEN` environment variable and list `CLAUDE_CODE_OAUTH_TOKEN` in `pass_env`, since agents receive only OS and tool-discovery variables plus `pass_env`.
 
@@ -124,9 +126,20 @@ Secret filtering is best effort. Configure read-only agent profiles for adoption
 
 ```yaml
 adopt:
-  ladder: [codex-review] # defaults to the build ladder; profiles must exist
+  ladder: [codex-inspect] # defaults to the build ladder; profiles must exist
   exclude: [private/**] # additional repository-relative secret file patterns
+
+profiles:
+  codex-inspect:
+    provider: openai
+    command: ["codex", "exec", "--sandbox", "workspace-write", "--add-dir", "{{output_dir}}", "-"]
+    stdin: true
 ```
+
+An adoption agent works in the inspection checkout and writes its output to a directory aeh
+opens outside it. `{{output_dir}}` in a profile's command is replaced with that directory, so
+a CLI with a sandbox can be allowed to write there (`--add-dir` in Codex and Claude Code). Only
+profiles in `adopt.ladder` may use it; the configuration refuses it anywhere else.
 
 Basenames `.env*`, `*.pem`, `*.key`, `id_*`, `*.pfx`, `credentials*`, and `secrets*` are
 excluded case-insensitively. Tracked symbolic links and reparse points are also removed
