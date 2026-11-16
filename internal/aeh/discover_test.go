@@ -61,6 +61,8 @@ func newDiscoveryFixture(t *testing.T, agent string) *discoveryFixture {
 	mustGit(t, f.dir, "init", "-q", "-b", "main")
 	mustGit(t, f.dir, "config", "core.autocrlf", "false")
 	write(t, f.dir, ".gitignore", ".aeh/\n")
+	// An existing project: discovery keeps its stack. Projects from scratch have their own tests.
+	write(t, f.dir, "src/shop.js", "// the existing shop\n")
 	f.setAgent(agent)
 	f.writeConfig("")
 	mustGit(t, f.dir, "add", "-A")

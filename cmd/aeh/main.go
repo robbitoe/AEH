@@ -30,6 +30,7 @@ Discovery (from an idea to a draft book of specs in memory)
   aeh discover answer <slug> <QID> "<text>"
                                     answer a question (again to revise it)
   aeh discover skip <slug> <QID>    skip an optional question
+  aeh discover review <slug>        run the advisory book review again when it has no verdict
   aeh discover promote <slug> <feature>
                                     create an unapproved feature spec from a committed draft
   aeh discover accept <slug> vision|data
@@ -74,7 +75,8 @@ Memory (local, private: .aeh/memory/ of the main checkout, never published by ae
 
 Tracking
   aeh status                        progress of every outcome
-  aeh version
+  aeh version                       print the version
+  aeh help                          this list
 `
 
 func main() {
@@ -186,7 +188,7 @@ func dispatch(ctx context.Context, args []string) (int, error) {
 		if err := aeh.Answer(repo, args[1], strings.Join(args[2:], " ")); err != nil {
 			return 1, err
 		}
-		fmt.Printf("answer recorded; run it again with: aeh run %s (or aeh plan <feature> for a blocked plan)\n", args[1])
+		fmt.Printf("answer recorded; run it again with: aeh run %s (or aeh plan <feature>, or aeh adopt seal <feature>, for a blocked plan)\n", args[1])
 		return 0, nil
 
 	case "status":
@@ -465,7 +467,7 @@ func adoptCommand(ctx context.Context, repo aeh.Repo, args []string) (int, error
 
 func discoverCommand(ctx context.Context, repo aeh.Repo, args []string) (int, error) {
 	if len(args) < 2 {
-		return 2, errors.New("usage: aeh discover new|run|show|answer|skip|promote|accept <slug> ...")
+		return 2, errors.New("usage: aeh discover new|run|show|answer|skip|review|promote|accept <slug> ...")
 	}
 	slug := args[1]
 	switch args[0] {
@@ -522,21 +524,41 @@ func discoverCommand(ctx context.Context, repo aeh.Repo, args []string) (int, er
 		}
 		fmt.Printf("%s skipped; phase %s\n", args[2], st.Phase)
 		return 0, nil
+	case "review":
+		if len(args) != 2 {
+			return 2, errors.New("usage: aeh discover review <slug>")
+		}
+		st, err := aeh.DiscoverReview(ctx, repo, slug, os.Stdout)
+		if err != nil {
+			return 1, err
+		}
+		printDiscovery(st, false)
+		return 0, nil
 	case "promote", "accept":
 		if len(args) != 3 {
 			return 2, fmt.Errorf("usage: aeh discover %s <slug> <feature|vision|data>", args[0])
 		}
 		var st aeh.DiscoveryState
 		var err error
+		actions := &st.Acceptances
 		if args[0] == "promote" {
 			st, err = aeh.DiscoverPromote(repo, slug, args[2])
+			actions = &st.Promotions
 		} else {
 			st, err = aeh.DiscoverAccept(repo, slug, args[2])
 		}
 		if err != nil {
 			return 1, err
 		}
-		printDiscovery(st, true)
+		// One line for the action; aeh discover show prints the whole session.
+		for _, a := range *actions {
+			if a.Name == args[2] {
+				fmt.Printf("%sed %s to %s (%s)\n", strings.TrimSuffix(args[0], "e"), a.Name, a.Target, a.Date)
+			}
+		}
+		if args[0] == "promote" {
+			fmt.Printf("approve it when it reads right: aeh memory approve %s\n", args[2])
+		}
 		return 0, nil
 	}
 	return 2, fmt.Errorf("unknown discover command %q", args[0])
