@@ -42,6 +42,7 @@ Adoption (an existing system, area by area)
                                      inspect an area and record observations
   aeh adopt verify [--base <rev>]    verify only the commands in aeh/config.yaml
   aeh adopt promote <feature>       create an unapproved spec from keep observations
+  aeh adopt seal <feature>          characterization tests of an approved adopted feature
   aeh adopt status                  inventory, area states and uncovered path groups
   aeh adopt show <feature>          observations of an area, with their state and decision token
   aeh adopt confirm <feature> AC-<n> keep|bug|drop --seen <token>
@@ -323,7 +324,7 @@ func memoryCommand(repo aeh.Repo, args []string) (int, error) {
 
 func adoptCommand(ctx context.Context, repo aeh.Repo, args []string) (int, error) {
 	if len(args) == 0 {
-		return 2, errors.New("usage: aeh adopt inventory|accept|area|verify|promote|status|show|confirm")
+		return 2, errors.New("usage: aeh adopt inventory|accept|area|verify|promote|seal|status|show|confirm")
 	}
 	switch args[0] {
 	case "inventory", "verify", "area":
@@ -378,6 +379,18 @@ func adoptCommand(ctx context.Context, repo aeh.Repo, args []string) (int, error
 			return 1, err
 		}
 		fmt.Println("Current system inventory accepted in memory.")
+		return 0, nil
+	case "seal":
+		if len(args) != 2 {
+			return 2, errors.New("usage: aeh adopt seal <feature>")
+		}
+		st, err := aeh.AdoptSeal(ctx, repo, args[1], os.Stdout)
+		if err != nil {
+			return 1, err
+		}
+		if st.Status == aeh.StatusBlocked {
+			return 3, nil
+		}
 		return 0, nil
 	case "promote":
 		if len(args) != 2 {

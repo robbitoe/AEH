@@ -152,6 +152,8 @@ aeh adopt show billing
 aeh adopt confirm billing AC-1 keep --seen <token-from-show>
 aeh adopt promote billing
 aeh memory approve billing
+aeh adopt seal billing
+git merge aeh/billing-v0_1_0     # you merge the characterization tests
 aeh adopt status
 ```
 
@@ -163,9 +165,21 @@ as `keep`, `bug` or `drop` before promoting. Promotion requires at least one kee
 its original AC numbers (gaps included), and permanently reserves retired observation IDs.
 It creates an unapproved 0.1.0 spec; it does not claim implementation or characterization.
 Repeating promotion is a no-op only while the promoted spec's exact bytes remain at memory HEAD.
-Characterization with `aeh adopt seal` belongs to the next stage.
+`aeh adopt seal <feature>` characterizes an approved adopted feature: it runs `aeh plan` in an
+explicit characterize mode. The test author writes tests and a `plan.yaml` with
+`kind: characterize` and no task. Every check of a plan applies, with red turned to green:
+each new test file must pass on the existing code on its own, all of them together, and the
+previous acceptance suite with them added. QA reviews with a characterization prompt;
+the route and reviewers come from the rules that overlap the area's paths and the files the
+tests change, and only go up. The verified commit is published on `aeh/<ID>` and recorded in
+memory as the feature's first implementation: `code_sha` is that published commit and
+`observed_base_sha` the commit the area agent inspected. `aeh run` refuses a
+characterization: there is nothing to implement; merge the branch. `aeh plan` refuses an
+adopted feature until it is characterized, and plans its next version (for example a fix
+for a `bug` observation, as a new criterion) only after you merged the characterization.
 
-`aeh adopt status` lists observed, confirmed and promoted areas and uncovered groups of
+`aeh adopt status` lists each area as observed, confirmed, promoted, characterizing,
+characterized (verified, being published), published or merged, and uncovered groups of
 tracked files at the accepted inventory's base and date. Files not matched by any feature
 or area path are grouped by their first two path segments; partially covered groups remain visible.
 Every adoption command regenerates `.aeh/reports/adopt.md` with inventory, inspection,
@@ -180,7 +194,7 @@ aeh adopt confirm billing AC-2 bug --seen 81d2c4e5f6a7    # recorded in defects.
 aeh adopt confirm billing AC-3 drop --seen 0c1d2e3f4a5b   # not worth keeping
 ```
 
-The token binds your decision to the observation as you saw it. If an agent observed it again in the meantime, the command fails and shows the new text. The same decision again is a no-op; a different one is refused. A bug or a drop retires the number for good. The log is checked against the memory history, so a rewritten or restored log is refused. A criterion added or changed by hand in `area.md` is reported, not accepted; edit the description freely. Characterization tests come in the next stage.
+The token binds your decision to the observation as you saw it. If an agent observed it again in the meantime, the command fails and shows the new text. The same decision again is a no-op; a different one is refused. A bug or a drop retires the number for good. The log is checked against the memory history, so a rewritten or restored log is refused. A criterion added or changed by hand in `area.md` is reported, not accepted; edit the description freely.
 
 ## From an approved spec to code
 
@@ -353,6 +367,7 @@ Make sure your project's `.gitignore` covers build output (`bin/`, `obj/`, `node
 | `aeh adopt area <feature> --paths a/,... [--title "..."] [--base <rev>]` | Creates or refreshes observations within fixed area paths. |
 | `aeh adopt verify [--base <rev>]` | Runs configured build/test commands in a disposable worktree; saves provenance. |
 | `aeh adopt promote <feature>` | Creates an unapproved 0.1.0 spec from keep observations, retaining criterion numbers. |
+| `aeh adopt seal <feature>` | Writes, checks green and publishes characterization tests of an approved adopted feature. |
 | `aeh adopt status` | Lists inventory state, area states and uncovered path groups. |
 | `aeh adopt show <feature>` | Observations of an adopted area: state, decision and the token to decide on each. |
 | `aeh adopt confirm <feature> AC-<n> keep\|bug\|drop --seen <token>` | Decides on an observation as you saw it; refuses if it changed since. |
@@ -387,11 +402,11 @@ The engine above is the build stage of the [vision](docs/vision.md). Next, in or
 1. **Memory.** A private wiki in `.aeh/memory/` with versioned specs, kept in sync with the code by a deterministic drift gate.
 2. **Triage and reviewers (implemented).** Trivial, change and new routes, with QA, security and DBA reviewers chosen by route and rules.
 3. **Specs to code (implemented).** An approved feature produces one task and independently reviewed, runner-sealed acceptance tests with `aeh plan`.
-4. **Discovery and adoption inventory/areas (implemented).** From a vague idea to a validated spec book with HTML mockups, advisory independent review, owner promotion to features, and acceptance of vision/data. Characterization of adopted behavior comes next.
+4. **Discovery and adoption inventory/areas (implemented).** From a vague idea to a validated spec book with HTML mockups, advisory independent review, owner promotion to features, and acceptance of vision/data; adoption of an existing system area by area, up to sealed characterization tests.
 5. **Live review.** Specs keep evolving while approved features are built.
 6. **Sandbox.** Agents in a container with no network by default.
 
-Adoption characterization and live spec/test revision remain future work. Manual outcomes, tasks and acceptance tests can also be written by hand or with your agent CLI.
+Live spec/test revision remains future work. Manual outcomes, tasks and acceptance tests can also be written by hand or with your agent CLI.
 
 ## Development
 

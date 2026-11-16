@@ -53,6 +53,9 @@ func RunOutcome(ctx context.Context, r Repo, id string, log io.Writer) (State, e
 	if err != nil {
 		return State{}, err
 	}
+	if generated && plan.Kind == PlanCharacterize {
+		return State{}, characterizeRunError(id)
+	}
 	if generated {
 		if plan.Phase != PlanLogged {
 			return State{}, fmt.Errorf("plan %s is not finished; run aeh plan %s", id, plan.Feature)
@@ -80,7 +83,14 @@ func RunOutcome(ctx context.Context, r Repo, id string, log io.Writer) (State, e
 	if err != nil {
 		return State{}, err
 	}
+	if o.Kind == PlanCharacterize {
+		return State{}, characterizeRunError(id)
+	}
 	return run(ctx, r, cfg, o, log, nil)
+}
+
+func characterizeRunError(id string) error {
+	return fmt.Errorf("%s characterizes existing behavior: nothing to implement; merge %s", id, IntegrationBranch(id))
 }
 
 // Do runs a level-1 change described in one sentence, with route-based reviews.

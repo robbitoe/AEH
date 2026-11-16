@@ -1343,8 +1343,10 @@ func adoptionStatus(a *adoptSession) (AdoptStatusSnapshot, error) {
 				state = "observed"
 			}
 		}
-		if _, ok := memory.Spec(name); ok {
-			state = "promoted"
+		if spec, ok := memory.Spec(name); ok {
+			if state, err = characterizationState(a.repo, spec); err != nil {
+				return st, err
+			}
 		}
 		st.Areas = append(st.Areas, AdoptAreaStatus{Feature: name, State: state, Paths: front.Paths})
 		paths = append(paths, front.Paths...)
@@ -1378,6 +1380,37 @@ func adoptionStatus(a *adoptSession) (AdoptStatusSnapshot, error) {
 		st.Verification = &v
 	}
 	return st, nil
+}
+
+// characterizationState is the state of a promoted area: promoted until a characterization
+// plan runs; characterizing while it runs or is blocked; characterized once its sealed tests
+// are verified; published once aeh/<ID> holds them and memory records that commit; merged once
+// the main checkout's HEAD contains it.
+func characterizationState(r Repo, spec Spec) (string, error) {
+	if im, ok := spec.LastImplementation(); ok {
+		if _, err := git(r.Root, "merge-base", "--is-ancestor", im.Code, "HEAD"); err == nil {
+			return "merged", nil
+		}
+		return "published", nil
+	}
+	if spec.Approval == nil {
+		return "promoted", nil
+	}
+	id, err := generatedOutcomeID(spec.Feature, spec.Version)
+	if err != nil {
+		return "", err
+	}
+	plan, ok, err := LoadPlanState(r, id)
+	if err != nil || !ok || plan.Kind != PlanCharacterize {
+		return "promoted", err
+	}
+	switch {
+	case plan.Phase == PlanPublishing || plan.Phase == PlanPublished || plan.Phase == PlanLogged:
+		return "characterized", nil
+	case plan.Status == StatusBlocked:
+		return "characterizing (blocked)", nil
+	}
+	return "characterizing", nil
 }
 
 // AdoptStatus holds the project lock and regenerates the adoption report.
