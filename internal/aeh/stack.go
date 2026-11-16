@@ -35,12 +35,22 @@ func housekeeping(p string) bool {
 		return false
 	}
 	lower := strings.ToLower(p)
-	for _, prefix := range []string{".git", ".editorconfig", "readme", "license", "licence", "copying", "changelog"} {
-		if strings.HasPrefix(lower, prefix) {
-			return true
-		}
+	switch lower {
+	case ".gitignore", ".gitattributes", ".gitmodules", ".editorconfig":
+		return true
 	}
-	return strings.HasSuffix(lower, ".md")
+	// Exact names only, with a text extension at most: license.py is code, not a license.
+	stem, ext := lower, path.Ext(lower)
+	if ext == ".md" || ext == ".txt" || ext == ".rst" {
+		stem = strings.TrimSuffix(lower, ext)
+	} else if ext != "" {
+		return false
+	}
+	switch stem {
+	case "readme", "license", "licence", "copying", "changelog", "notice", "authors", "contributing":
+		return true
+	}
+	return ext == ".md"
 }
 
 // detectStack reads the committed files at the main checkout's HEAD. A repository without

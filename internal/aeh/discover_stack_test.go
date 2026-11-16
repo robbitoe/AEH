@@ -118,7 +118,9 @@ func TestDetectStack(t *testing.T) {
 		t.Fatalf("aeh files and housekeeping only: %+v %v", st, err)
 	}
 	for p, want := range map[string]bool{"aeh/config.yaml": true, "README.md": true, "LICENSE": true, ".gitignore": true,
-		"NOTES.md": true, "docs/guide.md": false, "src/a.go": false, "package.json": false} {
+		"NOTES.md": true, "docs/guide.md": false, "src/a.go": false, "package.json": false,
+		"LICENSE.txt": true, "CHANGELOG.rst": true, ".gitattributes": true, "license.py": false, "copying.go": false,
+		"readme.js": false, ".github": false, "licenses": false} {
 		if housekeeping(p) != want {
 			t.Errorf("housekeeping(%q) = %v", p, !want)
 		}

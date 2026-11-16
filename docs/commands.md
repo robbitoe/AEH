@@ -8,7 +8,7 @@ Every command of the `aeh` CLI, in the order of the product cycle. This file is 
 - Exit codes: `0` done, `1` error, `2` wrong usage, `3` blocked: the command stopped with a question for the owner.
 - `<slug>` and `<feature>` are lowercase letters, digits and hyphens. `<ID>` is an outcome ID such as `OUT-001` or `billing-v0_2_0`.
 - State and evidence are local and never committed: `.aeh/` (state, runs, reports, memory). Configuration, outcomes, seals and prompt overrides are versioned in `aeh/`.
-- Commands that change state take a project lock: a second command waits for the first.
+- Commands that change state take a project lock. A second command does not wait: it fails at once with an error naming the lock. If a command crashed, verify it stopped before removing the lock it names.
 - Agent and command output shown on the terminal, saved in state or written to reports is redacted: recognized secrets become `[redacted <kind>]`.
 
 ## Setup
