@@ -15,10 +15,17 @@ import (
 )
 
 // PlanFile is the author's task and declared traceability, not proof of test coverage.
+// A characterization plan (kind: characterize) has no task: it only seals tests of
+// behavior the code already has.
 type PlanFile struct {
-	Task  PlanTask            `yaml:"task"`
+	Kind  string              `yaml:"kind,omitempty" json:",omitempty"`
+	Task  PlanTask            `yaml:"task,omitempty"`
 	Trace map[string][]string `yaml:"trace"`
 }
+
+// PlanCharacterize is the plan and outcome kind of characterization tests: green on the
+// existing code, with nothing to implement.
+const PlanCharacterize = "characterize"
 
 // PlanTask covers the entire new-criteria delta in one implementation task.
 type PlanTask struct {
@@ -52,17 +59,26 @@ func parsePlanFile(b []byte) (PlanFile, error) {
 }
 
 func validatePlanForm(p PlanFile) error {
-	goal := strings.TrimSpace(p.Task.Goal)
-	if goal == "" || len(goal) > 500 || strings.ContainsAny(goal, "\r\n\u0085\u2028\u2029") {
-		return errors.New("plan.yaml: task.goal must be one non-empty line of at most 500 bytes")
-	}
-	if len(p.Task.Paths) == 0 {
-		return errors.New("plan.yaml: task.paths must name at least one literal path")
-	}
-	for _, t := range p.Task.Paths {
-		if err := checkTaskPath(t); err != nil {
-			return err
+	switch p.Kind {
+	case PlanCharacterize:
+		if p.Task.Goal != "" || len(p.Task.Paths) > 0 {
+			return errors.New("plan.yaml: a characterization plan has no task; remove task")
 		}
+	case "":
+		goal := strings.TrimSpace(p.Task.Goal)
+		if goal == "" || len(goal) > 500 || strings.ContainsAny(goal, "\r\n\u0085\u2028\u2029") {
+			return errors.New("plan.yaml: task.goal must be one non-empty line of at most 500 bytes")
+		}
+		if len(p.Task.Paths) == 0 {
+			return errors.New("plan.yaml: task.paths must name at least one literal path")
+		}
+		for _, t := range p.Task.Paths {
+			if err := checkTaskPath(t); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("plan.yaml: kind %q is unknown; omit it, or use characterize for a characterization plan", p.Kind)
 	}
 	if len(p.Trace) == 0 {
 		return errors.New("plan.yaml: trace must map each new AC-<n> to test files")
@@ -151,6 +167,7 @@ type PlanCandidateFile struct {
 // PlanInput is the runner's immutable input to pure candidate validation.
 type PlanInput struct {
 	OutcomeID string
+	Kind      string // "" or PlanCharacterize
 	Spec      Spec
 	Delta     CriteriaDelta
 	Protected []string
@@ -177,6 +194,11 @@ func validatePlanCandidate(in PlanInput, files []PlanCandidateFile, plan PlanFil
 	folded := map[string]bool{}
 	var total int64
 	for _, f := range ordered {
+		// A test path is published, recorded in memory's implementation history and shown in
+		// later plans: it must not carry a credential. The message never repeats the path.
+		if len(findSecrets([]byte(f.Path))) > 0 {
+			return errors.New("plan: a changed path looks like it contains a credential; rename the file")
+		}
 		if err := checkPlanTestPath(f.Path); err != nil {
 			return fmt.Errorf("plan: changed path %q: %w", f.Path, err)
 		}
@@ -210,6 +232,12 @@ func validatePlanCandidate(in PlanInput, files []PlanCandidateFile, plan PlanFil
 	}
 	if err := validatePlanForm(plan); err != nil {
 		return err
+	}
+	if plan.Kind != in.Kind {
+		if in.Kind == PlanCharacterize {
+			return errors.New("plan: plan.yaml must declare kind: characterize and no task")
+		}
+		return errors.New("plan: plan.yaml must not declare a kind; it plans an implementation task")
 	}
 	protected := append([]string{"aeh/", ".aeh/", cfg.AcceptanceDir}, in.Protected...)
 	protected = append(protected, in.Config.Protected...)
@@ -283,10 +311,12 @@ func planPathContained(pattern, task string) bool {
 func generatedOutcome(in PlanInput, plan PlanFile, route string, changelog string) Outcome {
 	cfg := in.Config.plan()
 	o := Outcome{
-		ID: in.OutcomeID, Title: in.Spec.Title, Level: 2, Feature: in.Spec.Feature,
+		ID: in.OutcomeID, Kind: in.Kind, Title: in.Spec.Title, Level: 2, Feature: in.Spec.Feature,
 		Change: "minor", Changelog: changelog, Route: route,
 		Acceptance: []string{cfg.AcceptanceDir + "/" + in.OutcomeID + "/"},
-		Tasks:      []Task{{ID: "T1", Goal: plan.Task.Goal, Paths: append([]string(nil), plan.Task.Paths...), MaxDiffLines: cfg.MaxDiffLines}},
+	}
+	if in.Kind != PlanCharacterize {
+		o.Tasks = []Task{{ID: "T1", Goal: plan.Task.Goal, Paths: append([]string(nil), plan.Task.Paths...), MaxDiffLines: cfg.MaxDiffLines}}
 	}
 	var lines []string
 	for _, c := range in.Delta.New {

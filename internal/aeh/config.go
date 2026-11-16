@@ -150,6 +150,7 @@ type Task struct {
 // Outcome is the contract: what an actor achieves, how it is verified, and how it is split.
 type Outcome struct {
 	ID          string      `yaml:"id"`
+	Kind        string      `yaml:"kind,omitempty" json:",omitempty"` // "" or characterize: tests only, nothing to implement
 	Title       string      `yaml:"title"`
 	Level       int         `yaml:"level"`
 	Actor       string      `yaml:"actor"`
@@ -413,6 +414,20 @@ func (o *Outcome) normalize() error {
 		if !validRole(role) {
 			return fmt.Errorf("outcome %s: reviewer role %q must be qa, security or dba", o.ID, role)
 		}
+	}
+	switch o.Kind {
+	case "":
+	case PlanCharacterize:
+		// Characterization seals tests of existing behavior: there is no task to invent.
+		if len(o.Tasks) > 0 {
+			return fmt.Errorf("outcome %s: a characterize outcome has no tasks", o.ID)
+		}
+		if len(o.Acceptance) == 0 {
+			return fmt.Errorf("outcome %s: a characterize outcome needs acceptance test paths", o.ID)
+		}
+		return nil
+	default:
+		return fmt.Errorf("outcome %s: kind %q must be empty or characterize", o.ID, o.Kind)
 	}
 	if len(o.Tasks) == 0 {
 		goal := o.Title

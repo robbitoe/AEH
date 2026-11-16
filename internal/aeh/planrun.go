@@ -34,7 +34,9 @@ const (
 type PlanState struct {
 	Version         int              `json:"version"`
 	ID              string           `json:"id"`
+	Kind            string           `json:"kind,omitempty"` // "" or PlanCharacterize
 	Feature         string           `json:"feature"`
+	ObservedBase    string           `json:"observed_base_sha,omitempty"` // characterization: the inspected commit
 	Phase           string           `json:"phase"`
 	Status          string           `json:"status"` // running, blocked or the phase's end state
 	Base            string           `json:"base"`
@@ -120,7 +122,34 @@ func savePlanState(r Repo, s *PlanState) error {
 		return err
 	}
 	s.UpdatedAt = time.Now().UTC()
+	redactPlanState(s)
 	return writePrivateJSON(p, s)
+}
+
+// redactPlanState redacts every diagnostic the state carries before it is saved: command,
+// agent and Git output reach the next author's feedback, the owner's question and the
+// terminal only from here, so no path can skip it. The in-memory state is redacted too.
+func redactPlanState(s *PlanState) {
+	s.Question = redactDiagnostic(s.Question)
+	for i := range s.Answers {
+		s.Answers[i] = redactDiagnostic(s.Answers[i]) // the owner's replies reach the next author
+	}
+	for i := range s.Attempts {
+		s.Attempts[i].Feedback = redactDiagnostic(s.Attempts[i].Feedback)
+	}
+	for i := range s.Checks {
+		s.Checks[i].Name = redactDiagnostic(s.Checks[i].Name) // names carry test paths
+		s.Checks[i].Detail = redactDiagnostic(s.Checks[i].Detail)
+	}
+}
+
+// redactPlanErr is the error boundary of aeh plan and aeh adopt seal: Git, command and memory
+// diagnostics may carry secrets. Unlike redactErr it keeps the text otherwise as it is.
+func redactPlanErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &redactedError{msg: redactDiagnostic(err.Error()), err: err}
 }
 
 // planner carries one planning session.
@@ -133,20 +162,50 @@ type planner struct {
 	owners  string // every feature's paths and the declared spec, as the run contract sees them
 	state   *PlanState
 	log     io.Writer
-	prompts map[string]string // plan.md, review-plan.md and review-<role>.md
+	prompts map[string]string // the author's and QA's plan prompts and review-<role>.md
 	sources map[string]string
+	kind    string // "" or PlanCharacterize
 }
 
+// authorPrompt and qaPrompt name the prompts of this kind of plan.
+func (p *planner) authorPrompt() string {
+	if p.kind == PlanCharacterize {
+		return "characterize.md"
+	}
+	return "plan.md"
+}
+
+func (p *planner) qaPrompt() string {
+	if p.kind == PlanCharacterize {
+		return "review-characterize.md"
+	}
+	return "review-plan.md"
+}
+
+// logf writes one redacted line to the terminal: arguments may carry command or agent output.
 func (p *planner) logf(format string, args ...any) {
 	if p.log != nil {
-		fmt.Fprintf(p.log, format+"\n", args...)
+		fmt.Fprintln(p.log, redactDiagnostic(fmt.Sprintf(format, args...)))
 	}
 }
 
 // PlanFeature plans the approved spec of a feature: it pins the inputs, checks the base,
 // lets a test author write acceptance tests and one task, checks and reviews the frozen
 // result, and publishes it on aeh/<ID>. Calling it again resumes an unfinished plan.
-func PlanFeature(ctx context.Context, r Repo, feature string, log io.Writer) (PlanState, error) {
+func PlanFeature(ctx context.Context, r Repo, feature string, log io.Writer) (_ PlanState, err error) {
+	defer func() { err = redactPlanErr(err) }()
+	return planFeature(ctx, r, feature, "", log)
+}
+
+// AdoptSeal plans characterization tests for a promoted, approved adopted feature: the tests
+// must pass on the existing code, and the published commit is recorded as its first
+// implementation. Calling it again resumes an unfinished characterization.
+func AdoptSeal(ctx context.Context, r Repo, feature string, log io.Writer) (_ PlanState, err error) {
+	defer func() { err = redactErr(err) }()
+	return planFeature(ctx, r, feature, PlanCharacterize, log)
+}
+
+func planFeature(ctx context.Context, r Repo, feature, kind string, log io.Writer) (_ PlanState, err error) {
 	// Plan state, locks, configuration and the base all come from the main checkout, also
 	// when aeh plan runs in a linked worktree, so every caller sees one plan.
 	main, err := MainCheckout(r)
@@ -159,6 +218,20 @@ func PlanFeature(ctx context.Context, r Repo, feature string, log io.Writer) (Pl
 		return PlanState{}, err
 	}
 	defer unlockProject()
+	if kind == PlanCharacterize {
+		// Like every adoption command: finish interrupted adoption imports first, and
+		// regenerate the adoption report on the way out, under the same lock.
+		if err := resumeAdoptImports(r); err != nil {
+			return PlanState{}, err
+		}
+		defer func() {
+			if a, lerr := loadAdoptState(r, ""); lerr == nil {
+				a.reportCommand(&err)
+			} else if err == nil {
+				err = lerr
+			}
+		}()
+	}
 	cfg, err := r.LoadConfig()
 	if err != nil {
 		return PlanState{}, err
@@ -180,7 +253,18 @@ func PlanFeature(ctx context.Context, r Repo, feature string, log io.Writer) (Pl
 	if !spec.Approved() {
 		return PlanState{}, fmt.Errorf("feature %s is not approved as it reads now; approve it first: aeh memory approve %s", feature, feature)
 	}
+	if kind == PlanCharacterize {
+		// Recording a characterization bumps the spec's version, which names the next plan: a
+		// published one is found by feature, never by the version it moved past.
+		if st, ok, err := finishPublishedCharacterization(r, cfg, memory.Dir, spec, log); err != nil || ok {
+			return st, err
+		}
+	}
 	id, err := generatedOutcomeID(feature, spec.Version)
+	if err != nil {
+		return PlanState{}, err
+	}
+	observed, err := characterizationBase(memory.Dir, spec, kind)
 	if err != nil {
 		return PlanState{}, err
 	}
@@ -190,13 +274,19 @@ func PlanFeature(ctx context.Context, r Repo, feature string, log io.Writer) (Pl
 	}
 	defer unlock()
 
-	p := &planner{repo: r, cfg: cfg, pcfg: cfg.plan(), spec: spec, memDir: memory.Dir, log: log, owners: memory.ContractFingerprint(feature)}
+	p := &planner{repo: r, cfg: cfg, pcfg: cfg.plan(), spec: spec, memDir: memory.Dir, log: log, owners: memory.ContractFingerprint(feature), kind: kind}
 	if err := p.loadPrompts(); err != nil {
 		return PlanState{}, err
 	}
 	st, exists, err := LoadPlanState(r, id)
 	if err != nil {
 		return st, err
+	}
+	if exists && st.Kind != kind {
+		if st.Kind == PlanCharacterize {
+			return st, fmt.Errorf("%s is a characterization plan; continue it with: aeh adopt seal %s", id, feature)
+		}
+		return st, fmt.Errorf("%s is an implementation plan; continue it with: aeh plan %s", id, feature)
 	}
 	// Memory must be clean to reserve or to work before publication. After publication only
 	// the log entry is missing, and logMemory reconciles an interrupted write of it.
@@ -206,7 +296,7 @@ func PlanFeature(ctx context.Context, r Repo, feature string, log io.Writer) (Pl
 		}
 	}
 	if !exists {
-		st, err = p.reserve(id)
+		st, err = p.reserve(id, observed)
 		if err != nil {
 			return st, err
 		}
@@ -274,13 +364,98 @@ func PlanFeature(ctx context.Context, r Repo, feature string, log io.Writer) (Pl
 			return st, err
 		}
 	}
+	if kind == PlanCharacterize {
+		p.logf("%s characterized on %s at %s and recorded in memory. Nothing to implement: merge %s into your base.", id, IntegrationBranch(id), short(st.PlanCommit), IntegrationBranch(id))
+		return st, nil
+	}
 	p.logf("%s planned on %s at %s. Build it with: aeh run %s", id, IntegrationBranch(id), short(st.PlanCommit), id)
 	return st, nil
 }
 
+// rulesForArea returns every rule that may touch a file of the area: a rule pattern compatible
+// with the literal prefix of any area path counts. Uncertainty raises the route, never lowers it.
+func rulesForArea(rules []TriageRule, paths []string) []TriageRule {
+	var hit []TriageRule
+	for _, rule := range rules {
+	next:
+		for _, rp := range rule.Paths {
+			for _, ap := range paths {
+				if ruleMayTouch(rp, ap) || ruleMayTouch(ap, rp) {
+					hit = append(hit, rule)
+					break next
+				}
+			}
+		}
+	}
+	return hit
+}
+
+// finishPublishedCharacterization completes or reports a characterization of the feature that
+// is already published on its branch: it records it in memory if a crash interrupted that
+// (RecordChange is idempotent by outcome and commit), and is otherwise a no-op. The caller
+// holds the project lock.
+func finishPublishedCharacterization(r Repo, cfg Config, memDir string, spec Spec, log io.Writer) (PlanState, bool, error) {
+	plans, err := ListPlanStates(r)
+	if err != nil {
+		return PlanState{}, false, err
+	}
+	for _, listed := range plans {
+		if listed.Feature != spec.Feature || listed.Kind != PlanCharacterize || (listed.Phase != PlanPublished && listed.Phase != PlanLogged) {
+			continue
+		}
+		unlock, err := lockOutcome(r, listed.ID)
+		if err != nil {
+			return listed, true, err
+		}
+		defer unlock()
+		st, _, err := LoadPlanState(r, listed.ID)
+		if err != nil {
+			return st, true, err
+		}
+		p := &planner{repo: r, cfg: cfg, pcfg: cfg.plan(), spec: spec, memDir: memDir, log: log, kind: PlanCharacterize, state: &st}
+		if st.Phase == PlanPublished {
+			if err := p.recordCharacterization(); err != nil {
+				return st, true, err
+			}
+		}
+		p.logf("%s characterized on %s at %s and recorded in memory. Nothing to implement: merge %s into your base.", st.ID, IntegrationBranch(st.ID), short(st.PlanCommit), IntegrationBranch(st.ID))
+		return st, true, nil
+	}
+	return PlanState{}, false, nil
+}
+
+// characterizationBase checks which kind of plan a feature admits. A feature promoted from an
+// adopted area is characterized first: its existing behavior gets sealed tests before any
+// change is planned. It returns the commit the area's agent last inspected.
+func characterizationBase(memDir string, spec Spec, kind string) (string, error) {
+	area, adopted, err := loadAreaIdentity(memDir, spec.Feature)
+	if err != nil {
+		return "", fmt.Errorf("adopted area %s: %w", spec.Feature, err)
+	}
+	_, implemented := spec.LastImplementation()
+	switch {
+	case kind == "" && adopted && !implemented:
+		return "", fmt.Errorf("feature %s was adopted from existing code; characterize it first: aeh adopt seal %s", spec.Feature, spec.Feature)
+	case kind == "":
+		return "", nil
+	case !adopted:
+		return "", fmt.Errorf("feature %s has no adopted area; characterization applies only to adopted features", spec.Feature)
+	case implemented:
+		return "", fmt.Errorf("feature %s already has an implementation; plan new criteria with: aeh plan %s", spec.Feature, spec.Feature)
+	}
+	if len(area.Events) == 0 {
+		return "", fmt.Errorf("adopted area %s has no observations", spec.Feature)
+	}
+	base := area.Events[len(area.Events)-1].CodeSHA
+	if !isFullSHA(base) {
+		return "", fmt.Errorf("adopted area %s: the last observation has no full code SHA", spec.Feature)
+	}
+	return base, nil
+}
+
 func (p *planner) loadPrompts() error {
 	p.prompts, p.sources = map[string]string{}, map[string]string{}
-	for _, name := range []string{"plan.md", "review-plan.md"} {
+	for _, name := range []string{p.authorPrompt(), p.qaPrompt()} {
 		text, err := loadPrompt(p.repo, name)
 		if err != nil {
 			return fmt.Errorf("load %s: %w", name, err)
@@ -302,9 +477,9 @@ func (p *planner) loadPrompts() error {
 
 // reserve pins the plan's inputs under a new outcome ID after checking that nothing else
 // already uses that ID and that the last implementation is integrated in the base.
-func (p *planner) reserve(id string) (PlanState, error) {
-	st := PlanState{Version: planStateVersion, ID: id, Feature: p.spec.Feature, Phase: PlanReserved, Status: StatusRunning,
-		SpecVersion: p.spec.Version, SpecDigest: p.spec.Approval.Content}
+func (p *planner) reserve(id, observed string) (PlanState, error) {
+	st := PlanState{Version: planStateVersion, ID: id, Kind: p.kind, Feature: p.spec.Feature, Phase: PlanReserved, Status: StatusRunning,
+		SpecVersion: p.spec.Version, SpecDigest: p.spec.Approval.Content, ObservedBase: observed}
 	if err := p.checkCollisions(id); err != nil {
 		return st, err
 	}
@@ -331,15 +506,25 @@ func (p *planner) reserve(id string) (PlanState, error) {
 		return st, fmt.Errorf("plan %s: the approved spec adds no criteria; nothing to plan", p.spec.Feature)
 	}
 	st.Route = RouteChange
-	if !hasLast {
+	if !hasLast && p.kind != PlanCharacterize {
 		st.Route = RouteNew
 	}
 	st.Roles = requiredRoles(st.Route)
+	if p.kind == PlanCharacterize {
+		// The route and reviewers come from the adopted area: every rule that may match
+		// anything below the feature's paths raises them (conservatively, with triage's glob
+		// semantics). The candidate's real files may raise them further.
+		st.Route, st.Roles = applyRules(st.Route, st.Roles, rulesForArea(p.cfg.Triage.Rules, p.spec.Paths))
+	}
 	if st.Inputs, err = p.inputsDigestFor(&st); err != nil {
 		return st, err
 	}
 	p.state = &st
-	p.logf("%s: planning %s %s (%d new criteria, route %s, base %s)", id, p.spec.Feature, p.spec.Version, len(st.Delta.New), st.Route, short(base))
+	verb := "planning"
+	if p.kind == PlanCharacterize {
+		verb = "characterizing"
+	}
+	p.logf("%s: %s %s %s (%d criteria, route %s, base %s)", id, verb, p.spec.Feature, p.spec.Version, len(st.Delta.New), st.Route, short(base))
 	return st, savePlanState(p.repo, &st)
 }
 
@@ -451,8 +636,10 @@ func (p *planner) inputsDigestFor(st *PlanState) (string, error) {
 		Effective         map[string]string
 		Profiles          map[string]Profile
 		Prompts           map[string]string
+		Kind              string `json:",omitempty"`
+		ObservedBase      string `json:",omitempty"`
 	}{st.Base, st.SpecDigest, prior, st.Delta, p.pcfg, p.cfg.Commands, p.cfg.PassEnv, p.owners, p.cfg.Protected, p.cfg.Triage.Rules,
-		p.cfg.Reviewers, p.cfg.Reviewers.declared, p.cfg.Reviewer, effective, p.cfg.Profiles, p.prompts}
+		p.cfg.Reviewers, p.cfg.Reviewers.declared, p.cfg.Reviewer, effective, p.cfg.Profiles, p.prompts, st.Kind, st.ObservedBase}
 	b, err := json.Marshal(v)
 	if err != nil {
 		return "", err
@@ -629,6 +816,8 @@ func (p *planner) baseline(ctx context.Context) (bool, string, error) {
 		if cerr := verifyCheckout(wt, st.Base); cerr != nil && g.Passed {
 			g.Passed, g.Output = false, cerr.Error()
 		}
+		// Command output may carry secrets: redact it before it is saved, logged or asked.
+		g.Output = redactDiagnostic(g.Output)
 		results = append(results, g)
 		p.logf("    %-6s %s", g.Name, gateStatus(g))
 		if g.Uncertain {
@@ -767,7 +956,7 @@ func (p *planner) attempt(ctx context.Context, a *PlanAttempt, feedback string) 
 	in := p.input()
 	data := newPlanPromptData(in)
 	data.Feedback = feedback
-	prompt, err := renderPrompt("plan.md", p.prompts["plan.md"], data)
+	prompt, err := renderPrompt(p.authorPrompt(), p.prompts[p.authorPrompt()], data)
 	if err != nil {
 		return "", err
 	}
@@ -817,7 +1006,9 @@ func (p *planner) attempt(ctx context.Context, a *PlanAttempt, feedback string) 
 	if err != nil {
 		return fail("form", err.Error())
 	}
-	st.Route, st.Roles = applyRules(st.Route, st.Roles, rulesForTasks(p.cfg.Triage.Rules, []Task{{ID: "T1", Paths: plan.Task.Paths}}))
+	if len(plan.Task.Paths) > 0 {
+		st.Route, st.Roles = applyRules(st.Route, st.Roles, rulesForTasks(p.cfg.Triage.Rules, []Task{{ID: "T1", Paths: plan.Task.Paths}}))
+	}
 	if err := p.save(); err != nil {
 		return "", err
 	}
@@ -903,6 +1094,7 @@ func (p *planner) verifyFrozen(ctx context.Context, a *PlanAttempt) (string, err
 		if err != nil {
 			return "", err
 		}
+		g.Output = redactDiagnostic(g.Output)
 		// The verdict and what it means for the attempt are saved together: a rejected or
 		// uncertain review never resumes as a review still to ask.
 		a.Reviews = append(a.Reviews, v)
@@ -938,7 +1130,7 @@ func approvedOn(reviews []ReviewVerdict, role, sha string) bool {
 func (p *planner) testDir() string { return p.pcfg.AcceptanceDir + "/" + p.state.ID + "/" }
 
 func (p *planner) input() PlanInput {
-	return PlanInput{OutcomeID: p.state.ID, Spec: p.spec, Delta: p.state.Delta, Protected: p.cfg.Protected, Config: p.cfg}
+	return PlanInput{OutcomeID: p.state.ID, Kind: p.state.Kind, Spec: p.spec, Delta: p.state.Delta, Protected: p.cfg.Protected, Config: p.cfg}
 }
 
 // planVerdict reads the author's last non-empty line: "PLAN: READY" or "PLAN: TOO-LARGE".
@@ -1001,7 +1193,11 @@ func (p *planner) freeze(candidate string, files []PlanCandidateFile, plan PlanF
 	for _, c := range st.Delta.New {
 		ids = append(ids, fmt.Sprintf("AC-%d", c.ID))
 	}
-	o := generatedOutcome(p.input(), plan, route, fmt.Sprintf("Adds %s.", strings.Join(ids, ", ")))
+	changelog := fmt.Sprintf("Adds %s.", strings.Join(ids, ", "))
+	if st.Kind == PlanCharacterize {
+		changelog = fmt.Sprintf("Characterizes %s.", strings.Join(ids, ", "))
+	}
+	o := generatedOutcome(p.input(), plan, route, changelog)
 	outcome, err := marshalOutcome(o)
 	if err != nil {
 		return "", err
@@ -1040,6 +1236,9 @@ func (p *planner) freeze(candidate string, files []PlanCandidateFile, plan PlanF
 		return "", err
 	}
 	msg := fmt.Sprintf("aeh: plan %s for %s %s\n\nAcceptance tests and one task for %s, sealed by aeh.", st.ID, st.Feature, st.SpecVersion, strings.Join(ids, ", "))
+	if st.Kind == PlanCharacterize {
+		msg = fmt.Sprintf("aeh: characterize %s %s (%s)\n\nCharacterization tests of the existing behavior for %s, sealed by aeh.", st.Feature, st.SpecVersion, st.ID, strings.Join(ids, ", "))
+	}
 	frozen, err := git(root, "-c", "user.name=aeh", "-c", "user.email=aeh@localhost", "-c", "commit.gpgsign=false", "commit-tree", tree, "-p", st.Base, "-m", msg)
 	if err != nil {
 		return "", err
@@ -1114,6 +1313,7 @@ func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile
 		return false, ""
 	}
 	g := gateCommand(ctx, "build", wt, p.cfg.Commands.Build, p.timeout(), p.cfg.PassEnv)
+	g.Output = redactDiagnostic(g.Output) // before it becomes feedback, state or a question
 	checks = append(checks, PlanCheckEntry{Name: "build", Passed: g.Passed && !g.Uncertain})
 	if uncertain, damaged := settle(g); uncertain {
 		return checks, "build", g.Output, true, nil
@@ -1135,11 +1335,15 @@ func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile
 		}
 	}
 	sort.Strings(files)
+	if p.state.Kind == PlanCharacterize {
+		return p.green(ctx, wt, files, checks, settle)
+	}
 	for i, f := range files {
 		g, err := p.acceptanceCommand(ctx, fmt.Sprintf("red-%d", i+1), wt, []string{dir + f})
 		if err != nil {
 			return checks, "", "", false, err
 		}
+		g.Output = redactDiagnostic(g.Output)
 		checks = append(checks, PlanCheckEntry{Name: "red " + dir + f, Passed: !g.Passed && !g.Uncertain, Detail: tail(g.Output, 500)})
 		if uncertain, damaged := settle(g); uncertain {
 			return checks, "red", g.Output, true, nil
@@ -1162,6 +1366,7 @@ func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile
 		if err != nil {
 			return checks, "", "", false, err
 		}
+		g.Output = redactDiagnostic(g.Output)
 		checks = append(checks, PlanCheckEntry{Name: "previous acceptance suite still passes", Passed: g.Passed && !g.Uncertain})
 		if uncertain, damaged := settle(g); uncertain {
 			return checks, "previous", g.Output, true, nil
@@ -1175,13 +1380,65 @@ func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile
 	return checks, "", "", false, nil
 }
 
+// green is the characterization check: every new test file passes on its own on the existing
+// code, all of them pass together, and the previous acceptance suite still passes with them
+// added. A pass is evidence, not proof: the QA reviewer judges that each test really runs and
+// pins the confirmed behavior.
+func (p *planner) green(ctx context.Context, wt string, files []string, checks []PlanCheckEntry,
+	settle func(GateResult) (bool, string)) ([]PlanCheckEntry, string, string, bool, error) {
+	dir := p.testDir()
+	run := func(step, name string, manifest []string, what string) (string, string, bool, error) {
+		g, err := p.acceptanceCommand(ctx, name, wt, manifest)
+		if err != nil {
+			return "", "", false, err
+		}
+		// Output of the owner's commands on adopted code may carry secrets: it is redacted
+		// before it becomes feedback for the next author, state or a question on the terminal.
+		output := redactDiagnostic(g.Output)
+		checks = append(checks, PlanCheckEntry{Name: what, Passed: g.Passed && !g.Uncertain, Detail: tail(output, 500)})
+		if uncertain, damaged := settle(g); uncertain {
+			return step, output, true, nil
+		} else if damaged != "" {
+			return step, redactDiagnostic(damaged), false, nil
+		}
+		if !g.Passed {
+			return step, what + " fails on the existing code; a characterization test must pass without any change:\n" + output, false, nil
+		}
+		return "", "", false, nil
+	}
+	var all []string
+	for i, f := range files {
+		all = append(all, dir+f)
+		if step, msg, uncertain, err := run("green", fmt.Sprintf("green-%d", i+1), []string{dir + f}, "green "+dir+f); err != nil || step != "" {
+			return checks, step, msg, uncertain, err
+		}
+	}
+	if step, msg, uncertain, err := run("green", "green-all", all, "all new tests pass together"); err != nil || step != "" {
+		return checks, step, msg, uncertain, err
+	}
+	tests, missing, err := p.previousSuite()
+	if err != nil {
+		return checks, "", "", false, err
+	}
+	if len(missing) > 0 {
+		return checks, "previous", "sealed tests of unchanged criteria are missing: " + strings.Join(missing, ", "), false, nil
+	}
+	if len(tests) > 0 {
+		with := append(append([]string{}, tests...), all...)
+		if step, msg, uncertain, err := run("previous", "previous", with, "previous acceptance suite passes with the new tests"); err != nil || step != "" {
+			return checks, step, msg, uncertain, err
+		}
+	}
+	return checks, "", "", false, nil
+}
+
 // review asks one role's independent reviewer about the frozen plan commit. QA uses the plan
 // review prompt; security and DBA use their usual prompts on the same diff.
 func (p *planner) review(ctx context.Context, role, author, commit, wt, diff, planYAML, runDir string) (ReviewVerdict, GateResult, error) {
 	g := GateResult{Name: "review"}
 	name := "review-" + role + ".md"
 	if role == RoleQA {
-		name = "review-plan.md"
+		name = p.qaPrompt()
 	}
 	v := ReviewVerdict{Role: role, SHA: commit, Verdict: "INVALID", PromptSource: p.sources[name]}
 	profile, err := p.cfg.reviewerFor(role, author)
@@ -1251,6 +1508,9 @@ func (p *planner) publish() error {
 // implementation is recorded when aeh run accepts the outcome.
 func (p *planner) logMemory() error {
 	st := p.state
+	if st.Kind == PlanCharacterize {
+		return p.recordCharacterization()
+	}
 	marker := "AEH-Plan: " + st.ID + " " + st.PlanCommit
 	done := func() error {
 		st.Phase, st.Status = PlanLogged, PlanLogged
@@ -1284,6 +1544,41 @@ func (p *planner) logMemory() error {
 		return fmt.Errorf("log plan %s: %w", st.ID, w.restore(p.memDir, err))
 	}
 	return done()
+}
+
+// recordCharacterization records the published commit as the feature's first implementation:
+// code_sha is the commit that holds the sealed tests, observed_base_sha the inspected commit.
+// A later plan requires code_sha in its base, that is, merged by the owner. RecordChange is
+// idempotent by outcome and commit, so a crash after the memory commit only repeats it.
+func (p *planner) recordCharacterization() error {
+	st := p.state
+	planYAML, ok := gitBlob(p.repo.Root, st.PlanCommit, p.testDir()+"plan.yaml")
+	if !ok {
+		return fmt.Errorf("characterization %s: plan commit %s has no plan.yaml", st.ID, short(st.PlanCommit))
+	}
+	plan, err := parsePlanFile([]byte(planYAML))
+	if err != nil {
+		return fmt.Errorf("characterization %s: %w", st.ID, err)
+	}
+	im := &Implementation{Outcome: st.ID, Approval: st.SpecDigest, Code: st.PlanCommit, ObservedBase: st.ObservedBase}
+	for _, c := range st.Delta.New {
+		var tests []string
+		for _, f := range plan.Trace[fmt.Sprintf("AC-%d", c.ID)] {
+			tests = append(tests, p.testDir()+f)
+		}
+		if len(tests) == 0 {
+			return fmt.Errorf("characterization %s has no tests for AC-%d", st.ID, c.ID)
+		}
+		im.Criteria = append(im.Criteria, ImplementedCriterion{ID: c.ID, Text: c.Text, Tests: tests})
+	}
+	sort.Slice(im.Criteria, func(i, j int) bool { return im.Criteria[i].ID < im.Criteria[j].ID })
+	note := fmt.Sprintf("characterization tests of the existing behavior observed at %s; merge %s", short(st.ObservedBase), IntegrationBranch(st.ID))
+	rec := PendingRecord{OutcomeID: st.ID, Feature: st.Feature, Change: "minor", Note: note, Commit: st.PlanCommit, Implementation: im}
+	if _, _, err := RecordChange(p.repo, rec, ""); err != nil {
+		return fmt.Errorf("characterization %s: %w; run aeh adopt seal %s again to finish", st.ID, err, st.Feature)
+	}
+	st.Phase, st.Status = PlanLogged, PlanLogged
+	return savePlanState(p.repo, st)
 }
 
 // pendingLogEntry reports that memory's only change is this plan's uncommitted log entry.
@@ -1334,7 +1629,7 @@ func (p *planner) restart(question string) error {
 	if err := p.block(question); err != nil {
 		return err
 	}
-	return errors.New(question)
+	return errors.New(p.state.Question) // redacted by the save
 }
 
 // answerPlan records the owner's answer to a blocked plan so aeh plan can retry it.

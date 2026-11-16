@@ -291,6 +291,9 @@ type Implementation struct {
 	Code         string                 `yaml:"code_sha"`                // full SHA accepted on aeh/<outcome>
 	Criteria     []ImplementedCriterion `yaml:"criteria"`                // every criterion of that approval, sorted by ID
 	MaxCriterion int                    `yaml:"max_criterion"`           // highest criterion ID ever approved, retired ones included
+	// ObservedBase, for a characterization, is the commit an adoption agent inspected. Code is
+	// still the published commit that holds the sealed tests.
+	ObservedBase string `yaml:"observed_base_sha,omitempty" json:",omitempty"`
 }
 
 // ImplementedCriterion is one criterion as implemented, with the sealed tests that check it.
@@ -350,6 +353,9 @@ func (im Implementation) validate() error {
 	}
 	if !isFullSHA(im.Code) {
 		return fmt.Errorf("code_sha %q is not a full commit SHA", im.Code)
+	}
+	if im.ObservedBase != "" && !isFullSHA(im.ObservedBase) {
+		return fmt.Errorf("observed_base_sha %q is not a full commit SHA", im.ObservedBase)
 	}
 	if len(im.Criteria) == 0 {
 		return errors.New("no criteria")
