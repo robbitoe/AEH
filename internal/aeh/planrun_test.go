@@ -355,6 +355,7 @@ func TestPlanRefusesChangedCriteria(t *testing.T) {
 	}
 	// With the change undone and a new criterion added, the delta is only the new one.
 	editSpec(t, f.repo, "pay", "then src/pay.txt says PAID.\n", "then src/pay.txt says paid.\n- AC-2: Given a paid cart, when paid again, then nothing changes.\n")
+	raiseVersion(t, f.repo, "pay")
 	if _, _, err := ApproveSpec(f.repo, "pay"); err != nil {
 		t.Fatal(err)
 	}
