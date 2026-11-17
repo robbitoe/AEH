@@ -67,6 +67,9 @@ type Spec struct {
 	Approval *SpecApproval
 	// Implemented lists the accepted implementations of approved contents, oldest first.
 	Implemented []Implementation
+	// rev is the memory commit the spec was read from, or "" for the working tree. Criteria
+	// identity replays history up to it, so a pinned spec is judged as it was then.
+	rev string
 }
 
 // Criteria parses the spec's acceptance criteria; see parseCriteria.
@@ -81,6 +84,34 @@ type SpecApproval struct {
 	// ever approved for the feature, so a removed criterion's number stays retired.
 	Criteria     []int `yaml:"criteria,omitempty,flow"`
 	MaxCriterion int   `yaml:"max_criterion,omitempty"`
+	// DeltaBase is what the approval's criteria delta was computed against: the approval
+	// digest of the feature's last implementation then, or "none". Empty in approvals written
+	// before stage 5, which are not checked.
+	DeltaBase string `yaml:"delta_base,omitempty"`
+}
+
+// noImplementation is the DeltaBase of an approval given before any implementation.
+const noImplementation = "none"
+
+// deltaBase is what a new approval's delta is computed against: the last implementation's
+// approval digest, or noImplementation.
+func (s Spec) deltaBase() string {
+	if im, ok := s.LastImplementation(); ok {
+		return im.Approval
+	}
+	return noImplementation
+}
+
+// staleApproval reports that the spec's approval was computed against an implementation that
+// is no longer the last one, and that the last one is not of this approval: a version in
+// between was implemented (or abandoned), so the approved delta is not the real one.
+func (s Spec) staleApproval() bool {
+	a := s.Approval
+	if a == nil || a.DeltaBase == "" || a.DeltaBase == s.deltaBase() {
+		return false
+	}
+	im, _ := s.LastImplementation()
+	return im.SpecVersion != a.Version
 }
 
 // Approved reports whether the owner approved the spec as it reads now: the digest of its
@@ -157,8 +188,10 @@ func (f *codeFence) step(line string) bool {
 // MemorySnapshot is what a run reads from memory. Fingerprint covers everything the drift
 // gate uses, so a run can detect that memory changed under it.
 type MemorySnapshot struct {
-	Present     bool
-	Dir         string
+	Present bool
+	Dir     string
+	// Commit is the memory commit a pinned snapshot was read from; "" for the working tree.
+	Commit      string
 	Specs       []Spec
 	Fingerprint string
 }
@@ -210,6 +243,9 @@ type PendingRecord struct {
 	// Implementation, for an outcome generated from an approved spec, is written in the same
 	// memory commit. RecordChange sets its MaxCriterion.
 	Implementation *Implementation `json:",omitempty"`
+	// MemoryBase is the memory commit the plan was pinned to: the implementation is checked
+	// against the spec as it read there, even when a newer version was approved since.
+	MemoryBase string `json:",omitempty"`
 }
 
 // MemoryDir is the memory of the project's main checkout, also from linked worktrees.
@@ -565,6 +601,10 @@ func readApproval(p string) (*SpecApproval, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseApproval(b)
+}
+
+func parseApproval(b []byte) (*SpecApproval, error) {
 	var a SpecApproval
 	dec := yaml.NewDecoder(bytes.NewReader(b))
 	dec.KnownFields(true)
@@ -588,7 +628,90 @@ func readApproval(p string) (*SpecApproval, error) {
 	if a.MaxCriterion < 0 {
 		return nil, fmt.Errorf("%s: max_criterion must not be negative", approvalFile)
 	}
+	if a.DeltaBase != "" && a.DeltaBase != noImplementation && !isSHA256Hex(a.DeltaBase) {
+		return nil, fmt.Errorf("%s: delta_base must be %q or a sha256 in hex", approvalFile, noImplementation)
+	}
 	return &a, nil
+}
+
+// ownerApprovals returns the versions and contents the owner approved for a feature, oldest
+// first: every memory commit whose approval.yaml matches the spec next to it at the same
+// version. Records carry an approval forward to a bumped spec version, so they never count.
+func ownerApprovals(dir, feature string) ([]SpecApproval, error) {
+	aRel, sRel := approvalRel(feature), specRel(feature)
+	// --full-history: path simplification would skip a side branch whose files a merge did
+	// not keep, hiding an approval that is still in HEAD's history.
+	log, err := git(dir, "log", "--full-history", "--reverse", "--format=%H", "--", aRel, sRel)
+	if err != nil {
+		return nil, fmt.Errorf("approval history of %s: %w", feature, err)
+	}
+	var out []SpecApproval
+	for _, sha := range strings.Fields(log) {
+		b, ok := gitBlob(dir, sha, aRel)
+		if !ok {
+			continue
+		}
+		a, err := parseApproval([]byte(b))
+		if err != nil || a == nil {
+			continue
+		}
+		text, ok := gitBlob(dir, sha, sRel)
+		if !ok {
+			continue
+		}
+		sp, err := parseSpec(text)
+		if err != nil || sp.Version != a.Version || approvalDigest(sp.Title, sp.Paths, sp.Body) != a.Content {
+			continue
+		}
+		out = append(out, *a)
+	}
+	return out, nil
+}
+
+// checkApprovalVersion refuses to approve a content under a version the owner already
+// approved with other content, or under a version below one already approved: an approved
+// version is immutable, so a changed spec must raise its version.
+func checkApprovalVersion(dir string, spec Spec, content string) error {
+	history, err := ownerApprovals(dir, spec.Feature)
+	if err != nil {
+		return err
+	}
+	v, err := parseSemver(spec.Version)
+	if err != nil {
+		return err
+	}
+	var high [3]int
+	highText, same := "", false
+	for _, a := range history {
+		n, err := parseSemver(a.Version)
+		if err != nil {
+			continue
+		}
+		if highText == "" || semverLess(high, n) {
+			high, highText, same = n, a.Version, false
+		}
+		if a.Version == highText && a.Content == content {
+			same = true
+		}
+	}
+	switch {
+	case highText == "" || semverLess(high, v):
+		return nil
+	case spec.Version == highText && same:
+		return nil // the newest approved version and content again: only the delta base changes
+	}
+	next, _ := bumpVersion(highText, "patch")
+	return fmt.Errorf("version %s of %s was already approved with other content (highest approved: %s); an approved version never changes. Set version: %s or higher in the spec's front matter, commit it, and approve again",
+		spec.Version, spec.Feature, highText, next)
+}
+
+func semverLess(a, b [3]int) bool {
+	for i := range a {
+		if a[i] != b[i] {
+			return a[i] < b[i]
+		}
+	}
+	return false
 }
 
 // ApproveSpec records the owner's approval of a feature's spec as it reads now, in one memory
@@ -619,14 +742,24 @@ func ApproveSpec(r Repo, feature string) (Spec, bool, error) {
 	if err != nil {
 		return Spec{}, false, fmt.Errorf("approve %s: acceptance criteria: %w", feature, err)
 	}
-	if spec.Approved() {
+	// The approval digest leaves the version out (records bump it), so the version rule is
+	// checked even for a spec that reads as approved: lowering only the version, or restoring
+	// an old approved pair, must not pass for the newest approval.
+	content := approvalDigest(spec.Title, spec.Paths, spec.Body)
+	if err := checkApprovalVersion(snap.Dir, spec, content); err != nil {
+		return Spec{}, false, fmt.Errorf("approve %s: %w", feature, err)
+	}
+	// A spec whose version moved past its approval (the owner raised only the version, or a
+	// record bumped it) is approved again under its own version, so that version enters
+	// history and its content cannot change later.
+	if spec.Approved() && spec.Approval.Version == spec.Version && !spec.staleApproval() {
 		return spec, false, nil
 	}
 	if strings.Contains(spec.Body, specPlaceholder) {
 		return Spec{}, false, fmt.Errorf("approve %s: the spec still has the placeholder text; describe the feature first", feature)
 	}
 	today := memoryNow().UTC().Format("2006-01-02")
-	a := SpecApproval{Version: spec.Version, Content: approvalDigest(spec.Title, spec.Paths, spec.Body), Date: today, MaxCriterion: ident.High}
+	a := SpecApproval{Version: spec.Version, Content: content, Date: today, MaxCriterion: ident.High, DeltaBase: spec.deltaBase()}
 	for _, c := range crit {
 		a.Criteria = append(a.Criteria, c.ID)
 		if c.ID > a.MaxCriterion {
@@ -696,9 +829,24 @@ func RecordChange(r Repo, p PendingRecord, expectedFingerprint string) (version,
 	if !ok {
 		return "", "", fmt.Errorf("record %s: feature %q does not exist in memory", p.OutcomeID, p.Feature)
 	}
-	version, err = bumpVersion(spec.Version, p.Change)
+	// The record raises the version past the one that was planned. A pinned plan's spec may
+	// have moved on since (the owner raised the version to approve a newer one): then the
+	// spec keeps its higher version.
+	from := spec.Version
+	var pinned *Spec
+	if p.MemoryBase != "" {
+		ps, err := pinnedSpec(dir, p.MemoryBase, p.Feature)
+		if err != nil {
+			return "", "", fmt.Errorf("record %s: %w", p.OutcomeID, err)
+		}
+		pinned, from = &ps, ps.Version
+	}
+	version, err = bumpVersion(from, p.Change)
 	if err != nil {
 		return "", "", fmt.Errorf("record %s: %w", p.OutcomeID, err)
+	}
+	if cur, _ := parseSemver(spec.Version); semverLess(mustSemver(version), cur) {
+		version = spec.Version
 	}
 	rel := specRel(p.Feature)
 	full := filepath.Join(dir, filepath.FromSlash(rel))
@@ -729,7 +877,7 @@ func RecordChange(r Repo, p PendingRecord, expectedFingerprint string) (version,
 	}
 	var implemented []byte
 	if p.Implementation != nil {
-		if implemented, err = implementationRecord(dir, spec, p); err != nil {
+		if implemented, err = implementationRecord(dir, spec, pinned, p); err != nil {
 			return "", "", fmt.Errorf("record %s: %w", p.OutcomeID, err)
 		}
 	}
@@ -762,22 +910,44 @@ func RecordChange(r Repo, p PendingRecord, expectedFingerprint string) (version,
 }
 
 // implementationRecord checks an implementation against the spec it claims to implement and
-// returns the feature's implementation file with it appended. The spec must still read as the
-// owner approved it and planned it, and the criteria must be exactly the spec's.
-func implementationRecord(dir string, spec Spec, p PendingRecord) ([]byte, error) {
+// returns the feature's implementation file with it appended. That spec is the pinned one
+// when the plan was pinned (it must read as the owner approved and planned it there), and
+// otherwise the current one; the criteria must be exactly that spec's.
+func implementationRecord(dir string, spec Spec, pinned *Spec, p PendingRecord) ([]byte, error) {
 	im := *p.Implementation
 	if im.Outcome != p.OutcomeID || im.Code != p.Commit {
 		return nil, errors.New("implementation does not match the recorded outcome and commit")
 	}
-	if !spec.Approved() || spec.Approval.Content != im.Approval {
+	planned := spec
+	if pinned != nil {
+		planned = *pinned
+	}
+	if !planned.Approved() || planned.Approval.Content != im.Approval {
 		return nil, fmt.Errorf("feature %s no longer reads as the approved spec that was planned", spec.Feature)
 	}
-	crit, ident, err := checkSpecCriteria(dir, spec)
+	if im.SpecVersion != "" && im.SpecVersion != planned.Version {
+		return nil, fmt.Errorf("implementation of %s %s does not match the planned version %s", spec.Feature, im.SpecVersion, planned.Version)
+	}
+	crit, ident, err := checkSpecCriteria(dir, planned)
 	if err != nil {
 		return nil, fmt.Errorf("feature %s: acceptance criteria: %w", spec.Feature, err)
 	}
 	if len(crit) == 0 {
 		return nil, fmt.Errorf("feature %s has no acceptance criteria to implement", spec.Feature)
+	}
+	if pinned != nil {
+		// One plan, one predecessor: an implementation recorded after the plan was reserved
+		// (a newer version's run finished first) supersedes this one.
+		if lastCode(spec) != lastCode(*pinned) {
+			return nil, fmt.Errorf("feature %s: another implementation was recorded after this plan was reserved; the plan is superseded", spec.Feature)
+		}
+		// Numbers approved since the pin stay retired or reserved: the high-water mark is the
+		// higher of both histories.
+		now, err := loadCriteriaIdentity(dir, spec)
+		if err != nil {
+			return nil, fmt.Errorf("feature %s: acceptance criteria: %w", spec.Feature, err)
+		}
+		ident.High = max(ident.High, now.High)
 	}
 	sort.Slice(crit, func(i, j int) bool { return crit[i].ID < crit[j].ID })
 	if len(crit) != len(im.Criteria) {
@@ -1152,6 +1322,18 @@ func parseSemver(v string) ([3]int, error) {
 		n[i] = x
 	}
 	return n, nil
+}
+
+// lastCode is the commit of the feature's last implementation, or "".
+func lastCode(s Spec) string {
+	im, _ := s.LastImplementation()
+	return im.Code
+}
+
+// mustSemver parses a version aeh itself produced.
+func mustSemver(v string) [3]int {
+	n, _ := parseSemver(v)
+	return n
 }
 
 func bumpVersion(v, change string) (string, error) {

@@ -291,6 +291,9 @@ type Implementation struct {
 	Code         string                 `yaml:"code_sha"`                // full SHA accepted on aeh/<outcome>
 	Criteria     []ImplementedCriterion `yaml:"criteria"`                // every criterion of that approval, sorted by ID
 	MaxCriterion int                    `yaml:"max_criterion"`           // highest criterion ID ever approved, retired ones included
+	// SpecVersion is the approved version that was planned. Empty in records written before
+	// stage 5.
+	SpecVersion string `yaml:"spec_version,omitempty" json:",omitempty"`
 	// ObservedBase, for a characterization, is the commit an adoption agent inspected. Code is
 	// still the published commit that holds the sealed tests.
 	ObservedBase string `yaml:"observed_base_sha,omitempty" json:",omitempty"`
@@ -319,6 +322,10 @@ func readImplementations(p string) ([]Implementation, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseImplementations(b)
+}
+
+func parseImplementations(b []byte) ([]Implementation, error) {
 	if _, err := checkConfigYAML(b); err != nil {
 		return nil, fmt.Errorf("%s: %w", implementedFile, err)
 	}
@@ -353,6 +360,11 @@ func (im Implementation) validate() error {
 	}
 	if !isFullSHA(im.Code) {
 		return fmt.Errorf("code_sha %q is not a full commit SHA", im.Code)
+	}
+	if im.SpecVersion != "" {
+		if _, err := parseSemver(im.SpecVersion); err != nil {
+			return fmt.Errorf("spec_version: %w", err)
+		}
 	}
 	if im.ObservedBase != "" && !isFullSHA(im.ObservedBase) {
 		return fmt.Errorf("observed_base_sha %q is not a full commit SHA", im.ObservedBase)
@@ -453,7 +465,11 @@ func loadCriteriaIdentity(dir string, s Spec) (criteriaIdentity, error) {
 	aRel, iRel, sRel := approvalRel(s.Feature), implementedRel(s.Feature), specRel(s.Feature)
 	// Spec-only commits matter too: restoring an old spec next to an old approval in separate
 	// commits makes a genuine pair only at the second one.
-	log, err := git(dir, "log", "--reverse", "--format=%H", "--", aRel, iRel, sRel)
+	args := []string{"log", "--reverse", "--format=%H"}
+	if s.rev != "" {
+		args = append(args, s.rev) // a pinned spec: its history up to the pin
+	}
+	log, err := git(dir, append(args, "--", aRel, iRel, sRel)...)
 	if err != nil {
 		return id, fmt.Errorf("criteria history of %s: %w", s.Feature, err)
 	}

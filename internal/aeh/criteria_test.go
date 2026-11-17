@@ -202,6 +202,7 @@ func TestApproveRecordsCriteriaAndRetiresNumbers(t *testing.T) {
 	}
 	// Remove AC-2 and approve: 2 is retired.
 	editSpec(t, r, "checkout", "- AC-2: Given a failed payment, when retried, then no second charge.\n", "")
+	raiseVersion(t, r, "checkout")
 	if _, _, err := ApproveSpec(r, "checkout"); err != nil {
 		t.Fatal(err)
 	}
@@ -240,6 +241,7 @@ func TestApproveRecordsCriteriaAndRetiresNumbers(t *testing.T) {
 	}
 	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "restore approval")
 	editSpec(t, r, "checkout", "- AC-2: Reused.", "- AC-3: New.")
+	raiseVersion(t, r, "checkout")
 	if _, _, err := ApproveSpec(r, "checkout"); err != nil {
 		t.Fatal(err)
 	}
@@ -366,6 +368,7 @@ func TestImplementationDoesNotReviveRetiredIDs(t *testing.T) {
 	}
 	recordImplementation(t, r, spec, "checkout-v0_1_0", fakeSHA('a'))
 	editSpec(t, r, "checkout", "- AC-2: Given a failed payment, when retried, then no second charge.\n", "")
+	raiseVersion(t, r, "checkout")
 	if _, _, err := ApproveSpec(r, "checkout"); err != nil {
 		t.Fatal(err)
 	}
@@ -418,6 +421,7 @@ func TestSeparateRestoreCommitsRetireNumbers(t *testing.T) {
 	ap := filepath.Join(dir, "wiki", "features", "checkout", approvalFile)
 	specA, approvalA := readFile(t, sp), readFile(t, ap)
 	editSpec(t, r, "checkout", "- AC-1: Require login.\n", "- AC-1: Require login.\n- AC-2: Require administrators.\n")
+	raiseVersion(t, r, "checkout")
 	if _, _, err := ApproveSpec(r, "checkout"); err != nil {
 		t.Fatal(err)
 	}
@@ -427,8 +431,9 @@ func TestSeparateRestoreCommitsRetireNumbers(t *testing.T) {
 		}
 		mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "restore "+filepath.Base(step.path))
 	}
-	if _, _, err := ApproveSpec(r, "checkout"); err != nil {
-		t.Fatal(err)
+	// The restored pair reads as approved but is not the newest approval (0.1.1).
+	if _, _, err := ApproveSpec(r, "checkout"); err == nil || !strings.Contains(err.Error(), "highest approved: 0.1.1") {
+		t.Fatalf("a restored old pair passed as the newest approval: %v", err)
 	}
 	editSpec(t, r, "checkout", "- AC-1: Require login.\n", "- AC-1: Require login.\n- AC-2: Back again.\n")
 	if _, _, err := ApproveSpec(r, "checkout"); err == nil || !strings.Contains(err.Error(), "retired") {
@@ -458,6 +463,7 @@ func TestRestoredApprovalKeepsNumbersRetired(t *testing.T) {
 	ap := filepath.Join(dir, "wiki", "features", "checkout", approvalFile)
 	oldSpec, oldApproval := readFile(t, sp), readFile(t, ap)
 	editSpec(t, r, "checkout", "- AC-2: Given a failed payment, when retried, then no second charge.\n", "")
+	raiseVersion(t, r, "checkout")
 	if _, _, err := ApproveSpec(r, "checkout"); err != nil {
 		t.Fatal(err)
 	}

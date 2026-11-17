@@ -48,7 +48,9 @@ func TestCommandReferenceIsComplete(t *testing.T) {
 		t.Fatal(err)
 	}
 	documented := map[string]bool{}
-	for _, m := range regexp.MustCompile("(?m)^### `(aeh[^`]*)`$").FindAllStringSubmatch(string(b), -1) {
+	// A checkout with core.autocrlf has CRLF line ends; $ must still match at each heading.
+	text := strings.ReplaceAll(string(b), "\r\n", "\n")
+	for _, m := range regexp.MustCompile("(?m)^### `(aeh[^`]*)`$").FindAllStringSubmatch(text, -1) {
 		documented[m[1]] = true
 	}
 	listed := map[string]bool{}

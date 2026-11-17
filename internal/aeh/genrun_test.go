@@ -137,18 +137,6 @@ func TestGeneratedRunPreflightConflicts(t *testing.T) {
 	}
 }
 
-func TestGeneratedRunStaleSpecRequiresRestart(t *testing.T) {
-	f, _ := generatedFixture(t, implementPay)
-	editSpec(t, f.repo, "pay", "Pays the cart.", "Updated payment behavior.")
-	if _, _, err := ApproveSpec(f.repo, "pay"); err != nil {
-		t.Fatal(err)
-	}
-	st := generatedRunState(t, f, planID)
-	if st.Status != StatusBlocked || !st.RestartRequired || st.Question != "spec changed since plan; approve it and run aeh plan again" || f.count("impl") != 0 {
-		t.Fatalf("stale spec accepted: %+v", st)
-	}
-}
-
 func TestGeneratedRunPendingImplementationRetry(t *testing.T) {
 	f, p := generatedFixture(t, implementPay)
 	dir := memDir(t, f.repo)

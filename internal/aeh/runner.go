@@ -166,6 +166,19 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer, gen 
 	ru := &runner{repo: r, cfg: cfg, outcome: o, protected: protectedPaths(cfg, o), state: &st, log: log, memory: memory, generated: gen}
 	if gen != nil {
 		ru.seal = &gen.Seal
+		if pin := gen.Plan.MemoryCommit; pin != "" {
+			// The run reads memory as its plan pinned it: contract, prompt, drift gate and
+			// the implementation record all see the planned version, whatever came after.
+			pinned, err := loadMemoryAt(memory.Dir, pin)
+			if err != nil {
+				return st, fmt.Errorf("run %s: %w", o.ID, err)
+			}
+			spec, ok := pinned.Spec(gen.Plan.Feature)
+			if !ok || spec.Version != gen.Plan.SpecVersion || (gen.Plan.Owners != "" && pinned.ContractFingerprint(gen.Plan.Feature) != gen.Plan.Owners) {
+				return st, fmt.Errorf("run %s: pinned memory commit %s does not hold %s %s as planned", o.ID, short(pin), gen.Plan.Feature, gen.Plan.SpecVersion)
+			}
+			memory, ru.memory = pinned, pinned
+		}
 		spec, exists := memory.Spec(gen.Plan.Feature)
 		if !exists || !spec.Approved() || spec.Approval.Content != gen.Plan.SpecDigest {
 			st.RestartRequired = true
@@ -305,7 +318,26 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer, gen 
 	var pendingErr error
 	if o.Feature != "" {
 		current, err := LoadMemory(r)
-		if gen != nil && err == nil {
+		pin := ""
+		if gen != nil {
+			pin = gen.Plan.MemoryCommit
+		}
+		switch {
+		case err != nil:
+		case pin != "":
+			// A pinned run ignores later memory changes; its pin must still be in history, and
+			// no other implementation may have been recorded since its plan was reserved.
+			if now, ok := current.Spec(o.Feature); ok && lastCode(now) != gen.Plan.PriorCode {
+				st.RestartRequired = true
+				err := ru.block(fmt.Sprintf("Another implementation of %s was recorded after plan %s was reserved; this plan is superseded. Plan the feature again: aeh plan %s", o.Feature, o.ID, o.Feature))
+				return st, err
+			}
+			if _, perr := loadMemoryAt(current.Dir, pin); perr != nil {
+				err = perr
+			} else {
+				current = memory
+			}
+		case gen != nil:
 			spec, exists := current.Spec(o.Feature)
 			if !exists || !spec.Approved() || spec.Approval.Content != gen.Plan.SpecDigest {
 				st.RestartRequired = true
@@ -321,7 +353,7 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer, gen 
 			err := ru.block(fmt.Sprintf("Cannot accept: %s. Inspect product memory and use a new outcome ID if its contract changed. What should change before retrying?", reason))
 			return st, err
 		}
-		pending = PendingRecord{OutcomeID: o.ID, Feature: o.Feature, Change: o.Change, Note: o.Changelog, Commit: st.Head}
+		pending = PendingRecord{OutcomeID: o.ID, Feature: o.Feature, Change: o.Change, Note: o.Changelog, Commit: st.Head, MemoryBase: pin}
 		if gen != nil {
 			pending.Implementation, err = ru.implementation()
 			if err != nil {
@@ -1199,7 +1231,11 @@ func (ru *runner) recordMemory(p PendingRecord, pendingErr error) {
 	if err != nil {
 		err = fmt.Errorf("save pending record: %w", err)
 	} else {
-		ru.state.MemoryVersion, ru.state.MemoryCommit, err = RecordChange(ru.repo, p, ru.memory.Fingerprint)
+		expected := ru.memory.Fingerprint
+		if p.MemoryBase != "" {
+			expected = "" // pinned: the record checks the implementation against the pin instead
+		}
+		ru.state.MemoryVersion, ru.state.MemoryCommit, err = RecordChange(ru.repo, p, expected)
 		if err == nil {
 			if clearErr := ClearPending(ru.repo, p.OutcomeID); clearErr != nil {
 				err = fmt.Errorf("clear pending record: %w", clearErr)
@@ -1427,7 +1463,7 @@ func (ru *runner) implementation() (*Implementation, error) {
 	for _, c := range g.Plan.Delta.Unchanged {
 		unchanged[c.ID] = c
 	}
-	im := &Implementation{Outcome: ru.outcome.ID, Approval: g.Plan.SpecDigest, Code: ru.state.Head}
+	im := &Implementation{Outcome: ru.outcome.ID, Approval: g.Plan.SpecDigest, SpecVersion: g.Plan.SpecVersion, Code: ru.state.Head}
 	for _, c := range crit {
 		tests := append([]string(nil), unchanged[c.ID].Tests...)
 		if len(tests) == 0 {

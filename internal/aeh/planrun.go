@@ -32,16 +32,22 @@ const (
 // PlanState is the local record of planning one generated outcome. It lives in the main
 // checkout's .aeh/state/<ID>.plan.json, next to the run state of the same outcome.
 type PlanState struct {
-	Version         int              `json:"version"`
-	ID              string           `json:"id"`
-	Kind            string           `json:"kind,omitempty"` // "" or PlanCharacterize
-	Feature         string           `json:"feature"`
-	ObservedBase    string           `json:"observed_base_sha,omitempty"` // characterization: the inspected commit
-	Phase           string           `json:"phase"`
-	Status          string           `json:"status"` // running, blocked or the phase's end state
-	Base            string           `json:"base"`
-	SpecVersion     string           `json:"spec_version"`
-	SpecDigest      string           `json:"spec_content_sha256"`
+	Version      int    `json:"version"`
+	ID           string `json:"id"`
+	Kind         string `json:"kind,omitempty"` // "" or PlanCharacterize
+	Feature      string `json:"feature"`
+	ObservedBase string `json:"observed_base_sha,omitempty"` // characterization: the inspected commit
+	Phase        string `json:"phase"`
+	Status       string `json:"status"` // running, blocked or the phase's end state
+	Base         string `json:"base"`
+	SpecVersion  string `json:"spec_version"`
+	SpecDigest   string `json:"spec_content_sha256"`
+	// MemoryCommit is the memory commit the plan was reserved at. The plan and its run read
+	// memory as it was there. Empty in plans reserved before stage 5, which read it as it is.
+	MemoryCommit string `json:"memory_commit,omitempty"`
+	// Owners is the contract fingerprint of the pinned memory (which code every feature owns
+	// and the feature's spec); the run checks its pinned snapshot against it.
+	Owners          string           `json:"owners_sha256,omitempty"`
 	PriorCode       string           `json:"prior_code_sha,omitempty"`
 	Delta           CriteriaDelta    `json:"delta"`
 	Route           string           `json:"route"`
@@ -250,9 +256,6 @@ func planFeature(ctx context.Context, r Repo, feature, kind string, log io.Write
 	if !ok {
 		return PlanState{}, fmt.Errorf("feature %q does not exist in memory", feature)
 	}
-	if !spec.Approved() {
-		return PlanState{}, fmt.Errorf("feature %s is not approved as it reads now; approve it first: aeh memory approve %s", feature, feature)
-	}
 	if kind == PlanCharacterize {
 		// Recording a characterization bumps the spec's version, which names the next plan: a
 		// published one is found by feature, never by the version it moved past.
@@ -264,23 +267,43 @@ func planFeature(ctx context.Context, r Repo, feature, kind string, log io.Write
 	if err != nil {
 		return PlanState{}, err
 	}
-	observed, err := characterizationBase(memory.Dir, spec, kind)
-	if err != nil {
+	// An unfinished plan reads its pinned memory, so it resumes even after the owner raised
+	// the spec's version to approve newer content: aeh plan continues it first.
+	if open, err := unfinishedPlan(r, feature); err != nil {
 		return PlanState{}, err
+	} else if open != "" {
+		id = open
 	}
 	unlock, err := lockOutcome(r, id)
 	if err != nil {
 		return PlanState{}, err
 	}
 	defer unlock()
-
-	p := &planner{repo: r, cfg: cfg, pcfg: cfg.plan(), spec: spec, memDir: memory.Dir, log: log, owners: memory.ContractFingerprint(feature), kind: kind}
-	if err := p.loadPrompts(); err != nil {
-		return PlanState{}, err
-	}
 	st, exists, err := LoadPlanState(r, id)
 	if err != nil {
 		return st, err
+	}
+	var observed string
+	if !exists {
+		// Only a new reservation needs the spec approved as it reads now. A reserved plan
+		// reads its pinned memory, so later edits never reach it.
+		if !spec.Approved() {
+			return PlanState{}, fmt.Errorf("feature %s is not approved as it reads now; approve it first: aeh memory approve %s", feature, feature)
+		}
+		if err := checkApprovalVersion(memory.Dir, spec, spec.Approval.Content); err != nil {
+			return PlanState{}, fmt.Errorf("plan %s: %w", feature, err)
+		}
+		if spec.staleApproval() {
+			return PlanState{}, fmt.Errorf("the approval of %s %s was computed against an implementation that is no longer the last one; approve it again so its delta is the real one: aeh memory approve %s",
+				feature, spec.Version, feature)
+		}
+		if spec.Approval.Version != spec.Version {
+			return PlanState{}, fmt.Errorf("feature %s is at version %s but its approval is of %s; approve this version first: aeh memory approve %s",
+				feature, spec.Version, spec.Approval.Version, feature)
+		}
+		if observed, err = characterizationBase(memory.Dir, spec, kind); err != nil {
+			return PlanState{}, err
+		}
 	}
 	if exists && st.Kind != kind {
 		if st.Kind == PlanCharacterize {
@@ -295,8 +318,38 @@ func planFeature(ctx context.Context, r Repo, feature, kind string, log io.Write
 			return st, fmt.Errorf("plan %s: %w; commit your memory edits first", feature, err)
 		}
 	}
+	// The plan's view of memory: pinned at reservation (memory is clean, so its HEAD is what
+	// was just read), read back from the pin on every resume.
+	view := memory
+	switch {
+	case !exists:
+		head, err := memoryHeadCommit(memory.Dir)
+		if err != nil {
+			return st, err
+		}
+		if view, err = loadMemoryAt(memory.Dir, head); err != nil {
+			return st, err
+		}
+	case st.MemoryCommit != "":
+		if view, err = loadMemoryAt(memory.Dir, st.MemoryCommit); err != nil {
+			return st, fmt.Errorf("plan %s: %w", id, err)
+		}
+	}
+	if spec, ok = view.Spec(feature); !ok {
+		return st, fmt.Errorf("feature %q does not exist in memory", feature)
+	}
+	if exists && st.MemoryCommit != "" && spec.Version != st.SpecVersion {
+		return st, fmt.Errorf("plan %s: pinned memory commit %s does not hold %s %s as planned", id, short(st.MemoryCommit), feature, st.SpecVersion)
+	}
+	if !spec.Approved() {
+		return st, fmt.Errorf("feature %s is not approved as it reads now; approve it first: aeh memory approve %s", feature, feature)
+	}
+	p := &planner{repo: r, cfg: cfg, pcfg: cfg.plan(), spec: spec, memDir: memory.Dir, log: log, owners: view.ContractFingerprint(feature), kind: kind}
+	if err := p.loadPrompts(); err != nil {
+		return st, err
+	}
 	if !exists {
-		st, err = p.reserve(id, observed)
+		st, err = p.reserve(id, observed, view.Commit)
 		if err != nil {
 			return st, err
 		}
@@ -370,6 +423,29 @@ func planFeature(ctx context.Context, r Repo, feature, kind string, log io.Write
 	}
 	p.logf("%s planned on %s at %s. Build it with: aeh run %s", id, IntegrationBranch(id), short(st.PlanCommit), id)
 	return st, nil
+}
+
+// unfinishedPlan returns the ID of the feature's oldest plan that is neither logged nor
+// waiting for a restart, or "". Its pin keeps it on the version it was reserved for.
+func unfinishedPlan(r Repo, feature string) (string, error) {
+	plans, err := ListPlanStates(r)
+	if err != nil {
+		return "", err
+	}
+	var open *PlanState
+	for i := range plans {
+		p := &plans[i]
+		if p.Feature != feature || p.Phase == PlanLogged || p.RestartRequired {
+			continue
+		}
+		if open == nil || p.UpdatedAt.Before(open.UpdatedAt) {
+			open = p
+		}
+	}
+	if open == nil {
+		return "", nil
+	}
+	return open.ID, nil
 }
 
 // rulesForArea returns every rule that may touch a file of the area: a rule pattern compatible
@@ -477,9 +553,9 @@ func (p *planner) loadPrompts() error {
 
 // reserve pins the plan's inputs under a new outcome ID after checking that nothing else
 // already uses that ID and that the last implementation is integrated in the base.
-func (p *planner) reserve(id, observed string) (PlanState, error) {
+func (p *planner) reserve(id, observed, memoryCommit string) (PlanState, error) {
 	st := PlanState{Version: planStateVersion, ID: id, Kind: p.kind, Feature: p.spec.Feature, Phase: PlanReserved, Status: StatusRunning,
-		SpecVersion: p.spec.Version, SpecDigest: p.spec.Approval.Content, ObservedBase: observed}
+		SpecVersion: p.spec.Version, SpecDigest: p.spec.Approval.Content, MemoryCommit: memoryCommit, Owners: p.owners, ObservedBase: observed}
 	if err := p.checkCollisions(id); err != nil {
 		return st, err
 	}
@@ -1560,7 +1636,7 @@ func (p *planner) recordCharacterization() error {
 	if err != nil {
 		return fmt.Errorf("characterization %s: %w", st.ID, err)
 	}
-	im := &Implementation{Outcome: st.ID, Approval: st.SpecDigest, Code: st.PlanCommit, ObservedBase: st.ObservedBase}
+	im := &Implementation{Outcome: st.ID, Approval: st.SpecDigest, SpecVersion: st.SpecVersion, Code: st.PlanCommit, ObservedBase: st.ObservedBase}
 	for _, c := range st.Delta.New {
 		var tests []string
 		for _, f := range plan.Trace[fmt.Sprintf("AC-%d", c.ID)] {
@@ -1573,7 +1649,7 @@ func (p *planner) recordCharacterization() error {
 	}
 	sort.Slice(im.Criteria, func(i, j int) bool { return im.Criteria[i].ID < im.Criteria[j].ID })
 	note := fmt.Sprintf("characterization tests of the existing behavior observed at %s; merge %s", short(st.ObservedBase), IntegrationBranch(st.ID))
-	rec := PendingRecord{OutcomeID: st.ID, Feature: st.Feature, Change: "minor", Note: note, Commit: st.PlanCommit, Implementation: im}
+	rec := PendingRecord{OutcomeID: st.ID, Feature: st.Feature, Change: "minor", Note: note, Commit: st.PlanCommit, Implementation: im, MemoryBase: st.MemoryCommit}
 	if _, _, err := RecordChange(p.repo, rec, ""); err != nil {
 		return fmt.Errorf("characterization %s: %w; run aeh adopt seal %s again to finish", st.ID, err, st.Feature)
 	}

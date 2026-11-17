@@ -114,6 +114,8 @@ Lists the inventory state, each area as observed, confirmed, promoted, character
 
 `aeh plan <feature>` plans the approved spec's new criteria: a test author writes acceptance tests and one task; aeh checks that the base is green, that each new test fails before the feature exists and that the previous suite still passes; QA and security review it; the result is sealed and published on `aeh/<ID>`. Requires `commands.acceptance`. An adopted feature must be characterized first (`aeh adopt seal`), and a later version plans only after the previous implementation is merged. Exit `3` when blocked; answer with `aeh answer <ID>` and run it again.
 
+A plan pins memory as it was when the plan was reserved. It, and the `aeh run` of its outcome, read the spec, criteria, last implementation and every feature's paths from that point, so edits and newer approvals never reach them; the implementation is recorded against the planned version.
+
 ## Execution
 
 ### `aeh run`
@@ -146,6 +148,8 @@ Creates the memory repository, its own local Git repository without a remote. It
 ### `aeh memory approve`
 
 `aeh memory approve <feature>` approves the spec as it reads now. Editing its title, paths or text voids the approval. Route `new` and `aeh plan` require it.
+
+An approved version never changes: to approve new content, raise `version:` in the spec's front matter above the highest version you approved (the error names the lowest valid one). Each approval records which implementation its criteria delta was computed against. If another implementation was recorded since (for example the previous version's run finished after you approved this one), `aeh plan` asks you to approve again; approving again keeps the version and content and updates only that base. A spec whose version is above its approval (you raised only the version, or recording an implementation raised it) is planned only after you approve that version.
 
 ### `aeh memory status`
 
