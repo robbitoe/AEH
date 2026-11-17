@@ -55,6 +55,36 @@ func TestApprovedVersionIsImmutable(t *testing.T) {
 	if spec, changed, err = ApproveSpec(r, "checkout"); err != nil || !changed || spec.Approval.Version != "0.1.1" {
 		t.Fatalf("raised version: %+v %v %v", spec.Approval, changed, err)
 	}
+	// Lowering only the version keeps the spec reading as approved (the digest leaves the
+	// version out), but it is not the newest approval: approve and plan refuse it.
+	dir := memDir(t, r)
+	editSpec(t, r, "checkout", "version: 0.1.1", "version: 0.1.0")
+	if _, _, err = ApproveSpec(r, "checkout"); err == nil || !strings.Contains(err.Error(), "highest approved: 0.1.1") {
+		t.Fatalf("a lowered version passed as approved: %v", err)
+	}
+	// Restoring the old approved pair is not the newest approval either.
+	sp := filepath.Join(dir, filepath.FromSlash(specRel("checkout")))
+	ap := filepath.Join(dir, filepath.FromSlash(approvalRel("checkout")))
+	first := mustGit(t, dir, "log", "--reverse", "--format=%H", "--", approvalRel("checkout"))
+	first = strings.Fields(first)[0]
+	for p, rel := range map[string]string{sp: specRel("checkout"), ap: approvalRel("checkout")} {
+		b, _ := gitBlob(dir, first, rel)
+		if err := os.WriteFile(p, []byte(b), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "restore the first approved pair")
+	if snap, _ := LoadMemory(r); !mustSpec(t, snap, "checkout").Approved() {
+		t.Fatal("setup: the restored pair should read as approved")
+	}
+	if _, _, err = ApproveSpec(r, "checkout"); err == nil || !strings.Contains(err.Error(), "highest approved: 0.1.1") {
+		t.Fatalf("a restored old pair passed as approved: %v", err)
+	}
+	editSpec(t, r, "checkout", "version: 0.1.0", "version: 0.1.1")
+	editSpec(t, r, "checkout", "then one order is created.", "then exactly one order is created.")
+	if _, _, err = ApproveSpec(r, "checkout"); err != nil {
+		t.Fatalf("the newest approved version and content again: %v", err)
+	}
 	// New content under an older version number is not raising it either. (The approval
 	// digest covers title, paths and body, so the version alone never voids an approval.)
 	editSpec(t, r, "checkout", "version: 0.1.1", "version: 0.1.0")
@@ -112,15 +142,80 @@ func TestPlanResumesFromItsPinnedMemory(t *testing.T) {
 	if st.Status != StatusBlocked || !isFullSHA(st.MemoryCommit) {
 		t.Fatalf("setup: %+v", st)
 	}
+	// The owner approves newer content, which needs a higher version: aeh plan still
+	// continues the unfinished plan of 0.1.0 first, from its pin.
 	editSpec(t, f.repo, "pay", "Pays the cart.", "Pays the cart in one step.")
+	raiseVersion(t, f.repo, "pay")
+	if _, _, err := ApproveSpec(f.repo, "pay"); err != nil {
+		t.Fatal(err)
+	}
 	if err := Answer(f.repo, planID, "Retry."); err != nil {
 		t.Fatal(err)
 	}
 	f.setScript("author", authorOK)
 	st = f.plan()
-	if st.Phase != PlanLogged || st.RestartRequired {
+	if st.ID != planID || st.Phase != PlanLogged || st.RestartRequired || st.SpecVersion != "0.1.0" {
 		t.Fatalf("pinned plan did not finish: %+v", st)
 	}
+	// Tampering with the pin is refused: another commit in history holds another version.
+	path, _ := planStatePath(f.repo, planID)
+	raw := readFile(t, path)
+	head := mustGit(t, memDir(t, f.repo), "rev-parse", "HEAD")
+	write(t, filepath.Dir(path), filepath.Base(path), strings.Replace(raw, st.MemoryCommit, head, 1))
+	if _, err := RunOutcome(context.Background(), f.repo, planID, nil); err == nil || !strings.Contains(err.Error(), "does not hold pay 0.1.0 as planned") {
+		t.Fatalf("a run accepted a pin with another version: %v", err)
+	}
+}
+
+// A merge that keeps the old files must not hide an approval made on its other parent.
+func TestApprovalHistoryFollowsMergedBranches(t *testing.T) {
+	r := newMemoryProject(t)
+	if _, err := CreateSpec(r, "checkout", "Checkout", []string{"src/checkout/**"}); err != nil {
+		t.Fatal(err)
+	}
+	describeSpec(t, r, "checkout", twoCriteria)
+	if _, _, err := ApproveSpec(r, "checkout"); err != nil {
+		t.Fatal(err)
+	}
+	dir := memDir(t, r)
+	trunk := mustGit(t, dir, "rev-parse", "--abbrev-ref", "HEAD")
+	mustGit(t, dir, "checkout", "-qb", "side")
+	editSpec(t, r, "checkout", "then one order is created.", "then exactly one order is created.")
+	editSpec(t, r, "checkout", "version: 0.1.0", "version: 0.2.0")
+	if _, _, err := ApproveSpec(r, "checkout"); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, dir, "checkout", "-q", trunk)
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "-s", "ours", "--no-edit", "side")
+	editSpec(t, r, "checkout", "then one order is created.", "then precisely one order is created.")
+	raiseVersion(t, r, "checkout")
+	if _, _, err := ApproveSpec(r, "checkout"); err == nil || !strings.Contains(err.Error(), "highest approved: 0.2.0") {
+		t.Fatalf("a merge hid the approval of 0.2.0: %v", err)
+	}
+}
+
+// A pinned snapshot rejects what loadMemoryDir rejects on disk instead of reading it as absent.
+func TestLoadMemoryAtRejectsNonRegularFiles(t *testing.T) {
+	r := newMemoryProject(t)
+	if _, err := CreateSpec(r, "checkout", "Checkout", []string{"src/checkout/**"}); err != nil {
+		t.Fatal(err)
+	}
+	dir := memDir(t, r)
+	write(t, dir, implementedRel("checkout")+"/x", "not a file\n")
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "a directory named implemented.yaml")
+	if _, err := loadMemoryAt(dir, mustGit(t, dir, "rev-parse", "HEAD")); err == nil || !strings.Contains(err.Error(), "must be a regular file") {
+		t.Fatalf("a directory was read as no implementations: %v", err)
+	}
+}
+
+func mustSpec(t *testing.T, snap MemorySnapshot, feature string) Spec {
+	t.Helper()
+	s, ok := snap.Spec(feature)
+	if !ok {
+		t.Fatalf("no feature %s", feature)
+	}
+	return s
 }
 
 func TestGeneratedRunFinishesItsPinnedVersion(t *testing.T) {

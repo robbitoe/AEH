@@ -431,8 +431,9 @@ func TestSeparateRestoreCommitsRetireNumbers(t *testing.T) {
 		}
 		mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "restore "+filepath.Base(step.path))
 	}
-	if _, _, err := ApproveSpec(r, "checkout"); err != nil {
-		t.Fatal(err)
+	// The restored pair reads as approved but is not the newest approval (0.1.1).
+	if _, _, err := ApproveSpec(r, "checkout"); err == nil || !strings.Contains(err.Error(), "highest approved: 0.1.1") {
+		t.Fatalf("a restored old pair passed as the newest approval: %v", err)
 	}
 	editSpec(t, r, "checkout", "- AC-1: Require login.\n", "- AC-1: Require login.\n- AC-2: Back again.\n")
 	if _, _, err := ApproveSpec(r, "checkout"); err == nil || !strings.Contains(err.Error(), "retired") {

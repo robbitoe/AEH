@@ -264,6 +264,13 @@ func planFeature(ctx context.Context, r Repo, feature, kind string, log io.Write
 	if err != nil {
 		return PlanState{}, err
 	}
+	// An unfinished plan reads its pinned memory, so it resumes even after the owner raised
+	// the spec's version to approve newer content: aeh plan continues it first.
+	if open, err := unfinishedPlan(r, feature); err != nil {
+		return PlanState{}, err
+	} else if open != "" {
+		id = open
+	}
 	unlock, err := lockOutcome(r, id)
 	if err != nil {
 		return PlanState{}, err
@@ -279,6 +286,9 @@ func planFeature(ctx context.Context, r Repo, feature, kind string, log io.Write
 		// reads its pinned memory, so later edits never reach it.
 		if !spec.Approved() {
 			return PlanState{}, fmt.Errorf("feature %s is not approved as it reads now; approve it first: aeh memory approve %s", feature, feature)
+		}
+		if err := checkApprovalVersion(memory.Dir, spec, spec.Approval.Content); err != nil {
+			return PlanState{}, fmt.Errorf("plan %s: %w", feature, err)
 		}
 		if spec.staleApproval() {
 			return PlanState{}, fmt.Errorf("the approval of %s %s was computed against an implementation that is no longer the last one; approve it again so its delta is the real one: aeh memory approve %s",
@@ -320,6 +330,9 @@ func planFeature(ctx context.Context, r Repo, feature, kind string, log io.Write
 	}
 	if spec, ok = view.Spec(feature); !ok {
 		return st, fmt.Errorf("feature %q does not exist in memory", feature)
+	}
+	if exists && st.MemoryCommit != "" && spec.Version != st.SpecVersion {
+		return st, fmt.Errorf("plan %s: pinned memory commit %s does not hold %s %s as planned", id, short(st.MemoryCommit), feature, st.SpecVersion)
 	}
 	if !spec.Approved() {
 		return st, fmt.Errorf("feature %s is not approved as it reads now; approve it first: aeh memory approve %s", feature, feature)
@@ -403,6 +416,29 @@ func planFeature(ctx context.Context, r Repo, feature, kind string, log io.Write
 	}
 	p.logf("%s planned on %s at %s. Build it with: aeh run %s", id, IntegrationBranch(id), short(st.PlanCommit), id)
 	return st, nil
+}
+
+// unfinishedPlan returns the ID of the feature's oldest plan that is neither logged nor
+// waiting for a restart, or "". Its pin keeps it on the version it was reserved for.
+func unfinishedPlan(r Repo, feature string) (string, error) {
+	plans, err := ListPlanStates(r)
+	if err != nil {
+		return "", err
+	}
+	var open *PlanState
+	for i := range plans {
+		p := &plans[i]
+		if p.Feature != feature || p.Phase == PlanLogged || p.RestartRequired {
+			continue
+		}
+		if open == nil || p.UpdatedAt.Before(open.UpdatedAt) {
+			open = p
+		}
+	}
+	if open == nil {
+		return "", nil
+	}
+	return open.ID, nil
 }
 
 // rulesForArea returns every rule that may touch a file of the area: a rule pattern compatible

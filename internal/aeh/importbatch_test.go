@@ -327,8 +327,10 @@ func TestImportBatchRejectsInvalidBatches(t *testing.T) {
 		"inner marker":      func(b *memoryBatch) { b.Subject = "x aeh-import: y" },
 		"non-ascii path":    func(b *memoryBatch) { b.Files = map[string][]byte{"wiki/café.md": []byte("x")} },
 		"features case":     func(b *memoryBatch) { b.Files = map[string][]byte{"wiki/FEATURES/shop/approval.yaml.md": []byte("x")} },
-		"directory case":    func(b *memoryBatch) { b.Files = map[string][]byte{"wiki/a/x.md": []byte("x"), "wiki/A/y.md": []byte("y")} },
-		"two-line log":      func(b *memoryBatch) { b.Log = "a\nAEH-Import: x y" },
+		"directory case": func(b *memoryBatch) {
+			b.Files = map[string][]byte{"wiki/a/x.md": []byte("x"), "wiki/A/y.md": []byte("y")}
+		},
+		"two-line log": func(b *memoryBatch) { b.Log = "a\nAEH-Import: x y" },
 	}
 	for name, mutate := range cases {
 		b := ok

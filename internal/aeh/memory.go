@@ -639,7 +639,9 @@ func parseApproval(b []byte) (*SpecApproval, error) {
 // version. Records carry an approval forward to a bumped spec version, so they never count.
 func ownerApprovals(dir, feature string) ([]SpecApproval, error) {
 	aRel, sRel := approvalRel(feature), specRel(feature)
-	log, err := git(dir, "log", "--reverse", "--format=%H", "--", aRel, sRel)
+	// --full-history: path simplification would skip a side branch whose files a merge did
+	// not keep, hiding an approval that is still in HEAD's history.
+	log, err := git(dir, "log", "--full-history", "--reverse", "--format=%H", "--", aRel, sRel)
 	if err != nil {
 		return nil, fmt.Errorf("approval history of %s: %w", feature, err)
 	}
@@ -659,9 +661,6 @@ func ownerApprovals(dir, feature string) ([]SpecApproval, error) {
 		}
 		sp, err := parseSpec(text)
 		if err != nil || sp.Version != a.Version || approvalDigest(sp.Title, sp.Paths, sp.Body) != a.Content {
-			continue
-		}
-		if n := len(out); n > 0 && out[n-1].Version == a.Version && out[n-1].Content == a.Content {
 			continue
 		}
 		out = append(out, *a)
@@ -743,15 +742,18 @@ func ApproveSpec(r Repo, feature string) (Spec, bool, error) {
 	if err != nil {
 		return Spec{}, false, fmt.Errorf("approve %s: acceptance criteria: %w", feature, err)
 	}
+	// The approval digest leaves the version out (records bump it), so the version rule is
+	// checked even for a spec that reads as approved: lowering only the version, or restoring
+	// an old approved pair, must not pass for the newest approval.
+	content := approvalDigest(spec.Title, spec.Paths, spec.Body)
+	if err := checkApprovalVersion(snap.Dir, spec, content); err != nil {
+		return Spec{}, false, fmt.Errorf("approve %s: %w", feature, err)
+	}
 	if spec.Approved() && !spec.staleApproval() {
 		return spec, false, nil
 	}
 	if strings.Contains(spec.Body, specPlaceholder) {
 		return Spec{}, false, fmt.Errorf("approve %s: the spec still has the placeholder text; describe the feature first", feature)
-	}
-	content := approvalDigest(spec.Title, spec.Paths, spec.Body)
-	if err := checkApprovalVersion(snap.Dir, spec, content); err != nil {
-		return Spec{}, false, fmt.Errorf("approve %s: %w", feature, err)
 	}
 	today := memoryNow().UTC().Format("2006-01-02")
 	a := SpecApproval{Version: spec.Version, Content: content, Date: today, MaxCriterion: ident.High, DeltaBase: spec.deltaBase()}

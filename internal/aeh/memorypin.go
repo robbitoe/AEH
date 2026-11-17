@@ -69,7 +69,10 @@ func loadMemoryAt(dir, commit string) (MemorySnapshot, error) {
 
 // specAt reads one feature's spec, approval and implementations at a memory commit.
 func specAt(dir, commit, feature string) (Spec, error) {
-	text, ok := gitBlob(dir, commit, specRel(feature))
+	text, ok, err := fileAt(dir, commit, specRel(feature))
+	if err != nil {
+		return Spec{}, err
+	}
 	if !ok {
 		return Spec{}, fmt.Errorf("memory at %s: feature %s has no spec.md", short(commit), feature)
 	}
@@ -80,18 +83,44 @@ func specAt(dir, commit, feature string) (Spec, error) {
 	if s.Feature != feature {
 		return Spec{}, fmt.Errorf("memory at %s: feature %s: spec declares feature %q", short(commit), feature, s.Feature)
 	}
-	if b, ok := gitBlob(dir, commit, approvalRel(feature)); ok {
+	if b, ok, err := fileAt(dir, commit, approvalRel(feature)); err != nil {
+		return Spec{}, err
+	} else if ok {
 		if s.Approval, err = parseApproval([]byte(b)); err != nil {
 			return Spec{}, fmt.Errorf("memory at %s: feature %s: %w", short(commit), feature, err)
 		}
 	}
-	if b, ok := gitBlob(dir, commit, implementedRel(feature)); ok {
+	if b, ok, err := fileAt(dir, commit, implementedRel(feature)); err != nil {
+		return Spec{}, err
+	} else if ok {
 		if s.Implemented, err = parseImplementations([]byte(b)); err != nil {
 			return Spec{}, fmt.Errorf("memory at %s: feature %s: %w", short(commit), feature, err)
 		}
 	}
 	s.rev = commit
 	return s, nil
+}
+
+// fileAt reads a regular file at a memory commit. A missing path is (false, nil); a path that
+// is a directory, a link or a submodule is an error, as loadMemoryDir rejects them on disk.
+func fileAt(dir, commit, rel string) (string, bool, error) {
+	out, err := git(dir, "ls-tree", "-z", commit, "--", rel)
+	if err != nil {
+		return "", false, fmt.Errorf("memory at %s: %s: %w", short(commit), rel, err)
+	}
+	if out == "" {
+		return "", false, nil
+	}
+	meta, name, _ := strings.Cut(strings.TrimSuffix(out, "\x00"), "\t")
+	fields := strings.Fields(meta)
+	if name != rel || len(fields) != 3 || fields[1] != "blob" || (fields[0] != "100644" && fields[0] != "100755") {
+		return "", false, fmt.Errorf("memory at %s: %s must be a regular file", short(commit), rel)
+	}
+	b, ok := gitBlob(dir, commit, rel)
+	if !ok {
+		return "", false, fmt.Errorf("memory at %s: %s is unreadable", short(commit), rel)
+	}
+	return b, true, nil
 }
 
 // pinnedSpec reads one feature's spec at a pinned memory commit, after checking the pin.

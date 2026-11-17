@@ -173,6 +173,9 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer, gen 
 			if err != nil {
 				return st, fmt.Errorf("run %s: %w", o.ID, err)
 			}
+			if spec, ok := pinned.Spec(gen.Plan.Feature); !ok || spec.Version != gen.Plan.SpecVersion {
+				return st, fmt.Errorf("run %s: pinned memory commit %s does not hold %s %s as planned", o.ID, short(pin), gen.Plan.Feature, gen.Plan.SpecVersion)
+			}
 			memory, ru.memory = pinned, pinned
 		}
 		spec, exists := memory.Spec(gen.Plan.Feature)
