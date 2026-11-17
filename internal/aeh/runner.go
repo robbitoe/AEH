@@ -173,7 +173,8 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer, gen 
 			if err != nil {
 				return st, fmt.Errorf("run %s: %w", o.ID, err)
 			}
-			if spec, ok := pinned.Spec(gen.Plan.Feature); !ok || spec.Version != gen.Plan.SpecVersion {
+			spec, ok := pinned.Spec(gen.Plan.Feature)
+			if !ok || spec.Version != gen.Plan.SpecVersion || (gen.Plan.Owners != "" && pinned.ContractFingerprint(gen.Plan.Feature) != gen.Plan.Owners) {
 				return st, fmt.Errorf("run %s: pinned memory commit %s does not hold %s %s as planned", o.ID, short(pin), gen.Plan.Feature, gen.Plan.SpecVersion)
 			}
 			memory, ru.memory = pinned, pinned
@@ -324,7 +325,13 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer, gen 
 		switch {
 		case err != nil:
 		case pin != "":
-			// A pinned run ignores later memory changes; its pin must still be in history.
+			// A pinned run ignores later memory changes; its pin must still be in history, and
+			// no other implementation may have been recorded since its plan was reserved.
+			if now, ok := current.Spec(o.Feature); ok && lastCode(now) != gen.Plan.PriorCode {
+				st.RestartRequired = true
+				err := ru.block(fmt.Sprintf("Another implementation of %s was recorded after plan %s was reserved; this plan is superseded. Plan the feature again: aeh plan %s", o.Feature, o.ID, o.Feature))
+				return st, err
+			}
 			if _, perr := loadMemoryAt(current.Dir, pin); perr != nil {
 				err = perr
 			} else {

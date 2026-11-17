@@ -292,3 +292,64 @@ func TestGeneratedRunWithoutPinReadsCurrentMemory(t *testing.T) {
 		t.Fatalf("unpinned run ignored the spec change: %+v", st)
 	}
 }
+
+// Raising only the version records an approval of that version: its content is then fixed.
+func TestVersionOnlyRaiseIsApprovedUnderItsOwnVersion(t *testing.T) {
+	r := newMemoryProject(t)
+	if _, err := CreateSpec(r, "checkout", "Checkout", []string{"src/checkout/**"}); err != nil {
+		t.Fatal(err)
+	}
+	describeSpec(t, r, "checkout", twoCriteria)
+	if _, _, err := ApproveSpec(r, "checkout"); err != nil {
+		t.Fatal(err)
+	}
+	raiseVersion(t, r, "checkout")
+	spec, changed, err := ApproveSpec(r, "checkout")
+	if err != nil || !changed || spec.Approval.Version != "0.1.1" {
+		t.Fatalf("version-only raise: %+v %v %v", spec.Approval, changed, err)
+	}
+	editSpec(t, r, "checkout", "then one order is created.", "then exactly one order is created.")
+	if _, _, err := ApproveSpec(r, "checkout"); err == nil || !strings.Contains(err.Error(), "highest approved: 0.1.1") {
+		t.Fatalf("new content under 0.1.1 after its approval: %v", err)
+	}
+}
+
+// The run checks its pinned snapshot against the ownership the plan reserved: an older pin
+// with the same spec but other features' paths missing is refused.
+func TestGeneratedRunRefusesAPinWithOtherOwners(t *testing.T) {
+	f := newPlanFixture(t, authorOK, countCall+reviewOK)
+	approved := mustGit(t, memDir(t, f.repo), "rev-parse", "HEAD")
+	if _, err := CreateSpec(f.repo, "other", "Other", []string{"lib/**"}); err != nil {
+		t.Fatal(err)
+	}
+	f.setScript("impl", countCall+implementPay)
+	f.writeConfig("plan:\n  ladder: [author]\n")
+	cfg := strings.Replace(readFile(t, f.repo.ConfigPath()), "ladder: [author]", "ladder: [impl]", 1)
+	cfg += "  impl:\n    provider: implementer\n    command: [sh, " + yamlQuote(filepath.ToSlash(filepath.Join(f.tmp, "impl.sh"))) + ", '{{prompt}}']\n    env:\n      AEH_COUNTER: " + yamlQuote(filepath.ToSlash(filepath.Join(f.tmp, "impl.count"))) + "\n"
+	write(t, f.dir, "aeh/config.yaml", cfg)
+	f.commitAll("configure independent implementation")
+	p := f.plan()
+	if p.Phase != PlanLogged || p.Owners == "" {
+		t.Fatalf("plan: %+v", p)
+	}
+	path, _ := planStatePath(f.repo, planID)
+	write(t, filepath.Dir(path), filepath.Base(path), strings.Replace(readFile(t, path), p.MemoryCommit, approved, 1))
+	if _, err := RunOutcome(context.Background(), f.repo, planID, nil); err == nil || !strings.Contains(err.Error(), "as planned") || f.count("impl") != 0 {
+		t.Fatalf("a pin without the other feature's paths ran: %v", err)
+	}
+}
+
+// An implementation recorded after a plan was reserved supersedes it: its run does not accept
+// over the newer history.
+func TestGeneratedRunIsSupersededByALaterImplementation(t *testing.T) {
+	f, _ := generatedFixture(t, implementPay)
+	snap, _ := LoadMemory(f.repo)
+	recordImplementation(t, f.repo, mustSpec(t, snap, "pay"), "pay-other", mustGit(t, f.dir, "rev-parse", "HEAD"))
+	st := generatedRunState(t, f, planID)
+	if st.Status != StatusBlocked || !st.RestartRequired || !strings.Contains(st.Question, "superseded") {
+		t.Fatalf("a superseded plan was accepted: %+v", st)
+	}
+	if im, err := readImplementations(filepath.Join(memDir(t, f.repo), filepath.FromSlash(implementedRel("pay")))); err != nil || len(im) != 1 || im[0].Outcome != "pay-other" {
+		t.Fatalf("history changed: %+v %v", im, err)
+	}
+}

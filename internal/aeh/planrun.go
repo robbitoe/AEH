@@ -44,7 +44,10 @@ type PlanState struct {
 	SpecDigest   string `json:"spec_content_sha256"`
 	// MemoryCommit is the memory commit the plan was reserved at. The plan and its run read
 	// memory as it was there. Empty in plans reserved before stage 5, which read it as it is.
-	MemoryCommit    string           `json:"memory_commit,omitempty"`
+	MemoryCommit string `json:"memory_commit,omitempty"`
+	// Owners is the contract fingerprint of the pinned memory (which code every feature owns
+	// and the feature's spec); the run checks its pinned snapshot against it.
+	Owners          string           `json:"owners_sha256,omitempty"`
 	PriorCode       string           `json:"prior_code_sha,omitempty"`
 	Delta           CriteriaDelta    `json:"delta"`
 	Route           string           `json:"route"`
@@ -293,6 +296,10 @@ func planFeature(ctx context.Context, r Repo, feature, kind string, log io.Write
 		if spec.staleApproval() {
 			return PlanState{}, fmt.Errorf("the approval of %s %s was computed against an implementation that is no longer the last one; approve it again so its delta is the real one: aeh memory approve %s",
 				feature, spec.Version, feature)
+		}
+		if spec.Approval.Version != spec.Version {
+			return PlanState{}, fmt.Errorf("feature %s is at version %s but its approval is of %s; approve this version first: aeh memory approve %s",
+				feature, spec.Version, spec.Approval.Version, feature)
 		}
 		if observed, err = characterizationBase(memory.Dir, spec, kind); err != nil {
 			return PlanState{}, err
@@ -548,7 +555,7 @@ func (p *planner) loadPrompts() error {
 // already uses that ID and that the last implementation is integrated in the base.
 func (p *planner) reserve(id, observed, memoryCommit string) (PlanState, error) {
 	st := PlanState{Version: planStateVersion, ID: id, Kind: p.kind, Feature: p.spec.Feature, Phase: PlanReserved, Status: StatusRunning,
-		SpecVersion: p.spec.Version, SpecDigest: p.spec.Approval.Content, MemoryCommit: memoryCommit, ObservedBase: observed}
+		SpecVersion: p.spec.Version, SpecDigest: p.spec.Approval.Content, MemoryCommit: memoryCommit, Owners: p.owners, ObservedBase: observed}
 	if err := p.checkCollisions(id); err != nil {
 		return st, err
 	}

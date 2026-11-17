@@ -149,7 +149,7 @@ Creates the memory repository, its own local Git repository without a remote. It
 
 `aeh memory approve <feature>` approves the spec as it reads now. Editing its title, paths or text voids the approval. Route `new` and `aeh plan` require it.
 
-An approved version never changes: to approve new content, raise `version:` in the spec's front matter above the highest version you approved (the error names the lowest valid one). Each approval records which implementation its criteria delta was computed against. If another implementation was recorded since (for example the previous version's run finished after you approved this one), `aeh plan` asks you to approve again; approving again keeps the version and content and updates only that base.
+An approved version never changes: to approve new content, raise `version:` in the spec's front matter above the highest version you approved (the error names the lowest valid one). Each approval records which implementation its criteria delta was computed against. If another implementation was recorded since (for example the previous version's run finished after you approved this one), `aeh plan` asks you to approve again; approving again keeps the version and content and updates only that base. A spec whose version is above its approval (you raised only the version, or recording an implementation raised it) is planned only after you approve that version.
 
 ### `aeh memory status`
 

@@ -749,7 +749,10 @@ func ApproveSpec(r Repo, feature string) (Spec, bool, error) {
 	if err := checkApprovalVersion(snap.Dir, spec, content); err != nil {
 		return Spec{}, false, fmt.Errorf("approve %s: %w", feature, err)
 	}
-	if spec.Approved() && !spec.staleApproval() {
+	// A spec whose version moved past its approval (the owner raised only the version, or a
+	// record bumped it) is approved again under its own version, so that version enters
+	// history and its content cannot change later.
+	if spec.Approved() && spec.Approval.Version == spec.Version && !spec.staleApproval() {
 		return spec, false, nil
 	}
 	if strings.Contains(spec.Body, specPlaceholder) {
@@ -933,6 +936,11 @@ func implementationRecord(dir string, spec Spec, pinned *Spec, p PendingRecord) 
 		return nil, fmt.Errorf("feature %s has no acceptance criteria to implement", spec.Feature)
 	}
 	if pinned != nil {
+		// One plan, one predecessor: an implementation recorded after the plan was reserved
+		// (a newer version's run finished first) supersedes this one.
+		if lastCode(spec) != lastCode(*pinned) {
+			return nil, fmt.Errorf("feature %s: another implementation was recorded after this plan was reserved; the plan is superseded", spec.Feature)
+		}
 		// Numbers approved since the pin stay retired or reserved: the high-water mark is the
 		// higher of both histories.
 		now, err := loadCriteriaIdentity(dir, spec)
@@ -1314,6 +1322,12 @@ func parseSemver(v string) ([3]int, error) {
 		n[i] = x
 	}
 	return n, nil
+}
+
+// lastCode is the commit of the feature's last implementation, or "".
+func lastCode(s Spec) string {
+	im, _ := s.LastImplementation()
+	return im.Code
 }
 
 // mustSemver parses a version aeh itself produced.
