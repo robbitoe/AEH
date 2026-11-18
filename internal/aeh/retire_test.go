@@ -241,17 +241,6 @@ func TestPlanRejectsRetiredBaseHashMismatch(t *testing.T) {
 	}
 }
 
-func TestPlanOnlyRemovedDeltaWaitsForL3(t *testing.T) {
-	f, _ := retirementFixture(t, true)
-	editSpec(t, f.repo, "pay", "- AC-1: Given a cart, when the user pays, then src/pay.txt says paid.\n", "")
-	if _, _, err := ApproveSpec(f.repo, "pay"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := PlanFeature(context.Background(), f.repo, "pay", nil); err == nil || !strings.Contains(err.Error(), "L3") {
-		t.Fatalf("only removed delta planned: %v", err)
-	}
-}
-
 func TestPlanRetirementRecoveryKeepsPinnedInputs(t *testing.T) {
 	f, _ := retirementFixture(t, true)
 	id := approveReplacement(t, f, true)

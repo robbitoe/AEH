@@ -33,6 +33,9 @@ type promptData struct {
 	MaxFiles   int
 	MaxBytes   int
 	PlanYAML   string // plan review: the frozen author's plan
+	// Plans: a delta with nothing to implement (no task), and the clarified criteria.
+	NoImplementation bool
+	Clarifications   string
 
 	// Discovery: the owner's idea, earlier questions with the latest answers, and limits.
 	Idea         string
@@ -83,10 +86,26 @@ func newPlanPromptData(in PlanInput) promptData {
 	for _, c := range in.Delta.New {
 		fmt.Fprintf(&delta, "- AC-%d: %s\n", c.ID, c.Text)
 	}
-	if len(in.Delta.Changes) > 0 {
+	var changed, clarified []CriterionChange
+	for _, c := range in.Delta.Changes {
+		if c.Clarified {
+			clarified = append(clarified, c)
+		} else {
+			changed = append(changed, c)
+		}
+	}
+	if len(changed) > 0 {
 		delta.WriteString("\nChanged criteria (replacement tests must be red):\n")
-		for _, c := range in.Delta.Changes {
+		for _, c := range changed {
 			fmt.Fprintf(&delta, "- AC-%d old text: %s\n  New text: %s\n", c.ID, c.OldText, c.NewText)
+		}
+	}
+	var clarifiedIDs []string
+	if len(clarified) > 0 {
+		delta.WriteString("\nClarifications approved by the owner (wording only; replacement tests must pass on the base, in separate files from red tests):\n")
+		for _, c := range clarified {
+			fmt.Fprintf(&delta, "- AC-%d old text: %s\n  New text: %s\n", c.ID, c.OldText, c.NewText)
+			clarifiedIDs = append(clarifiedIDs, fmt.Sprintf("AC-%d", c.ID))
 		}
 	}
 	if len(in.Retired) > 0 {
@@ -125,6 +144,7 @@ func newPlanPromptData(in PlanInput) promptData {
 		TestDir: cfg.AcceptanceDir + "/" + in.OutcomeID + "/",
 		Build:   in.Config.Commands.Build, Test: in.Config.Commands.Test, Acceptance: in.Config.Commands.Acceptance,
 		MaxLines: cfg.MaxDiffLines, MaxFiles: cfg.MaxFiles, MaxBytes: cfg.MaxBytes,
+		NoImplementation: in.NoImplementation, Clarifications: strings.Join(clarifiedIDs, ", "),
 	}
 }
 

@@ -429,8 +429,16 @@ func (o *Outcome) normalize() error {
 			return fmt.Errorf("outcome %s: a characterize outcome needs acceptance test paths", o.ID)
 		}
 		return nil
+	case PlanRevise:
+		if len(o.Tasks) > 0 {
+			return fmt.Errorf("outcome %s: a revise outcome has no tasks", o.ID)
+		}
+		if len(o.Acceptance) == 0 {
+			return fmt.Errorf("outcome %s: a revise outcome needs acceptance test paths", o.ID)
+		}
+		return nil
 	default:
-		return fmt.Errorf("outcome %s: kind %q must be empty or characterize", o.ID, o.Kind)
+		return fmt.Errorf("outcome %s: kind %q must be empty, characterize or revise", o.ID, o.Kind)
 	}
 	if len(o.Tasks) == 0 {
 		goal := o.Title

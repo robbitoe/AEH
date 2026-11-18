@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -44,28 +46,89 @@ func validateRetiredTests(tests []RetiredTest) error {
 	return nil
 }
 
+// redCriteria are what the implementation task builds: new criteria and changed ones that
+// are not clarifications. Their tests must fail on the base.
 func (d CriteriaDelta) redCriteria() []SpecCriterion {
 	crit := append([]SpecCriterion(nil), d.New...)
 	for _, c := range d.Changes {
-		crit = append(crit, SpecCriterion{ID: c.ID, Text: c.NewText})
+		if !c.Clarified {
+			crit = append(crit, SpecCriterion{ID: c.ID, Text: c.NewText})
+		}
 	}
 	return crit
 }
 
+// greenIDs are the criteria whose new tests must pass on the base: clarifications and
+// recovery of unchanged criteria in retired files.
+func (d CriteriaDelta) greenIDs() map[string]bool {
+	green := map[string]bool{}
+	for _, c := range d.Changes {
+		if c.Clarified {
+			green[fmt.Sprintf("AC-%d", c.ID)] = true
+		}
+	}
+	for _, c := range d.Recovery {
+		green[fmt.Sprintf("AC-%d", c.ID)] = true
+	}
+	return green
+}
+
+// clarifiedIDs are the changed criteria approved as clarifications, sorted.
+func (d CriteriaDelta) clarifiedIDs() []int {
+	var ids []int
+	for _, c := range d.Changes {
+		if c.Clarified {
+			ids = append(ids, c.ID)
+		}
+	}
+	sort.Ints(ids)
+	return ids
+}
+
 func (d CriteriaDelta) coverageCriteria() []SpecCriterion {
 	crit := d.redCriteria()
+	for _, c := range d.Changes {
+		if c.Clarified {
+			crit = append(crit, SpecCriterion{ID: c.ID, Text: c.NewText})
+		}
+	}
 	for _, c := range d.Recovery {
 		crit = append(crit, SpecCriterion{ID: c.ID, Text: c.Text})
 	}
 	return crit
 }
 
+// noImplementation reports a delta with nothing to build: only removed criteria,
+// clarifications or recovery. Its plan has no task and is recorded when published.
+func (d CriteriaDelta) noImplementation() bool {
+	return len(d.redCriteria()) == 0
+}
+
+// applyClarifications marks the changed criteria the approval clarified. Each clarification
+// must match a change of this delta with the same old and new texts; otherwise the approval
+// was given for another delta and must be repeated.
+func applyClarifications(d *CriteriaDelta, a *SpecApproval) error {
+	if a == nil {
+		return nil
+	}
+	for _, cl := range a.Clarifications {
+		found := false
+		for i := range d.Changes {
+			c := &d.Changes[i]
+			if c.ID == cl.ID && criterionDigest(c.OldText) == cl.Old && criterionDigest(c.NewText) == cl.New {
+				c.Clarified, found = true, true
+			}
+		}
+		if !found {
+			return fmt.Errorf("the clarification of AC-%d was approved for another change of its text; approve again", cl.ID)
+		}
+	}
+	return nil
+}
+
 // fileKinds returns true for green recovery and false for red implementation tests.
 func fileKinds(d CriteriaDelta, plan PlanFile) (map[string]bool, error) {
-	green := map[string]bool{}
-	for _, c := range d.Recovery {
-		green[fmt.Sprintf("AC-%d", c.ID)] = true
-	}
+	green := d.greenIDs()
 	kinds := map[string]bool{}
 	for _, id := range sortedTraceIDs(plan.Trace) {
 		for _, file := range plan.Trace[id] {
@@ -76,6 +139,104 @@ func fileKinds(d CriteriaDelta, plan PlanFile) (map[string]bool, error) {
 		}
 	}
 	return kinds, nil
+}
+
+// implementedCriteria lists, for each criterion of the planned spec, the tests that cover it
+// after the plan: its surviving sealed tests, plus the plan's new files traced to it.
+func implementedCriteria(outcome string, crit []SpecCriterion, d CriteriaDelta, absences []string, trace PlanFile, dir string) ([]ImplementedCriterion, error) {
+	crit = append([]SpecCriterion(nil), crit...)
+	sort.Slice(crit, func(i, j int) bool { return crit[i].ID < crit[j].ID })
+	unchanged := map[int]ImplementedCriterion{}
+	for _, c := range d.Unchanged {
+		unchanged[c.ID] = c
+	}
+	var out []ImplementedCriterion
+	for _, c := range crit {
+		var tests []string
+		for _, file := range unchanged[c.ID].Tests {
+			if !containsPath(absences, file) {
+				tests = append(tests, file)
+			}
+		}
+		for _, file := range trace.Trace[fmt.Sprintf("AC-%d", c.ID)] {
+			tests = append(tests, dir+file)
+		}
+		if len(tests) == 0 {
+			return nil, fmt.Errorf("plan %s has no tests for AC-%d", outcome, c.ID)
+		}
+		out = append(out, ImplementedCriterion{ID: c.ID, Text: c.Text, Tests: tests})
+	}
+	return out, nil
+}
+
+// equivalenceLine is QA's statement about one clarification.
+var equivalenceLine = regexp.MustCompile(`^EQUIVALENT AC-([1-9][0-9]*): (yes|no)$`)
+
+// parseEquivalence reads QA's "EQUIVALENT AC-<n>: yes|no" lines: exactly one per clarified
+// criterion, none for others, nothing malformed. It returns the criteria QA answered no.
+func parseEquivalence(out string, ids []int) ([]string, error) {
+	want := map[int]bool{}
+	for _, id := range ids {
+		want[id] = true
+	}
+	got := map[int]string{}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(strings.ToUpper(line), "EQUIVALENT") {
+			continue
+		}
+		m := equivalenceLine.FindStringSubmatch(line)
+		if m == nil {
+			return nil, fmt.Errorf("malformed equivalence line %q; write EQUIVALENT AC-<n>: yes or no", tail(line, 80))
+		}
+		id, _ := strconv.Atoi(m[1])
+		switch {
+		case !want[id]:
+			return nil, fmt.Errorf("AC-%d is not a clarification of this plan", id)
+		case got[id] != "":
+			return nil, fmt.Errorf("AC-%d has more than one equivalence line", id)
+		}
+		got[id] = m[2]
+	}
+	var no []string
+	for _, id := range ids {
+		switch got[id] {
+		case "":
+			return nil, fmt.Errorf("AC-%d has no equivalence line", id)
+		case "no":
+			no = append(no, fmt.Sprintf("AC-%d", id))
+		}
+	}
+	return no, nil
+}
+
+// revisionSummary names what a plan without implementation does.
+func revisionSummary(d CriteriaDelta) string {
+	var parts []string
+	list := func(ids []int) string {
+		var s []string
+		for _, id := range ids {
+			s = append(s, fmt.Sprintf("AC-%d", id))
+		}
+		return strings.Join(s, ", ")
+	}
+	if len(d.Removed) > 0 {
+		parts = append(parts, "retires the tests of "+list(d.Removed))
+	}
+	if ids := d.clarifiedIDs(); len(ids) > 0 {
+		parts = append(parts, "clarifies "+list(ids))
+	}
+	var rec []int
+	for _, c := range d.Recovery {
+		rec = append(rec, c.ID)
+	}
+	if len(rec) > 0 {
+		parts = append(parts, "re-covers "+list(rec))
+	}
+	if len(parts) == 0 {
+		return "revises tests"
+	}
+	return strings.Join(parts, "; ")
 }
 
 func retiredPaths(tests []RetiredTest) []string {

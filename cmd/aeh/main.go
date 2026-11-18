@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -68,7 +69,8 @@ Memory (local, private: .aeh/memory/ of the main checkout, never published by ae
   aeh memory init                   create the memory repository
   aeh memory new <feature> --title "..." --paths a/**,b/**
                                     add a feature spec at version 0.1.0
-  aeh memory approve <feature>      approve the spec as it reads now (required by route new)
+  aeh memory approve <feature> [--clarify AC-<n>,...|none]
+                                    approve the spec as it reads now (required by route new)
   aeh memory status                 features, versions, approvals and pending records
   aeh memory lint                   check memory and its privacy settings
   aeh memory record <ID>            retry a pending memory record of an accepted outcome
@@ -243,10 +245,31 @@ func memoryCommand(repo aeh.Repo, args []string) (int, error) {
 		return 0, nil
 
 	case "approve":
-		if len(args) != 2 {
-			return 2, errors.New("usage: aeh memory approve <feature>")
+		usage := errors.New("usage: aeh memory approve <feature> [--clarify AC-<n>,...|none]")
+		if len(args) < 2 || strings.HasPrefix(args[1], "-") {
+			return 2, usage
 		}
-		s, changed, err := aeh.ApproveSpec(repo, args[1])
+		fs := flag.NewFlagSet("approve", flag.ContinueOnError)
+		clarify := fs.String("clarify", "", "changed criteria approved as wording-only clarifications (AC-<n>,... or none)")
+		if err := fs.Parse(args[2:]); err != nil || fs.NArg() != 0 {
+			return 2, usage
+		}
+		var opt aeh.ApproveOptions
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "clarify" {
+				opt.SetClarify = true
+			}
+		})
+		if opt.SetClarify && *clarify != "none" {
+			for _, item := range strings.Split(*clarify, ",") {
+				n, err := strconv.Atoi(strings.TrimPrefix(strings.TrimSpace(item), "AC-"))
+				if err != nil || n < 1 || !strings.HasPrefix(strings.TrimSpace(item), "AC-") {
+					return 2, fmt.Errorf("--clarify: %q is not AC-<n>", item)
+				}
+				opt.Clarify = append(opt.Clarify, n)
+			}
+		}
+		s, changed, err := aeh.ApproveSpecWith(repo, args[1], opt)
 		if err != nil {
 			return 1, err
 		}
