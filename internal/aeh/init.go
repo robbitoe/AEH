@@ -92,9 +92,10 @@ profiles:
   # --permission-prompts none denies anything that would ask instead of waiting.
   # acceptEdits lets it edit files; to let it run your tests too, add for example
   # "--allowedTools", "Bash(npm test:*)".
+  # Text output keeps a final SPEC-QUESTION line readable; json would hide it.
   fuerte:
     provider: anthropic
-    command: ["claude", "-p", "--safe-mode", "--permission-mode", "acceptEdits", "--permission-prompts", "none", "--output-format", "json"]
+    command: ["claude", "-p", "--safe-mode", "--permission-mode", "acceptEdits", "--permission-prompts", "none", "--output-format", "text"]
     stdin: true
     timeout_minutes: 30
   # Read-only Claude reviewer; it reviews what Codex implements.

@@ -101,8 +101,11 @@ func RunOutcome(ctx context.Context, r Repo, id string, log io.Writer) (State, e
 		if stateErr != nil {
 			return s, stateErr
 		}
-		if s.ResumeOutcome != nil {
-			o, err = *s.ResumeOutcome, nil
+		// Only a paused question resumes an aeh do: other blocks are refined with a new
+		// aeh do. The stored contract is checked like an outcome file.
+		if s.ResumeOutcome != nil && s.Cursor != nil && s.ResumeOutcome.ID == id {
+			o = *s.ResumeOutcome
+			err = o.normalize()
 		}
 	}
 	if err != nil {
@@ -1090,10 +1093,10 @@ func (ru *runner) finalCheck(ctx context.Context) (bool, string, error) {
 	gates := []GateResult{}
 	if ru.seal != nil {
 		if ru.generated != nil {
+			// Generated seals hash Git objects: the sealed gate checks them at head, and
+			// verifyCheckout above proved the worktree matches head. Hashing the checked-out
+			// files instead would fail whenever Git converts line endings on checkout.
 			gates = append(gates, ru.sealedGate(ru.state.Base, head))
-			if gates[len(gates)-1].Passed {
-				gates = append(gates, gateHash(wt, ru.generated.Manifest, ru.generated.Paths))
-			}
 		} else {
 			gates = append(gates, gateHash(wt, *ru.seal, o.Acceptance))
 		}
