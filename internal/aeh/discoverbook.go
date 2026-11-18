@@ -41,6 +41,8 @@ type DiscoveryAction struct {
 	Content string   `json:"content_sha256"`
 	Date    string   `json:"date"`
 	Paths   []string `json:"paths,omitempty"` // promoted path claims survive later owner edits
+	// Revision: the promotion wrote a pending revision of an existing feature.
+	Revision bool `json:"revision,omitempty"`
 }
 
 type draftFeature struct {
@@ -49,7 +51,12 @@ type draftFeature struct {
 	Body  string   `yaml:"-"`
 }
 
-func parseDraftFeature(b []byte) (draftFeature, error) {
+func parseDraftFeature(b []byte) (draftFeature, error) { return parseDraftFeatureFor(b, false) }
+
+// parseDraftFeatureFor parses a draft. A new feature numbers its criteria 1 through n; a
+// revision of an existing feature keeps the numbers its history assigns, checked by
+// revisionCandidate.
+func parseDraftFeatureFor(b []byte, revision bool) (draftFeature, error) {
 	var f draftFeature
 	if err := checkNoSecrets("draft", b); err != nil {
 		return f, err
@@ -130,8 +137,11 @@ func parseDraftFeature(b []byte) (draftFeature, error) {
 		return f, errors.New("draft needs a non-empty Acceptance criteria section")
 	}
 	for i, c := range crit {
-		if c.ID != i+1 {
+		if !revision && c.ID != i+1 {
 			return f, errors.New("draft criteria must be numbered 1 through n without gaps")
+		}
+		if revision && i > 0 && c.ID <= crit[i-1].ID {
+			return f, errors.New("revision criteria must be in increasing order without repeated numbers")
 		}
 	}
 	f.Body = body
@@ -153,10 +163,14 @@ func (d *discoverySession) validateBookFeatures(f frozenOutput) error {
 			continue
 		}
 		slug := strings.TrimSuffix(strings.TrimPrefix(rel, "features/"), ".md")
+		var draft draftFeature
+		var err error
 		if _, exists := memory.Spec(slug); exists {
-			return fmt.Errorf("draft %s is an existing feature; changes to features require stage 5", slug)
+			// A draft for an existing feature is a revision of it.
+			draft, _, err = d.checkBookRevision(memory, slug, f.Files[rel])
+		} else {
+			draft, err = parseDraftFeature(f.Files[rel])
 		}
-		draft, err := parseDraftFeature(f.Files[rel])
 		if err != nil {
 			return fmt.Errorf("%s: %w", rel, err)
 		}
@@ -437,6 +451,10 @@ func DiscoverPromote(r Repo, slug, feature string) (_ DiscoveryState, err error)
 	if err := checkSlug(feature); err != nil {
 		return *d.state, err
 	}
+	// A pending revision of an existing feature is promoted from spec.next.md, its only source.
+	if _, pending := gitBlob(d.memDir, "HEAD", revisionRel(feature)); pending || d.revisionPromoted(feature) {
+		return d.promoteRevision(feature)
+	}
 	b, err := d.draftAtHead("features/" + feature + ".md")
 	if err != nil {
 		return *d.state, err
@@ -465,7 +483,7 @@ func DiscoverPromote(r Repo, slug, feature string) (_ DiscoveryState, err error)
 		if spec.Feature == feature {
 			return *d.state, fmt.Errorf("feature %s already exists; edit and commit the draft in memory", feature)
 		}
-		if pathsOverlap(f.Paths, spec.Paths) {
+		if pathsOverlap(f.Paths, spec.OwnedPaths()) {
 			return *d.state, fmt.Errorf("draft %s paths overlap feature %s; edit and commit the draft in memory", feature, spec.Feature)
 		}
 	}
@@ -532,17 +550,26 @@ func (d *discoverySession) recordAction(a DiscoveryAction, promotion bool, b []b
 	if promotion {
 		verb = "promote"
 	}
+	return d.record(map[string][]byte{a.Target: b, d.memRel("record.md"): d.renderRecord()}, "discover "+d.state.Slug+": "+verb+" "+a.Name, verb+" "+a.Name+" to "+a.Target)
+}
+
+// renderRecord lists the owner's actions on this session.
+func (d *discoverySession) renderRecord() []byte {
 	var record strings.Builder
 	fmt.Fprintf(&record, "# Discovery %s\n\nOwner actions; these are not feature approvals.\n", d.state.Slug)
 	for _, group := range []struct {
 		verb    string
 		actions []DiscoveryAction
-	}{{"Promoted", d.state.Promotions}, {"Accepted", d.state.Acceptances}} {
+	}{{"Promoted", d.state.Promotions}, {"Accepted", d.state.Acceptances}, {"Discarded the revision of", d.state.Discards}} {
 		for _, action := range group.actions {
-			fmt.Fprintf(&record, "\n- %s %s to %s (%s), content SHA-256 %s.\n", group.verb, action.Name, action.Target, action.Date, action.Content)
+			what := action.Name
+			if action.Revision {
+				what = "the revision of " + action.Name
+			}
+			fmt.Fprintf(&record, "\n- %s %s to %s (%s), content SHA-256 %s.\n", group.verb, what, action.Target, action.Date, action.Content)
 		}
 	}
-	return d.record(map[string][]byte{a.Target: b, d.memRel("record.md"): []byte(record.String())}, "discover "+d.state.Slug+": "+verb+" "+a.Name, verb+" "+a.Name+" to "+a.Target)
+	return []byte(record.String())
 }
 
 // DiscoverShow holds the same project lock as mutating commands and refreshes review validity.

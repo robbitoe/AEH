@@ -98,6 +98,10 @@ aeh discover accept shop vision      # wiki/vision.md, or wiki/vision.next.md if
 aeh discover accept shop data        # wiki/data.md, or wiki/data.next.md if it exists
 ```
 
+A draft named after an existing feature is a revision of it. When the book is imported, AEH validates it against the feature's history and the product (kept criteria keep their numbers, removed numbers stay retired, new criteria go above the highest number ever used; new paths must not belong to another feature or adopted area, and an adopted feature keeps its paths) and writes it to `wiki/features/<feature>/spec.next.md` with its session, draft digest, base commit and criteria diff. That file is then the revision's only source: edit and commit it there. Each feature has at most one pending revision; another session's revision of it is refused. `aeh discover promote <slug> <feature>` writes it as the next, unapproved version of `spec.md` (a minor version above every version the spec had or the owner approved), keeps the changelog, history and implementations, and removes `spec.next.md` in the same memory commit; a revision whose spec changed after the import is stale and is refused. `aeh discover discard <slug> <feature>` removes a pending revision. `aeh memory status` lists pending revisions.
+
+When a version changes a feature's paths, the feature owns the union of its old and new paths until that version is implemented: its plan may move or retire the old code, the drift gate counts both, and no other feature may claim the old paths. Moving code requires new or changed criteria; a version that only changes paths is planned as a plan without implementation whose record reassigns ownership and releases the old paths. Implementations recorded before this rule carry no paths and add no union. Features adopted from existing code keep their paths for now; after their characterization is accepted, changed or removed criteria retire their sealed characterization tests like any other, and `observed_base_sha`, the owner's decisions and the historical numbers are kept.
+
 Promotion reads the committed draft from memory HEAD and revalidates it against existing features and their paths. Resolve conflicts by editing and committing the draft in the memory repository; no agent reruns. The promoted spec must also meet the existing spec format, including its 120-byte title limit. Repeating promotion or acceptance of unchanged draft content succeeds without another memory commit. Vision and data are advisory: neither enters feature approval digests nor run contracts. Each command refreshes the discovery report, which includes rounds, attempts, redacted feedback, answers and owner actions.
 
 The agent writes only into an output directory that aeh opened before the agent ran. aeh freezes that output against an exact list of allowed files and limits. Then it checks the output:
@@ -396,7 +400,8 @@ Make sure your project's `.gitignore` covers build output (`bin/`, `obj/`, `node
 | `aeh discover answer <slug> <QID> "<text>"` | Answers a question; answering again records a revision. |
 | `aeh discover skip <slug> <QID>` | Skips an optional question. |
 | `aeh discover review <slug>` | Runs the advisory book review again when it has no verdict. |
-| `aeh discover promote <slug> <feature>` | Creates an unapproved spec at 0.1.0 from a committed draft. |
+| `aeh discover promote <slug> <feature>` | Creates an unapproved spec at 0.1.0 from a committed draft, or the next version of a feature from its pending revision. |
+| `aeh discover discard <slug> <feature>` | Discards the pending revision (`spec.next.md`) of a feature. |
 | `aeh discover accept <slug> vision\|data` | Accepts an advisory document; existing documents use `.next.md`. |
 | `aeh adopt inventory [--base <rev>]` | Inspects a pinned base; proposes system documentation and local configuration. |
 | `aeh adopt accept system` | Accepts the pending system inventory. |

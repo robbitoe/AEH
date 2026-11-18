@@ -47,7 +47,7 @@ func gateDrift(paths []string, memory MemorySnapshot, declared string) GateResul
 		}
 		owned := false
 		for _, spec := range memory.Specs {
-			if matchAny(file, spec.Paths) {
+			if matchAny(file, spec.OwnedPaths()) {
 				touched[spec.Feature] = append(touched[spec.Feature], file)
 				owned = true
 			}

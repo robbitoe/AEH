@@ -120,7 +120,7 @@ func TestQueueOneAndSeveralBlockers(t *testing.T) {
 
 func TestQueuePathsBlockOtherWorkAndRecompute(t *testing.T) {
 	r := queueProject(t)
-	if _, err := CreateSpec(r, "shipping", "Shipping", []string{"src/new/**"}); err != nil {
+	if _, err := CreateSpec(r, "shipping", "Shipping", []string{"src/ship/**"}); err != nil {
 		t.Fatal(err)
 	}
 	describeSpec(t, r, "shipping", twoCriteria)
@@ -133,6 +133,8 @@ func TestQueuePathsBlockOtherWorkAndRecompute(t *testing.T) {
 	if len(q.Blockers) != 2 {
 		t.Fatalf("cross-feature blockers: %+v", q.Blockers)
 	}
+	// Another feature claiming the reserved paths is refused by the queue.
+	editSpec(t, r, "shipping", "src/ship/**", "src/new/labels/**")
 	_, _, err := ApproveSpec(r, "shipping")
 	requireQueuedError(t, err, "checkout")
 	for _, tc := range []struct {
@@ -415,7 +417,9 @@ func TestAbandonPublishedRevisionCompletesItsRecordAndRefuses(t *testing.T) {
 
 func TestQueueOtherFeaturePromotionAdmission(t *testing.T) {
 	r, _ := newAreaProject(t)
-	if _, err := CreateSpec(r, "checkout", "Checkout", []string{"src/checkout/**"}); err != nil {
+	// A feature that reaches into the area's paths (claimed before stage 5 checked areas) gives
+	// them up: the queue reserves the old paths until the new version activates.
+	if _, err := CreateSpec(r, "checkout", "Checkout", []string{"src/checkout/**", "src/billing/**"}); err != nil {
 		t.Fatal(err)
 	}
 	describeSpec(t, r, "checkout", twoCriteria)
@@ -423,7 +427,7 @@ func TestQueueOtherFeaturePromotionAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	registerQueuePlan(t, r, "OLD-1", "checkout")
-	editSpec(t, r, "checkout", "src/checkout/**", "src/billing/**")
+	editSpec(t, r, "checkout", "src/checkout/**, src/billing/**", "src/checkout/**")
 	raiseVersion(t, r, "checkout")
 	if s, _, err := ApproveSpec(r, "checkout"); err != nil || s.Queued == nil {
 		t.Fatalf("queue: %+v %v", s, err)

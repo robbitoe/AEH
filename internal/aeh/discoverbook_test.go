@@ -106,9 +106,10 @@ func TestDiscoveryBookValidationFeedback(t *testing.T) {
 	if _, err := CreateSpec(f.repo, "cart", "Existing cart", []string{"old/cart/**"}); err != nil {
 		t.Fatal(err)
 	}
+	// A draft for an existing feature is a revision of it (stage 5): imported as spec.next.md.
 	f.setAgent(writeBook)
 	st := f.run()
-	if st.Status != StatusBlocked || !strings.Contains(st.Attempts[len(st.Attempts)-1].Feedback, "existing feature") {
+	if st.Phase != DiscoveryDraft || !strings.Contains(f.memFile(revisionRel("cart")), "session: shop") {
 		t.Fatalf("existing slug: %+v", st)
 	}
 }

@@ -33,7 +33,10 @@ Discovery (from an idea to a draft book of specs in memory)
   aeh discover skip <slug> <QID>    skip an optional question
   aeh discover review <slug>        run the advisory book review again when it has no verdict
   aeh discover promote <slug> <feature>
-                                    create an unapproved feature spec from a committed draft
+                                    create an unapproved feature spec from a committed draft,
+                                    or the next version of a feature from its pending revision
+  aeh discover discard <slug> <feature>
+                                    discard the pending revision (spec.next.md) of a feature
   aeh discover accept <slug> vision|data
                                     accept an advisory document (existing documents use .next.md)
 
@@ -329,6 +332,9 @@ func memoryCommand(repo aeh.Repo, args []string) (int, error) {
 				approval = "edited after approval of " + s.Approval.Version
 			}
 			fmt.Printf("%-24s %-9s %-28s %s\n", s.Feature, s.Version, approval, last)
+			if session, ok := st.Revisions[s.Feature]; ok {
+				fmt.Printf("  pending revision: spec.next.md from discovery %s; promote or discard it with aeh discover\n", session)
+			}
 			fmt.Print(pendingMemoryText(s.Feature, st.Work, st.Queues))
 		}
 		for _, q := range st.Queues {
@@ -542,7 +548,7 @@ func adoptCommand(ctx context.Context, repo aeh.Repo, args []string) (int, error
 
 func discoverCommand(ctx context.Context, repo aeh.Repo, args []string) (int, error) {
 	if len(args) < 2 {
-		return 2, errors.New("usage: aeh discover new|run|show|answer|skip|review|promote|accept <slug> ...")
+		return 2, errors.New("usage: aeh discover new|run|show|answer|skip|review|promote|discard|accept <slug> ...")
 	}
 	slug := args[1]
 	switch args[0] {
@@ -636,6 +642,15 @@ func discoverCommand(ctx context.Context, repo aeh.Repo, args []string) (int, er
 			fmt.Printf("approve it when it reads right: aeh memory approve %s\n", args[2])
 		}
 		return 0, nil
+	case "discard":
+		if len(args) != 3 {
+			return 2, errors.New("usage: aeh discover discard <slug> <feature>")
+		}
+		if _, err := aeh.DiscoverDiscard(repo, slug, args[2]); err != nil {
+			return 1, err
+		}
+		fmt.Printf("discarded the pending revision of %s\n", args[2])
+		return 0, nil
 	}
 	return 2, fmt.Errorf("unknown discover command %q", args[0])
 }
@@ -693,7 +708,14 @@ func printDiscovery(st aeh.DiscoveryState, all bool) {
 		}
 	}
 	for _, a := range st.Promotions {
+		if a.Revision {
+			fmt.Printf("promoted the revision of %s to %s (%s)\n", a.Name, a.Target, a.Date)
+			continue
+		}
 		fmt.Printf("promoted %s to %s (%s)\n", a.Name, a.Target, a.Date)
+	}
+	for _, a := range st.Discards {
+		fmt.Printf("discarded the revision of %s (%s)\n", a.Name, a.Date)
 	}
 	for _, a := range st.Acceptances {
 		fmt.Printf("accepted %s to %s (%s)\n", a.Name, a.Target, a.Date)

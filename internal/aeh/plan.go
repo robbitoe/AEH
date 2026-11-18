@@ -262,7 +262,8 @@ func validatePlanCandidate(in PlanInput, files []PlanCandidateFile, plan PlanFil
 	protected = append(protected, in.Config.Protected...)
 	for _, t := range plan.Task.Paths {
 		contained := false
-		for _, pattern := range in.Spec.Paths {
+		// While paths migrate, the task may also reach the old paths to move or retire code.
+		for _, pattern := range in.Spec.OwnedPaths() {
 			if planPathContained(pattern, t) {
 				contained = true
 				break

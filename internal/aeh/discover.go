@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -131,6 +132,7 @@ type DiscoveryState struct {
 	Book        *pendingBook       `json:"pending_book,omitempty"`
 	Promotions  []DiscoveryAction  `json:"promotions,omitempty"`
 	Acceptances []DiscoveryAction  `json:"acceptances,omitempty"`
+	Discards    []DiscoveryAction  `json:"discards,omitempty"` // pending revisions the owner discarded
 	UpdatedAt   time.Time          `json:"updated_at"`
 }
 
@@ -180,6 +182,7 @@ type DiscoveryAttempt struct {
 // the two never loses or doubles it.
 type pendingImport struct {
 	Files        map[string][]byte `json:"files"`
+	Remove       []string          `json:"remove,omitempty"` // files the batch deletes`
 	ExpectedHead string            `json:"expected_head"`
 	Subject      string            `json:"subject"`
 	Log          string            `json:"log"`
@@ -402,10 +405,16 @@ func (d *discoverySession) memRel(name string) string {
 // record saves the state change together with the memory batch that records it, then imports
 // the batch. A crash after the save is finished by the next discovery command.
 func (d *discoverySession) record(files map[string][]byte, subject, log string) error {
+	return d.recordWith(files, nil, subject, log)
+}
+
+// recordWith also removes files (pending revisions) in the same memory commit.
+func (d *discoverySession) recordWith(files map[string][]byte, remove []string, subject, log string) error {
 	p, err := newPendingImport(d.memDir, files, subject, log)
 	if err != nil {
 		return fmt.Errorf("discover %s: %w", d.state.Slug, err)
 	}
+	p.Remove = remove
 	d.state.Pending = p
 	if err := d.save(); err != nil {
 		return err
@@ -459,7 +468,12 @@ func discardPartialImport(dir string, p *pendingImport, session string) error {
 		return err
 	}
 	var paths []string
+	var removed []string
 	for _, e := range strings.Split(strings.TrimRight(out, "\x00"), "\x00") {
+		if len(e) >= 4 && (e[:2] == " D" || e[:2] == "D ") && slices.Contains(p.Remove, e[3:]) {
+			removed = append(removed, e[3:]) // a deletion this batch makes
+			continue
+		}
 		if len(e) < 4 || strings.ContainsAny(e[:2], "RCUD") || e[:2] == "AA" {
 			return nil // renames, copies, deletions and conflicts are not aeh's
 		}
@@ -491,6 +505,14 @@ func discardPartialImport(dir string, p *pendingImport, session string) error {
 		}
 		if inIndex && !(inHead && index == head) && index != string(want) {
 			return nil
+		}
+	}
+	for _, rel := range removed {
+		if _, err := git(dir, "reset", "-q", "--", rel); err != nil {
+			return err
+		}
+		if _, err := git(dir, "checkout", "-q", "HEAD", "--", rel); err != nil {
+			return err
 		}
 	}
 	for _, rel := range paths {
@@ -882,6 +904,14 @@ func (d *discoverySession) acceptReviewed(round int, a *DiscoveryAttempt, out *d
 			r.Files = append(r.Files, strings.TrimPrefix(rel, d.memRel("")))
 		}
 		subject = fmt.Sprintf("discover %s: round %d draft book", st.Slug, round)
+		// Drafts of existing features are revisions: they are imported as spec.next.md.
+		revisions, err := d.revisionFiles(out.files)
+		if err != nil {
+			return err
+		}
+		for rel, b := range revisions {
+			files[rel] = b
+		}
 	}
 	st.Rounds = append(st.Rounds, r)
 	files[d.roundRel(round)] = []byte(d.renderRound(st.Rounds[len(st.Rounds)-1]))
@@ -1068,7 +1098,7 @@ func (d *discoverySession) prompt(round int, feedback string) (string, error) {
 		StackAnswer:  d.stackQuestion(true),
 		Idea:         d.state.Idea,
 		History:      d.history(),
-		Features:     featureIndexBlock(memory),
+		Features:     discoveryFeatureBlock(memory),
 		Research:     d.dcfg.Research,
 		Round:        round,
 		MaxQuestions: d.dcfg.MaxQuestions,

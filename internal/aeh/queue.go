@@ -191,7 +191,7 @@ func queueBlockers(q QueuedApproval, work []PendingWork, snap MemorySnapshot) []
 	for _, w := range work {
 		owns := false
 		if s, ok := snap.Spec(w.Feature); ok {
-			owns = pathsOverlap(s.Paths, q.Paths)
+			owns = pathsOverlap(s.OwnedPaths(), q.Paths)
 		}
 		if w.Feature == q.Feature || q.PathsChanged && (owns || pathsOverlap(w.Paths, q.Paths)) {
 			out = append(out, w)
@@ -224,7 +224,7 @@ func admitWorkExceptQueue(r Repo, feature string, paths []string, id, except str
 			return err
 		}
 		if s, ok := snap.Spec(feature); ok {
-			paths = append(append([]string{}, paths...), s.Paths...)
+			paths = append(append([]string{}, paths...), s.OwnedPaths()...)
 		}
 	}
 	for _, q := range queues {

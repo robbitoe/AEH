@@ -531,7 +531,7 @@ func fingerprint(m MemorySnapshot) string {
 		Specs   []entry
 	}{Present: m.Present}
 	for _, s := range m.Specs {
-		v.Specs = append(v.Specs, entry{s.Feature, s.Version, s.Paths})
+		v.Specs = append(v.Specs, entry{s.Feature, s.Version, s.OwnedPaths()})
 	}
 	b, _ := json.Marshal(v)
 	sum := sha256.Sum256(b)
@@ -556,7 +556,7 @@ func (m MemorySnapshot) ContractFingerprint(declared string) string {
 		DeclaredApproved bool
 	}{Present: m.Present, Declared: declared}
 	for _, s := range m.Specs {
-		v.Owners = append(v.Owners, owner{s.Feature, s.Paths})
+		v.Owners = append(v.Owners, owner{s.Feature, s.OwnedPaths()})
 		if s.Feature == declared {
 			v.DeclaredTitle, v.DeclaredVersion = s.Title, s.Version
 			sum := sha256.Sum256([]byte(s.Body))
@@ -856,6 +856,17 @@ func ApproveSpecWith(r Repo, feature string, opt ApproveOptions) (Spec, bool, er
 	if err := admitWorkExceptQueue(r, feature, spec.Paths, "", except); err != nil {
 		return Spec{}, false, err
 	}
+	// Paths that differ from the approved version's are a new claim: no other feature or
+	// adopted area may own them, and an adopted feature keeps its paths.
+	if spec.Approval != nil {
+		if prior, err := previousApprovedSpec(snap.Dir, spec); err == nil {
+			if ps, err := parseSpec(prior); err == nil && !samePaths(ps.Paths, spec.Paths) {
+				if err := checkPathClaim(snap.Dir, snap, feature, spec.Paths, ps.Paths); err != nil {
+					return Spec{}, false, fmt.Errorf("approve %s: %w", feature, err)
+				}
+			}
+		}
+	}
 	// Criteria are checked before the already-approved shortcut, so an approval never stands
 	// for criteria aeh cannot plan from.
 	crit, ident, err := checkSpecCriteria(snap.Dir, spec)
@@ -1103,6 +1114,7 @@ func implementationRecord(dir string, spec Spec, pinned *Spec, p PendingRecord) 
 		}
 	}
 	im.MaxCriterion = ident.High
+	im.Paths = append([]string(nil), planned.Paths...)
 	if len(crit) > 0 && crit[len(crit)-1].ID > im.MaxCriterion {
 		im.MaxCriterion = crit[len(crit)-1].ID
 	}
@@ -1259,6 +1271,8 @@ type MemoryStatus struct {
 	Work    []PendingWork
 	Queues  []QueuedApproval
 	Errors  []string // recovery/queue errors; readers can still inspect the memory and registry
+	// Revisions maps each feature with a pending revision (spec.next.md) to its session.
+	Revisions map[string]string
 }
 
 func ReadMemoryStatus(r Repo) (MemoryStatus, error) {
@@ -1291,7 +1305,10 @@ func ReadMemoryStatus(r Repo) (MemoryStatus, error) {
 	if err != nil {
 		return st, err
 	}
-	return st, nil
+	if snap.Present {
+		st.Revisions, err = PendingRevisions(r)
+	}
+	return st, err
 }
 
 // LastAccepted returns the newest "accepted on" changelog entry of a spec, or "".
@@ -1339,7 +1356,7 @@ func LintMemory(r Repo) (errs, warnings []string, err error) {
 	}
 	for i, a := range snap.Specs {
 		for _, b := range snap.Specs[i+1:] {
-			if pathsOverlap(a.Paths, b.Paths) {
+			if pathsOverlap(a.OwnedPaths(), b.OwnedPaths()) {
 				warnings = append(warnings, fmt.Sprintf("features %s and %s claim overlapping paths; a change there fails the drift gate", a.Feature, b.Feature))
 			}
 		}
@@ -1623,7 +1640,18 @@ func appendLog(dir string, w memoryWrites, logEntry string) error {
 
 // commit stages exactly the files this command wrote, after checking nobody changed them.
 func (w memoryWrites) commit(dir, subject string, trailers ...string) error {
-	files := make([]string, 0, len(w))
+	return w.commitWith(dir, nil, subject, trailers...)
+}
+
+// commitWith also commits the deletion of removed, files this command deleted.
+func (w memoryWrites) commitWith(dir string, removed []string, subject string, trailers ...string) error {
+	files := make([]string, 0, len(w)+len(removed))
+	for _, rel := range removed {
+		if _, err := os.Lstat(filepath.Join(dir, filepath.FromSlash(rel))); !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("memory commit: %s reappeared while aeh was removing it", rel)
+		}
+		files = append(files, rel)
+	}
 	for rel, wrote := range w {
 		if now, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(rel))); err != nil || !bytes.Equal(now, wrote) {
 			return fmt.Errorf("memory commit: %s changed while aeh was writing it", rel)

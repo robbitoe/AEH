@@ -43,7 +43,7 @@ func newPendingImport(memDir string, files map[string][]byte, subject, log strin
 // touching the batch's files, the batch moves onto the new HEAD (saved first); otherwise the
 // owner decides. The caller clears its pending batch and saves after success.
 func finishImport(r Repo, memDir, session string, p *pendingImport, save func() error) error {
-	b := memoryBatch{Session: session, ExpectedHead: p.ExpectedHead, Files: p.Files, Subject: p.Subject, Log: p.Log}
+	b := memoryBatch{Session: session, ExpectedHead: p.ExpectedHead, Files: p.Files, Remove: p.Remove, Subject: p.Subject, Log: p.Log}
 	_, _, err := importMemoryBatch(r, b)
 	if errors.Is(err, ErrMemoryChanged) {
 		head, herr := git(memDir, "rev-parse", "HEAD")

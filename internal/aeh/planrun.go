@@ -601,9 +601,11 @@ func (p *planner) reserve(id, observed, memoryCommit string) (PlanState, error) 
 		}
 	}
 	switch {
-	case len(st.Delta.New) == 0 && len(st.Delta.Changed) == 0 && len(st.Delta.Removed) == 0:
+	case len(st.Delta.New) == 0 && len(st.Delta.Changed) == 0 && len(st.Delta.Removed) == 0 && !p.spec.PathsMigrating():
 		return st, fmt.Errorf("plan %s: the approved spec adds no criteria; nothing to plan", p.spec.Feature)
 	}
+	// A version that only changes paths reassigns ownership: a plan without implementation
+	// whose record releases the old paths. Moving code needs new or changed criteria.
 	st.NoImplementation = p.kind != PlanCharacterize && st.Delta.noImplementation()
 	if st.Retired, st.Absences, err = p.retirement(&st); err != nil {
 		return st, err
@@ -617,7 +619,7 @@ func (p *planner) reserve(id, observed, memoryCommit string) (PlanState, error) 
 		// The route and reviewers come from the adopted area: every rule that may match
 		// anything below the feature's paths raises them (conservatively, with triage's glob
 		// semantics). The candidate's real files may raise them further.
-		st.Route, st.Roles = applyRules(st.Route, st.Roles, rulesForArea(p.cfg.Triage.Rules, p.spec.Paths))
+		st.Route, st.Roles = applyRules(st.Route, st.Roles, rulesForArea(p.cfg.Triage.Rules, p.spec.OwnedPaths()))
 	}
 	if st.Inputs, err = p.inputsDigestFor(&st); err != nil {
 		return st, err
@@ -1800,7 +1802,16 @@ func (p *planner) recordPlan() error {
 		if crit, _, err = p.spec.Criteria(); err != nil {
 			return fmt.Errorf("%s %s: %w", what, st.ID, err)
 		}
-		note = fmt.Sprintf("%s without code changes; merge %s", revisionSummary(st.Delta), IntegrationBranch(st.ID))
+		summary := revisionSummary(st.Delta)
+		if p.spec.PathsMigrating() {
+			moved := "reassigns its paths to " + strings.Join(p.spec.Paths, ", ")
+			if len(st.Delta.Removed) == 0 && len(st.Delta.clarifiedIDs()) == 0 && len(st.Delta.Recovery) == 0 {
+				summary = moved
+			} else {
+				summary += "; " + moved
+			}
+		}
+		note = fmt.Sprintf("%s without code changes; merge %s", summary, IntegrationBranch(st.ID))
 	}
 	im := &Implementation{Outcome: st.ID, Approval: st.SpecDigest, SpecVersion: st.SpecVersion, Code: st.PlanCommit, ObservedBase: st.ObservedBase,
 		Retired: append([]RetiredTest(nil), st.Retired...)}
@@ -1810,7 +1821,8 @@ func (p *planner) recordPlan() error {
 	// One plan, one predecessor: if another implementation was recorded since the plan was
 	// reserved (and it is not this plan's own record after a crash), the plan is superseded;
 	// it needs a restart, so aeh plan no longer resumes it.
-	if cur, err := LoadMemory(p.repo); err == nil {
+	// Committed memory decides, not an owner's uncommitted edit of implemented.yaml.
+	if cur, err := committedMemory(p.repo); err == nil {
 		if now, ok := cur.Spec(st.Feature); ok && lastCode(now) != st.PriorCode && lastCode(now) != st.PlanCommit {
 			return p.restart(fmt.Sprintf("Another implementation of %s was recorded after plan %s was reserved; this plan is superseded and was not recorded. Plan the feature again: %s %s",
 				st.Feature, st.ID, again, st.Feature))

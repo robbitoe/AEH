@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -299,6 +300,10 @@ type Implementation struct {
 	ObservedBase string `yaml:"observed_base_sha,omitempty" json:",omitempty"`
 	// Retired records this implementation's retirements; older entries remain intact.
 	Retired []RetiredTest `yaml:"retired_tests,omitempty" json:",omitempty"`
+	// Paths are the feature's paths in the approved spec that was implemented. A later
+	// version that changes the paths owns the union of both until it is implemented
+	// (OwnedPaths). Empty in records written before stage 5 L5.
+	Paths []string `yaml:"paths,omitempty,flow" json:",omitempty"`
 }
 
 // ImplementedCriterion is one criterion as implemented, with the sealed tests that check it.
@@ -374,6 +379,11 @@ func (im Implementation) validate() error {
 	if len(im.Criteria) == 0 && len(im.Retired) == 0 {
 		return errors.New("no criteria")
 	}
+	for _, p := range im.Paths {
+		if err := checkSpecPath(p); err != nil {
+			return fmt.Errorf("paths: %w", err)
+		}
+	}
 	if err := validateRetiredTests(im.Retired); err != nil {
 		return err
 	}
@@ -422,6 +432,38 @@ func isSHA256Hex(s string) bool {
 }
 
 // LastImplementation returns the feature's most recent implementation record, if any.
+// OwnedPaths is the code the feature owns: its declared paths, plus, while a version that
+// changed them is not implemented yet, the paths of its last implementation. The union lets
+// that version's plan move or retire the old code; once it is recorded, the old paths are
+// released. Records written before stage 5 L5 carry no paths and add nothing.
+func (s Spec) OwnedPaths() []string {
+	last, ok := s.LastImplementation()
+	if !ok || len(last.Paths) == 0 {
+		return s.Paths
+	}
+	out := append([]string(nil), s.Paths...)
+	for _, p := range last.Paths {
+		if !slices.Contains(out, p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// PathsMigrating reports whether the declared paths differ from those of the last
+// implementation (in either direction), so the feature owns their union.
+func (s Spec) PathsMigrating() bool {
+	last, ok := s.LastImplementation()
+	return ok && len(last.Paths) > 0 && !samePaths(last.Paths, s.Paths)
+}
+
+func samePaths(a, b []string) bool {
+	x, y := slices.Clone(a), slices.Clone(b)
+	slices.Sort(x)
+	slices.Sort(y)
+	return slices.Equal(slices.Compact(x), slices.Compact(y))
+}
+
 func (s Spec) LastImplementation() (Implementation, bool) {
 	if len(s.Implemented) == 0 {
 		return Implementation{}, false
