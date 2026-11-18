@@ -203,7 +203,10 @@ func checkPathClaim(dir string, memory MemorySnapshot, feature string, paths, ba
 	return nil
 }
 
-// pendingRevision reads a feature's pending revision as memory's HEAD has it.
+// pendingRevision reads a feature's pending revision as memory's HEAD has it. The owner may
+// edit its title, paths and text; its provenance (session, draft and base commit) must read as
+// the runner last wrote it, so an edit cannot hand the revision to another session or hide
+// that it is stale.
 func pendingRevision(dir, feature string) (specRevision, []byte, bool, error) {
 	text, ok := gitBlob(dir, "HEAD", revisionRel(feature))
 	if !ok {
@@ -216,7 +219,48 @@ func pendingRevision(dir, feature string) (specRevision, []byte, bool, error) {
 	if rv.Front.Feature != feature {
 		return rv, nil, true, fmt.Errorf("%s names feature %s", revisionRel(feature), rv.Front.Feature)
 	}
+	written, session, err := revisionWrittenAt(dir, feature)
+	if err != nil {
+		return rv, nil, true, err
+	}
+	m, w := rv.Front.Revision, written.Front.Revision
+	if session != "discover/"+m.Session || m.Session != w.Session || m.Draft != w.Draft || m.Base != w.Base || written.Front.Feature != feature {
+		return rv, nil, true, fmt.Errorf("%s: its revision metadata (session, draft_sha256, base_commit) was edited; restore it as aeh wrote it", revisionRel(feature))
+	}
 	return rv, []byte(text), true, nil
+}
+
+// revisionWrittenAt returns the revision as the runner last wrote it: the newest commit that
+// touched spec.next.md with a discovery import marker. Owner commits carry no marker.
+func revisionWrittenAt(dir, feature string) (specRevision, string, error) {
+	rel := revisionRel(feature)
+	out, err := git(dir, "log", "--format=%H%x00%B%x01", "HEAD", "--", rel)
+	if err != nil {
+		return specRevision{}, "", fmt.Errorf("revision history of %s: %w", feature, err)
+	}
+	for _, entry := range strings.Split(out, "\x01") {
+		sha, body, ok := strings.Cut(strings.TrimSpace(entry), "\x00")
+		if !ok {
+			continue
+		}
+		for _, line := range strings.Split(body, "\n") {
+			rest, ok := strings.CutPrefix(strings.TrimSpace(line), "AEH-Import: discover/")
+			if !ok {
+				continue
+			}
+			session, _, _ := strings.Cut(rest, " ")
+			text, ok := gitBlob(dir, sha, rel)
+			if !ok {
+				return specRevision{}, "", fmt.Errorf("%s: the runner's import does not hold it", rel)
+			}
+			rv, err := parseRevision([]byte(text))
+			if err != nil {
+				return specRevision{}, "", fmt.Errorf("%s as aeh wrote it: %w", rel, err)
+			}
+			return rv, "discover/" + session, nil
+		}
+	}
+	return specRevision{}, "", fmt.Errorf("%s was not written by a discovery import; remove it from memory", rel)
 }
 
 // revisionReplaceable reports whether a session may replace a pending revision: only its own,
@@ -369,20 +413,34 @@ func (d *discoverySession) promoteRevision(feature string) (DiscoveryState, erro
 	return *d.state, d.recordWith(files, []string{revisionRel(feature)}, "discover "+d.state.Slug+": promote revision "+feature, "promote revision "+feature+" to "+specRel(feature))
 }
 
-// nextRevisionVersion is one minor version above every version the spec had or the owner
-// approved (a queued approval included), so an approved version never names other content.
+// nextRevisionVersion is one minor version above every version the spec ever had in memory or
+// the owner approved (a queued approval included), so a version never names other content.
 func nextRevisionVersion(dir string, cur Spec) (string, error) {
 	high, err := parseSemver(cur.Version)
 	if err != nil {
 		return "", err
+	}
+	raise := func(version string) {
+		if v, err := parseSemver(version); err == nil && semverLess(high, v) {
+			high = v
+		}
 	}
 	approvals, err := ownerApprovals(dir, cur.Feature)
 	if err != nil {
 		return "", err
 	}
 	for _, a := range approvals {
-		if v, err := parseSemver(a.Version); err == nil && semverLess(high, v) {
-			high = v
+		raise(a.Version)
+	}
+	log, err := git(dir, "log", "--full-history", "--format=%H", "HEAD", "--", specRel(cur.Feature))
+	if err != nil {
+		return "", fmt.Errorf("spec history of %s: %w", cur.Feature, err)
+	}
+	for _, sha := range strings.Fields(log) {
+		if text, ok := gitBlob(dir, sha, specRel(cur.Feature)); ok {
+			if s, err := parseSpec(text); err == nil {
+				raise(s.Version)
+			}
 		}
 	}
 	return bumpVersion(fmt.Sprintf("%d.%d.%d", high[0], high[1], high[2]), "minor")
@@ -505,4 +563,52 @@ func maxCriterionID(crit []SpecCriterion) int {
 		n = max(n, c.ID)
 	}
 	return n
+}
+
+// approvedPathsBase is what an approval's paths are compared with: the paths of the approval in
+// force, or, for a first approval, the adopted area's paths (an adopted feature keeps them) or
+// the spec's own.
+func approvedPathsBase(dir string, spec Spec) ([]string, error) {
+	if spec.Approval != nil {
+		if prior, err := previousApprovedSpec(dir, spec); err == nil {
+			if ps, err := parseSpec(prior); err == nil {
+				return ps.Paths, nil
+			}
+		}
+		return spec.Paths, nil
+	}
+	ident, adopted, err := loadAreaIdentity(dir, spec.Feature)
+	if err != nil {
+		return nil, fmt.Errorf("adopted area %s: %w", spec.Feature, redactErr(err))
+	}
+	if !adopted {
+		return spec.Paths, nil
+	}
+	front, _, err := reconcileArea(dir, spec.Feature, ident)
+	if err != nil {
+		return nil, err
+	}
+	return front.Paths, nil
+}
+
+// legacyImplementationPaths fills the paths of a last implementation recorded before records
+// carried them, from the spec at the memory commit that recorded it, so a later path change
+// still owns the union. A record that cannot be found adds nothing.
+func legacyImplementationPaths(dir string, s *Spec) {
+	n := len(s.Implemented)
+	if n == 0 || len(s.Implemented[n-1].Paths) > 0 {
+		return
+	}
+	last := s.Implemented[n-1]
+	_, commit, ok, err := findRecord(dir, "AEH-Record: "+last.Outcome+" "+last.Code)
+	if err != nil || !ok {
+		return
+	}
+	text, ok := gitBlob(dir, commit, specRel(s.Feature))
+	if !ok {
+		return
+	}
+	if sp, err := parseSpec(text); err == nil {
+		s.Implemented[n-1].Paths = sp.Paths
+	}
 }

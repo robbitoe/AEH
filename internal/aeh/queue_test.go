@@ -416,14 +416,21 @@ func TestAbandonPublishedRevisionCompletesItsRecordAndRefuses(t *testing.T) {
 }
 
 func TestQueueOtherFeaturePromotionAdmission(t *testing.T) {
-	r, _ := newAreaProject(t)
-	// A feature that reaches into the area's paths (claimed before stage 5 checked areas) gives
-	// them up: the queue reserves the old paths until the new version activates.
+	// A feature that reaches into paths later inspected as an adopted area (approved before
+	// the area existed) gives them up: the queue reserves the old paths until the new version
+	// activates, so the area cannot be promoted meanwhile.
+	r := newMemoryProject(t)
 	if _, err := CreateSpec(r, "checkout", "Checkout", []string{"src/checkout/**", "src/billing/**"}); err != nil {
 		t.Fatal(err)
 	}
 	describeSpec(t, r, "checkout", twoCriteria)
 	if _, _, err := ApproveSpec(r, "checkout"); err != nil {
+		t.Fatal(err)
+	}
+	draft := &areaDraft{Front: areaFront{Title: "Billing", Paths: []string{"src/billing/**"}}, Prose: "# Billing\n\nComputes fees.\n"}
+	if _, err := recordAreaObservations(r, "billing", draft, []observationInput{
+		{Text: "Given an order of 100, when billed, then the fee is 2.", Locations: []string{"src/billing/fee.go:42"}},
+	}, obsSHA); err != nil {
 		t.Fatal(err)
 	}
 	registerQueuePlan(t, r, "OLD-1", "checkout")

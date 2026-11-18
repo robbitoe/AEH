@@ -376,7 +376,7 @@ func (im Implementation) validate() error {
 	if im.ObservedBase != "" && !isFullSHA(im.ObservedBase) {
 		return fmt.Errorf("observed_base_sha %q is not a full commit SHA", im.ObservedBase)
 	}
-	if len(im.Criteria) == 0 && len(im.Retired) == 0 {
+	if len(im.Criteria) == 0 && len(im.Retired) == 0 && len(im.Paths) == 0 {
 		return errors.New("no criteria")
 	}
 	for _, p := range im.Paths {

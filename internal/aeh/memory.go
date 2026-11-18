@@ -513,6 +513,7 @@ func loadMemoryDir(dir string) (MemorySnapshot, error) {
 		if s.Implemented, err = readImplementations(filepath.Join(featuresDir, e.Name(), implementedFile)); err != nil {
 			return snap, fmt.Errorf("memory: feature %s: %w", e.Name(), err)
 		}
+		legacyImplementationPaths(dir, &s)
 		snap.Specs = append(snap.Specs, s)
 	}
 	sort.Slice(snap.Specs, func(i, j int) bool { return snap.Specs[i].Feature < snap.Specs[j].Feature })
@@ -856,16 +857,14 @@ func ApproveSpecWith(r Repo, feature string, opt ApproveOptions) (Spec, bool, er
 	if err := admitWorkExceptQueue(r, feature, spec.Paths, "", except); err != nil {
 		return Spec{}, false, err
 	}
-	// Paths that differ from the approved version's are a new claim: no other feature or
-	// adopted area may own them, and an adopted feature keeps its paths.
-	if spec.Approval != nil {
-		if prior, err := previousApprovedSpec(snap.Dir, spec); err == nil {
-			if ps, err := parseSpec(prior); err == nil && !samePaths(ps.Paths, spec.Paths) {
-				if err := checkPathClaim(snap.Dir, snap, feature, spec.Paths, ps.Paths); err != nil {
-					return Spec{}, false, fmt.Errorf("approve %s: %w", feature, err)
-				}
-			}
-		}
+	// The approved paths are a claim: no other feature or adopted area may own them, and an
+	// adopted feature keeps its area's paths.
+	base, err := approvedPathsBase(snap.Dir, spec)
+	if err != nil {
+		return Spec{}, false, fmt.Errorf("approve %s: %w", feature, err)
+	}
+	if err := checkPathClaim(snap.Dir, snap, feature, spec.Paths, base); err != nil {
+		return Spec{}, false, fmt.Errorf("approve %s: %w", feature, err)
 	}
 	// Criteria are checked before the already-approved shortcut, so an approval never stands
 	// for criteria aeh cannot plan from.
@@ -1087,7 +1086,7 @@ func implementationRecord(dir string, spec Spec, pinned *Spec, p PendingRecord) 
 	if err != nil {
 		return nil, fmt.Errorf("feature %s: acceptance criteria: %w", spec.Feature, err)
 	}
-	if len(crit) == 0 && (pinned == nil || len(im.Retired) == 0) {
+	if len(crit) == 0 && (pinned == nil || len(im.Retired) == 0 && !planned.PathsMigrating()) {
 		return nil, fmt.Errorf("feature %s has no acceptance criteria to implement", spec.Feature)
 	}
 	if pinned != nil {

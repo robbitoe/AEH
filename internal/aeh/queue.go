@@ -256,6 +256,28 @@ func blockerNames(work []PendingWork) string {
 }
 
 func admitFeatureImports(r Repo, dir string, files map[string][]byte) error {
+	// Ownership first: a batch prepared before another feature claimed its paths (and
+	// finished after a crash) must not publish a second owner.
+	memory, err := loadMemoryDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, rel := range sortedKeys(files) {
+		if !strings.HasPrefix(rel, "wiki/features/") || !strings.HasSuffix(rel, "/spec.md") {
+			continue
+		}
+		spec, err := parseSpec(string(files[rel]))
+		if err != nil {
+			return err
+		}
+		base := spec.Paths
+		if cur, ok := memory.Spec(spec.Feature); ok {
+			base = cur.Paths
+		}
+		if err := checkPathClaim(dir, memory, spec.Feature, spec.Paths, base); err != nil {
+			return err
+		}
+	}
 	queues, err := listQueues(dir)
 	if err != nil || len(queues) == 0 {
 		return err

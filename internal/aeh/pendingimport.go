@@ -50,7 +50,14 @@ func finishImport(r Repo, memDir, session string, p *pendingImport, save func() 
 		if herr != nil {
 			return herr
 		}
-		if touched := batchFilesChanged(memDir, p.ExpectedHead, head, p.Files); touched != "" {
+		check := map[string][]byte{}
+		for rel, b := range p.Files {
+			check[rel] = b
+		}
+		for _, rel := range p.Remove {
+			check[rel] = nil // a removal must not delete a revision committed since
+		}
+		if touched := batchFilesChanged(memDir, p.ExpectedHead, head, check); touched != "" {
 			return fmt.Errorf("memory changed %s since aeh prepared this step; restore it or commit it back, then run the command again", touched)
 		}
 		p.ExpectedHead = head
