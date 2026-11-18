@@ -557,7 +557,7 @@ func openAdopt(r Repo, feature string) (*adoptSession, func(), error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	unlock, err := lockProject(Repo{Root: main})
+	unlock, err := lockLiveProject(Repo{Root: main})
 	if err != nil {
 		return nil, nil, err
 	}

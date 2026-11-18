@@ -13,11 +13,12 @@ import (
 
 // Outcome and task statuses. Kept deliberately few.
 const (
-	StatusPending  = "pending"
-	StatusRunning  = "running"
-	StatusBlocked  = "blocked"
-	StatusAccepted = "accepted"
-	StatusDone     = "done"
+	StatusPending   = "pending"
+	StatusRunning   = "running"
+	StatusBlocked   = "blocked"
+	StatusAccepted  = "accepted"
+	StatusDone      = "done"
+	StatusAbandoned = "abandoned"
 )
 
 // Attempt is one try of a task with one profile.
@@ -67,6 +68,10 @@ type State struct {
 	RestartRequired bool        `json:"restart_required,omitempty"`
 	ID              string      `json:"id"`
 	Title           string      `json:"title"`
+	Feature         string      `json:"feature,omitempty"`
+	Paths           []string    `json:"paths,omitempty"`
+	Change          string      `json:"change,omitempty"`
+	Changelog       string      `json:"changelog,omitempty"`
 	Status          string      `json:"status"`
 	Base            string      `json:"base"`
 	Head            string      `json:"verified_head"`
@@ -162,6 +167,16 @@ func ListStates(r Repo) ([]State, error) {
 
 // Answer records the owner's reply to a blocked outcome and makes it runnable again.
 func Answer(r Repo, id, text string) error {
+	main, err := MainCheckout(r)
+	if err != nil {
+		return err
+	}
+	r = Repo{Root: main}
+	unlockProject, err := lockLiveProject(r)
+	if err != nil {
+		return err
+	}
+	defer unlockProject()
 	unlock, err := lockOutcome(r, id)
 	if err != nil {
 		return err
@@ -178,6 +193,9 @@ func Answer(r Repo, id, text string) error {
 	s, err := loadState(r, id)
 	if err != nil {
 		return err
+	}
+	if s.Status == StatusAbandoned {
+		return fmt.Errorf("outcome %s is abandoned and cannot receive answers", id)
 	}
 	if s.Version != 2 {
 		return errors.New("pre-stage-2 state cannot resume; relaunch with another outcome ID")

@@ -48,9 +48,22 @@ type generatedRun struct {
 
 // RunOutcome executes an outcome from aeh/outcomes/<id>.yaml until it is accepted or blocked.
 func RunOutcome(ctx context.Context, r Repo, id string, log io.Writer) (State, error) {
+	main, err := MainCheckout(r)
+	if err != nil {
+		return State{}, err
+	}
+	r = Repo{Root: main}
+	unlock, err := lockLiveProject(r)
+	if err != nil {
+		return State{}, err
+	}
+	defer unlock()
 	plan, generated, err := LoadPlanState(r, id)
 	if err != nil {
 		return State{}, err
+	}
+	if plan.Status == StatusAbandoned {
+		return State{}, fmt.Errorf("%s is abandoned and cannot resume", id)
 	}
 	if generated && plan.Kind == PlanCharacterize {
 		return State{}, characterizeRunError(id)
@@ -102,6 +115,16 @@ func characterizeRunError(id string) error {
 // link declares the feature the change modifies, enforced by the drift gate.
 // A nonempty route overrides model triage, just like route: in an outcome.
 func Do(ctx context.Context, r Repo, text string, paths []string, profile string, link MemoryLink, log io.Writer, route string) (State, error) {
+	main, err := MainCheckout(r)
+	if err != nil {
+		return State{}, err
+	}
+	r = Repo{Root: main}
+	unlock, err := lockLiveProject(r)
+	if err != nil {
+		return State{}, err
+	}
+	defer unlock()
 	if route != "" && !validRoute(route) {
 		return State{}, errors.New("route must be trivial, change or new")
 	}
@@ -134,12 +157,17 @@ func Do(ctx context.Context, r Repo, text string, paths []string, profile string
 
 // run executes an outcome; gen is the pinned plan provenance of a generated outcome, or nil.
 func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer, gen *generatedRun) (State, error) {
-	// One run or memory write at a time per project, across linked worktrees.
-	unlockProject, err := lockProject(r)
-	if err != nil {
+	// RunOutcome and Do hold the project lock before reading any work registry.
+	var paths []string
+	for _, t := range o.Tasks {
+		paths = append(paths, t.Paths...)
+	}
+	if len(paths) == 0 {
+		paths = []string{"**"}
+	}
+	if err := admitWork(r, o.Feature, paths, o.ID); err != nil {
 		return State{}, err
 	}
-	defer unlockProject()
 	unlock, err := lockOutcome(r, o.ID)
 	if err != nil {
 		return State{}, err
@@ -153,6 +181,9 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer, gen 
 	if err != nil {
 		return st, err
 	}
+	if st.Status == StatusAbandoned {
+		return st, fmt.Errorf("%s is abandoned and cannot resume", o.ID)
+	}
 	if st.Version != 2 {
 		return st, errors.New("pre-stage-2 state cannot resume; relaunch with another outcome ID")
 	}
@@ -162,6 +193,7 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer, gen 
 	if st.Title == "" {
 		st.Title = o.Title
 	}
+	st.Feature, st.Paths, st.Change, st.Changelog = o.Feature, paths, o.Change, o.Changelog
 	switch st.Status {
 	case StatusAccepted:
 		return st, fmt.Errorf("%s is already accepted on branch %s", o.ID, st.Branch)
@@ -382,6 +414,9 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer, gen 
 	report := ru.writeReport()
 	ru.logf("%s accepted. Branch %s is ready to review and merge. Report: %s", o.ID, branch, report)
 	ru.notify("accepted", fmt.Sprintf("%s accepted on branch %s", o.ID, branch))
+	if err := reconcileQueues(r); err != nil {
+		ru.logf("warning: reconcile queues after acceptance: %v", err)
+	}
 	return st, nil
 }
 
@@ -1241,11 +1276,6 @@ func (ru *runner) recordMemory(p PendingRecord, pendingErr error) {
 			expected = "" // pinned: the record checks the implementation against the pin instead
 		}
 		ru.state.MemoryVersion, ru.state.MemoryCommit, err = RecordChange(ru.repo, p, expected)
-		if err == nil {
-			if clearErr := ClearPending(ru.repo, p.OutcomeID); clearErr != nil {
-				err = fmt.Errorf("clear pending record: %w", clearErr)
-			}
-		}
 	}
 	ru.state.MemoryError = ""
 	if err != nil {
@@ -1254,6 +1284,13 @@ func (ru *runner) recordMemory(p PendingRecord, pendingErr error) {
 	ru.logf("%s", ru.memoryRecordSummary())
 	if err := saveState(ru.repo, ru.state); err != nil {
 		ru.logf("warning: save memory record result: %v", err)
+		return // keep the pending record until the acceptance result is durable
+	}
+	if err == nil {
+		if clearErr := ClearPending(ru.repo, p.OutcomeID); clearErr != nil {
+			ru.state.MemoryError = fmt.Sprintf("clear pending record: %v", clearErr)
+			_ = saveState(ru.repo, ru.state)
+		}
 	}
 }
 

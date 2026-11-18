@@ -55,6 +55,8 @@ Sends a test event to `notify.webhook` in `aeh/config.yaml`.
 
 `aeh discover promote <slug> <feature>` creates `wiki/features/<feature>/spec.md` at 0.1.0 from a committed draft, unapproved. Its paths must not overlap an existing feature. Approve it with `aeh memory approve`.
 
+Promotion is refused if its feature or paths are reserved by a queued approval.
+
 ### `aeh discover accept`
 
 `aeh discover accept <slug> vision|data` copies the draft vision or data model into `wiki/vision.md` or `wiki/data.md`. When the document exists, it goes to `.next.md` for the owner to merge.
@@ -96,9 +98,13 @@ Replaces `wiki/system.md` with the pending `wiki/system.next.md` in one memory c
 
 `aeh adopt promote <feature>` creates an unapproved 0.1.0 spec with only the `keep` observations, keeping their numbers (gaps included). Every observation must be decided first. Retired numbers are never reused.
 
+Promotion is refused if its feature or paths are reserved by a queued approval.
+
 ### `aeh adopt seal`
 
 `aeh adopt seal <feature>` writes characterization tests of an approved adopted feature: the plan of `aeh plan` in a `characterize` mode with no task. Each new test must pass on the existing code alone and together, and the previous acceptance suite must still pass. QA and security review it. The verified commit is published on `aeh/<ID>` and recorded in memory as the first implementation (`code_sha` is that commit, `observed_base_sha` the inspected one). There is nothing to implement: merge the branch. Exit `3` when blocked; answer with `aeh answer <ID>` and run it again.
+
+New characterization work is refused while a queued approval reserves the feature or its paths. A registered blocker may resume; abandoned plans cannot resume.
 
 ### `aeh adopt status`
 
@@ -116,11 +122,15 @@ Lists the inventory state, each area as observed, confirmed, promoted, character
 
 A plan pins memory as it was when the plan was reserved. It, and the `aeh run` of its outcome, read the spec, criteria, last implementation and every feature's paths from that point, so edits and newer approvals never reach them; the implementation is recorded against the planned version.
 
+A newer approval with pending work is queued. New plans affecting the queued feature or reserved paths are refused; a registered blocker continues from its pinned version. Abandoned plans are terminal.
+
 ## Execution
 
 ### `aeh run`
 
 `aeh run <ID>` runs an outcome until it is accepted or blocked: per task, an agent attempt, then the gates (sealed tests hash, scope, drift, build, test, acceptance) and the route's reviewers, with the ladder of retries and profiles. Accepted work stays on `aeh/<ID>` for the owner to merge; memory records the implementation. A characterization is refused: merge it. Exit `0` accepted, `3` blocked, `1` error.
+
+A new outcome linked to a queued feature or touching its reserved paths is refused under the project lock and names the queue. Registered blockers may resume against the old version. Abandoned outcomes cannot resume.
 
 ### `aeh do`
 
@@ -131,9 +141,17 @@ A plan pins memory as it was when the plan was reserved. It, and the `aeh run` o
 - `--route trivial|change|new` declares the route instead of model triage; rules may raise it, never lower it.
 - `--feature <f> --change patch|minor|major --note "..."` names the feature the change modifies; the drift gate checks it and memory records it.
 
+A queued approval refuses new changes linked through `--feature` or touching its reserved paths, before agents run.
+
 ### `aeh answer`
 
 `aeh answer <ID> "<text>"` answers a blocked outcome or plan so it can run again (`aeh run`, `aeh plan` or `aeh adopt seal`).
+
+Abandoned work refuses answers.
+
+### `aeh abandon`
+
+`aeh abandon <ID>` abandons a registered unfinished plan or run. It persists intent first, marks both states terminal `abandoned`, records an idempotent memory log entry, and reconciles queued approvals. Its branch `aeh/<ID>` and all run/report evidence remain. Accepted work is kept: the command completes any pending acceptance record, then refuses to abandon. No abandoned attempt counts as an implementation. Interrupted intents recover at the next command that reads the state, under the project lock followed by the outcome lock.
 
 ## Memory: local and private (`.aeh/memory/`)
 
@@ -153,9 +171,17 @@ An approved version never changes: to approve new content, raise `version:` in t
 
 `--clarify AC-<n>,...|none`: A clarification is a changed criterion whose new text only rewords the old one. Mark it when approving with `--clarify AC-<n>,...`: its replacement tests must pass on the base, live in files apart from tests that must fail, and the QA reviewer must answer `EQUIVALENT AC-<n>: yes` for each one before the verdict (a missing, repeated or malformed line invalidates the review; `no` rejects it). The marks are bound to the exact old and new texts; `--clarify none` removes them. Without the flag, an approval that is still current keeps its marks, and a new approval has none.
 
+With pending work, approval is recorded but queued: the output names every blocker and the approval in force remains the previous one. Implementation plans block until a run is accepted and recorded; characterizations and revisions finish when logged. Stopped runs and pending memory records also block. Path changes add pending work of other features owning or touching old or new paths. The target is preserved in memory's `wiki/features/<feature>/queue.json`; `spec.md` and `approval.yaml` continue to describe the version in force. Do not edit the version in force while queued. A queued version is an approved version for the immutable version rule.
+
+While queued, a second approval of the feature is refused. New work affecting the feature or reserved paths, and creation, approval or promotion of another feature claiming those paths, is refused and names the queue. Finish registered blockers with `plan`/`run`, or use `aeh abandon <ID>`. After their acceptance records or abandonment, AEH recomputes blockers under the project lock and activates only when the set is empty. Acceptance records made while queued are preserved. Activation recovers after interruption when a command next reads the queue. An implementation completed meanwhile may make the approved delta stale; reapprove it before planning.
+
+If an old acceptance record reaches or passes the queued version, activation waits. Only in this collision case, copy the same target spec from `queue.json` into `spec.md`, raise only `version:` above both versions, commit in memory and approve again to replace the target. Different target content remains forbidden. See the README's queued-approval recovery instructions for restoring owner edits and handling interrupted journals.
+
 ### `aeh memory status`
 
-Lists features with version, approval and last implementation, uncommitted memory changes and pending records.
+Lists each feature's version in force, approval, last implementation, pending work and queued approvals with their blockers, plus uncommitted memory changes and pending records. Recovers interrupted activation and abandonment first.
+
+Blocked activations show `activation waiting: <reason>` and emit warnings without failing unrelated commands or accepted work. Status prints queue and transaction recovery errors alongside useful state. It never overwrites an owner's edited version in force.
 
 ### `aeh memory lint`
 

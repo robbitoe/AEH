@@ -445,6 +445,9 @@ func DiscoverPromote(r Repo, slug, feature string) (_ DiscoveryState, err error)
 	if err != nil {
 		return *d.state, err
 	}
+	if err := admitWork(d.repo, feature, f.Paths, ""); err != nil {
+		return *d.state, err
+	}
 	digest := outputDigest("discovery-promotion", map[string][]byte{feature: b})
 	for _, a := range d.state.Promotions {
 		if a.Name == feature && a.Content == digest {

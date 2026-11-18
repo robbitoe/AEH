@@ -146,7 +146,7 @@ func openAdoption(r Repo) (*adoptSession, func(), error) {
 		return nil, nil, err
 	}
 	r = Repo{Root: main}
-	unlock, err := lockProject(r)
+	unlock, err := lockLiveProject(r)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -889,6 +889,9 @@ func adoptAreaNames(memDir string) ([]string, error) {
 }
 
 func checkAreaOwnership(r Repo, memDir, feature string, paths []string) error {
+	if err := admitWork(r, feature, paths, ""); err != nil {
+		return err
+	}
 	memory, err := LoadMemory(r)
 	if err != nil {
 		return err
@@ -1247,6 +1250,9 @@ func AdoptPromote(r Repo, feature string) (err error) {
 	}
 	front, prose, err := reconcileArea(a.memDir, feature, ident)
 	if err != nil {
+		return err
+	}
+	if err := admitWork(a.repo, feature, front.Paths, ""); err != nil {
 		return err
 	}
 	var active []string
