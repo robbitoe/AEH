@@ -897,7 +897,7 @@ func checkAreaOwnership(r Repo, memDir, feature string, paths []string) error {
 		return err
 	}
 	for _, s := range memory.Specs {
-		if s.Feature == feature || pathsOverlap(paths, s.Paths) {
+		if s.Feature == feature || pathsOverlap(paths, s.OwnedPaths()) {
 			return fmt.Errorf("area %s paths overlap existing feature %s", feature, s.Feature)
 		}
 	}

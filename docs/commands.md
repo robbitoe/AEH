@@ -55,7 +55,15 @@ Sends a test event to `notify.webhook` in `aeh/config.yaml`.
 
 `aeh discover promote <slug> <feature>` creates `wiki/features/<feature>/spec.md` at 0.1.0 from a committed draft, unapproved. Its paths must not overlap an existing feature. Approve it with `aeh memory approve`.
 
+For an existing feature, a draft of the book is a revision. When the book is imported, the revision is validated against the feature's history (kept criteria keep their numbers, removed numbers are never reused, new criteria go above the highest number ever used; new paths must not belong to another feature or to an adopted area, and an adopted feature keeps its paths) and written to `wiki/features/<feature>/spec.next.md`, with the session, the draft digest, the memory commit it revises and the criteria diff. From then on `spec.next.md` is the revision's only source: edit and commit it in memory to change it. A feature has one pending revision at a time; another session's revision of it is refused. `aeh discover promote` then writes it as the next, unapproved version of `spec.md` (one minor version above every version the spec had or the owner approved), keeps the changelog, history and implementations, adds a changelog line with `from_revision`, and removes `spec.next.md` in the same memory commit. It is refused if `spec.md` changed after the revision was imported (discard it and revise again). Approve the new version with `aeh memory approve` (and `--clarify` when a change only rewords a criterion).
+
+When a version changes the feature's paths, the feature owns the union of the old and new paths until that version is implemented, so its plan may move or retire the old code and the drift gate counts both. Moving code needs new or changed criteria; a version that only changes paths is planned as a plan without implementation that reassigns ownership. Once it is recorded, the old paths are released and another feature may claim them.
+
 Promotion is refused if its feature or paths are reserved by a queued approval.
+
+### `aeh discover discard`
+
+`aeh discover discard <slug> <feature>` removes the feature's pending revision from this session (`spec.next.md`) with a memory commit. Use it to unblock a stale revision or one you do not want.
 
 ### `aeh discover accept`
 
@@ -179,7 +187,7 @@ If an old acceptance record reaches or passes the queued version, activation wai
 
 ### `aeh memory status`
 
-Lists each feature's version in force, approval, last implementation, pending work and queued approvals with their blockers, plus uncommitted memory changes and pending records. Recovers interrupted activation and abandonment first.
+Lists each feature's version in force, approval, last implementation, pending revision (`spec.next.md` and its discovery session), pending work and queued approvals with their blockers, plus uncommitted memory changes and pending records. Recovers interrupted activation and abandonment first.
 
 Blocked activations show `activation waiting: <reason>` and emit warnings without failing unrelated commands or accepted work. Status prints queue and transaction recovery errors alongside useful state. It never overwrites an owner's edited version in force.
 

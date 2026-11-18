@@ -402,6 +402,7 @@ type memoryBatch struct {
 	Session      string            // who imports: one or two slugs joined by "/", e.g. "discover/shop"
 	ExpectedHead string            // the memory HEAD the batch was prepared against
 	Files        map[string][]byte // memory-relative paths under wiki/, final bytes
+	Remove       []string          // memory-relative files the batch deletes (pending revisions only)
 	Subject      string            // memory commit subject
 	Log          string            // log entry text; aeh adds the date and the session
 }
@@ -409,7 +410,20 @@ type memoryBatch struct {
 var batchSession = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*(/[a-z0-9]+(-[a-z0-9]+)*)?$`)
 
 // batchDigest identifies a batch by its files alone, so a retry on another day still matches.
-func batchDigest(files map[string][]byte) string { return outputDigest("memory-batch", files) }
+// Removals are part of it under a key no written file can have (those are under wiki/).
+func batchDigest(files map[string][]byte, remove ...string) string {
+	if len(remove) == 0 {
+		return outputDigest("memory-batch", files)
+	}
+	all := map[string][]byte{}
+	for rel, b := range files {
+		all[rel] = b
+	}
+	for _, rel := range remove {
+		all["remove:"+rel] = nil
+	}
+	return outputDigest("memory-batch", all)
+}
 
 func importMarker(session, digest string) string { return "AEH-Import: " + session + " " + digest }
 
@@ -421,7 +435,7 @@ func importMemoryBatch(r Repo, b memoryBatch) (commit string, imported bool, err
 	if err := b.validate(); err != nil {
 		return "", false, err
 	}
-	digest := batchDigest(b.Files)
+	digest := batchDigest(b.Files, b.Remove...)
 	marker := importMarker(b.Session, digest)
 	dir, err := MemoryDir(r)
 	if err != nil {
@@ -473,24 +487,44 @@ func importMemoryBatch(r Repo, b memoryBatch) (commit string, imported bool, err
 			return fail(err)
 		}
 	}
+	var removed []string
+	restoreRemoved := func(err error) error {
+		for _, rel := range removed {
+			_, _ = git(dir, "reset", "-q", "HEAD", "--", rel)
+			_, _ = git(dir, "checkout", "-q", "HEAD", "--", rel)
+		}
+		return err
+	}
+	for _, rel := range b.Remove {
+		if _, ok := gitBlob(dir, "HEAD", rel); !ok {
+			return fail(restoreRemoved(fmt.Errorf("%s is not in memory; nothing to remove", rel)))
+		}
+		if err := unchangedSinceHead(dir, rel); err != nil {
+			return fail(restoreRemoved(err))
+		}
+		if err := os.Remove(filepath.Join(dir, filepath.FromSlash(rel))); err != nil {
+			return fail(restoreRemoved(err))
+		}
+		removed = append(removed, rel)
+	}
 	after, err := loadMemoryDir(dir)
 	if err != nil {
-		return fail(err)
+		return fail(restoreRemoved(err))
 	}
 	if index := []byte(renderIndex(after.Specs)); !fileEquals(filepath.Join(dir, "wiki", "index.md"), index) {
 		if err := w.write(dir, "wiki/index.md", index); err != nil {
-			return fail(err)
+			return fail(restoreRemoved(err))
 		}
 	}
 	today := memoryNow().UTC().Format("2006-01-02")
 	if err := appendLog(dir, w, "["+today+"] import | "+b.Session+" | "+b.Log); err != nil {
-		return fail(err)
+		return fail(restoreRemoved(err))
 	}
 	if now, err := git(dir, "rev-parse", "HEAD"); err != nil || now != b.ExpectedHead {
-		return fail(fmt.Errorf("%w while aeh was writing the batch", ErrMemoryChanged))
+		return fail(restoreRemoved(fmt.Errorf("%w while aeh was writing the batch", ErrMemoryChanged)))
 	}
-	if err := w.commit(dir, b.Subject, marker); err != nil {
-		return fail(err)
+	if err := w.commitWith(dir, removed, b.Subject, marker); err != nil {
+		return fail(restoreRemoved(err))
 	}
 	commit, err = git(dir, "rev-parse", "HEAD")
 	if err != nil {
@@ -519,6 +553,11 @@ func verifyImported(dir, commit string, b memoryBatch) error {
 			return fmt.Errorf("does not hold %s as the batch wrote it", rel)
 		}
 	}
+	for _, rel := range b.Remove {
+		if _, ok := gitBlob(dir, commit, rel); ok {
+			return fmt.Errorf("still holds %s, which the batch removes", rel)
+		}
+	}
 	return nil
 }
 
@@ -544,6 +583,14 @@ func (b memoryBatch) validate() error {
 	if len(b.Files) == 0 {
 		return fmt.Errorf("import %s: the batch has no files", b.Session)
 	}
+	for _, rel := range b.Remove {
+		if !isRevisionPath(rel) {
+			return fmt.Errorf("import %s: %s: an import removes only a pending revision", b.Session, rel)
+		}
+		if _, ok := b.Files[rel]; ok {
+			return fmt.Errorf("import %s: %s is both written and removed", b.Session, rel)
+		}
+	}
 	if err := checkCaseAliases(sortedKeys(b.Files), nil); err != nil {
 		return fmt.Errorf("import %s: %w", b.Session, err)
 	}
@@ -568,10 +615,16 @@ func checkBatchPath(rel string) error {
 	if len(segs) < 2 || segs[0] != "wiki" {
 		return errors.New("imports write only under wiki/")
 	}
-	if strings.EqualFold(segs[1], "features") && (segs[1] != "features" || len(segs) != 4 || segs[3] != "spec.md" || checkSlug(segs[2]) != nil) {
-		return errors.New("under wiki/features/ an import writes only <feature>/spec.md")
+	if strings.EqualFold(segs[1], "features") && (segs[1] != "features" || len(segs) != 4 || (segs[3] != "spec.md" && segs[3] != revisionFile) || checkSlug(segs[2]) != nil) {
+		return errors.New("under wiki/features/ an import writes only <feature>/spec.md or <feature>/" + revisionFile)
 	}
 	return nil
+}
+
+// isRevisionPath reports whether rel is a feature's pending revision.
+func isRevisionPath(rel string) bool {
+	segs := strings.Split(rel, "/")
+	return len(segs) == 4 && segs[0] == "wiki" && segs[1] == "features" && checkSlug(segs[2]) == nil && segs[3] == revisionFile
 }
 
 func checkBatchLine(s string, max int) error {

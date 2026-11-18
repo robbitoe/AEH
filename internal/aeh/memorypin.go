@@ -20,6 +20,19 @@ func memoryHeadCommit(dir string) (string, error) {
 	return head, nil
 }
 
+// committedMemory reads memory as its HEAD commit has it, ignoring uncommitted edits.
+func committedMemory(r Repo) (MemorySnapshot, error) {
+	dir, err := MemoryDir(r)
+	if err != nil {
+		return MemorySnapshot{}, err
+	}
+	head, err := memoryHeadCommit(dir)
+	if err != nil {
+		return MemorySnapshot{}, err
+	}
+	return loadMemoryAt(dir, head)
+}
+
 // loadMemoryAt reads every spec as memory had it at a commit of its own history. The commit
 // must still be an ancestor of memory's HEAD: rewritten history voids the pin.
 func loadMemoryAt(dir, commit string) (MemorySnapshot, error) {
@@ -98,6 +111,7 @@ func specAt(dir, commit, feature string) (Spec, error) {
 		}
 	}
 	s.rev = commit
+	legacyImplementationPaths(dir, &s)
 	return s, nil
 }
 
