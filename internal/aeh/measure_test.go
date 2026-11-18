@@ -8,6 +8,36 @@ import (
 	"testing"
 )
 
+// The final check compares checked-out sealed files with their Git objects byte for
+// byte, tolerating only CRLF line endings for LF blobs.
+func TestGateSealedCheckout(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q")
+	mustGit(t, dir, "config", "core.autocrlf", "false")
+	write(t, dir, "tests/acc/a.test.js", "ok\nok\n")
+	write(t, dir, "tests/acc/b.test.js", "raw\r\nkeep\r\n")
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "seal")
+	head := mustGit(t, dir, "rev-parse", "HEAD")
+	paths := []string{"tests/acc"}
+	check := func(name string, pass bool, retired []string, prepare func()) {
+		t.Helper()
+		write(t, dir, "tests/acc/a.test.js", "ok\nok\n")
+		write(t, dir, "tests/acc/b.test.js", "raw\r\nkeep\r\n")
+		_ = os.Remove(filepath.Join(dir, "tests", "acc", "extra.test.js"))
+		prepare()
+		if g := gateSealedCheckout(dir, dir, head, retired, paths); g.Passed != pass {
+			t.Fatalf("%s: passed=%t: %s", name, g.Passed, g.Output)
+		}
+	}
+	check("identical", true, nil, func() {})
+	check("crlf conversion", true, nil, func() { write(t, dir, "tests/acc/a.test.js", "ok\r\nok\r\n") })
+	check("substituted", false, nil, func() { write(t, dir, "tests/acc/a.test.js", "pass\n") })
+	check("crlf blob changed", false, nil, func() { write(t, dir, "tests/acc/b.test.js", "raw\nkeep\n") })
+	check("extra file", false, nil, func() { write(t, dir, "tests/acc/extra.test.js", "x\n") })
+	check("retired present", false, []string{"tests/acc/a.test.js"}, func() {})
+}
+
 // A checkout that converts line endings (core.autocrlf, eol attributes) changes the
 // sealed files on disk but not their Git objects. The final check of a generated run
 // must accept it: found by the stage 5 measurement with Git for Windows defaults.

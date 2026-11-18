@@ -77,7 +77,7 @@ notify:
 profiles:
   medio:
     provider: openai
-    command: ["codex", "exec", "--sandbox", "workspace-write", "--json", "-"]
+    command: ["codex", "exec", "--sandbox", "workspace-write", "-"]
     stdin: true
     timeout_minutes: 30
     # quota_exit_codes: []  # Set only when the CLI documents a distinct quota exit code.

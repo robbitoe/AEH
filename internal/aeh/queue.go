@@ -616,7 +616,7 @@ func belowQueuedTarget(dir, feature, from, version, current string) string {
 		return version
 	}
 	p := mustSemver(patch)
-	if cur, err := parseSemver(current); err == nil && semverLess(p, cur) || !semverLess(p, target) {
+	if cur, err := parseSemver(current); err == nil && !semverLess(cur, p) || !semverLess(p, target) {
 		return version
 	}
 	return patch

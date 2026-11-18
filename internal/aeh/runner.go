@@ -1093,10 +1093,10 @@ func (ru *runner) finalCheck(ctx context.Context) (bool, string, error) {
 	gates := []GateResult{}
 	if ru.seal != nil {
 		if ru.generated != nil {
-			// Generated seals hash Git objects: the sealed gate checks them at head, and
-			// verifyCheckout above proved the worktree matches head. Hashing the checked-out
-			// files instead would fail whenever Git converts line endings on checkout.
 			gates = append(gates, ru.sealedGate(ru.state.Base, head))
+			if gates[len(gates)-1].Passed {
+				gates = append(gates, gateSealedCheckout(r.Root, wt, head, ru.generated.Manifest.Retired, ru.generated.Paths))
+			}
 		} else {
 			gates = append(gates, gateHash(wt, *ru.seal, o.Acceptance))
 		}
