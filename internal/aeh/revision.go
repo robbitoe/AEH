@@ -592,23 +592,33 @@ func approvedPathsBase(dir string, spec Spec) ([]string, error) {
 }
 
 // legacyImplementationPaths fills the paths of a last implementation recorded before records
-// carried them, from the spec at the memory commit that recorded it, so a later path change
-// still owns the union. A record that cannot be found adds nothing.
+// carried them, from the approved spec it implemented: the newest spec in memory history whose
+// approval digest is the record's. (The spec at the record commit may already be the owner's
+// next draft.) A spec that cannot be found adds nothing.
 func legacyImplementationPaths(dir string, s *Spec) {
 	n := len(s.Implemented)
 	if n == 0 || len(s.Implemented[n-1].Paths) > 0 {
 		return
 	}
-	last := s.Implemented[n-1]
-	_, commit, ok, err := findRecord(dir, "AEH-Record: "+last.Outcome+" "+last.Code)
-	if err != nil || !ok {
+	want := s.Implemented[n-1].Approval
+	args := []string{"log", "--full-history", "--format=%H"}
+	if s.rev != "" {
+		args = append(args, s.rev)
+	} else {
+		args = append(args, "HEAD")
+	}
+	log, err := git(dir, append(args, "--", specRel(s.Feature))...)
+	if err != nil {
 		return
 	}
-	text, ok := gitBlob(dir, commit, specRel(s.Feature))
-	if !ok {
-		return
-	}
-	if sp, err := parseSpec(text); err == nil {
-		s.Implemented[n-1].Paths = sp.Paths
+	for _, sha := range strings.Fields(log) {
+		text, ok := gitBlob(dir, sha, specRel(s.Feature))
+		if !ok {
+			continue
+		}
+		if sp, err := parseSpec(text); err == nil && approvalDigest(sp.Title, sp.Paths, sp.Body) == want {
+			s.Implemented[n-1].Paths = sp.Paths
+			return
+		}
 	}
 }

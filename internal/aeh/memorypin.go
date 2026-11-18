@@ -110,8 +110,8 @@ func specAt(dir, commit, feature string) (Spec, error) {
 			return Spec{}, fmt.Errorf("memory at %s: feature %s: %w", short(commit), feature, err)
 		}
 	}
-	legacyImplementationPaths(dir, &s)
 	s.rev = commit
+	legacyImplementationPaths(dir, &s)
 	return s, nil
 }
 

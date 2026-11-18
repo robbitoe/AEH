@@ -68,6 +68,9 @@ func TestLegacyImplementationPathsFromHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	recordImplementation(t, r, spec, "PAY-1", fakeSHA('a'))
+	// The owner's next draft (new paths) is committed before the legacy record lands, so the
+	// spec at the record commit is the draft, not what was implemented.
+	editSpec(t, r, "pay", "paths: [src/pay/**]", "paths: [lib/pay/**]")
 	dir := memDir(t, r)
 	p := filepath.Join(dir, filepath.FromSlash(implementedRel("pay")))
 	var kept []string
@@ -79,8 +82,7 @@ func TestLegacyImplementationPathsFromHistory(t *testing.T) {
 	if err := os.WriteFile(p, []byte(strings.Join(kept, "\n")), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "a record from before stage 5 L5")
-	editSpec(t, r, "pay", "paths: [src/pay/**]", "paths: [lib/pay/**]")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "record pay (PAY-1)\n\nAEH-Record: PAY-1 "+fakeSHA('a'))
 	snap, err := LoadMemory(r)
 	if err != nil {
 		t.Fatal(err)
