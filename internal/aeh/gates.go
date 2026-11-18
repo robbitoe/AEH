@@ -159,6 +159,61 @@ func sealedGitContents(root, commit string, paths []string) (map[string][]byte, 
 	return contents, nil
 }
 
+// gateSealedCheckout fails if the checked-out sealed files differ from their Git objects
+// at commit, the ones the sealed gate verified. Generated seals hash Git objects, so a
+// checkout that converts line endings (core.autocrlf, eol attributes) must not fail:
+// only CRLF for LF in a blob without carriage returns is tolerated. Any other difference,
+// such as a smudge filter's substitution, an extra file or a retired path on disk, fails.
+func gateSealedCheckout(root, wt, commit string, retired, paths []string) GateResult {
+	g := GateResult{Name: "hash"}
+	for _, file := range retired {
+		if e := checkPlanTestPath(file); e != nil {
+			g.Output = e.Error()
+			return g
+		}
+		if _, e := os.Lstat(filepath.Join(wt, filepath.FromSlash(file))); !errors.Is(e, os.ErrNotExist) {
+			g.Output = "retired acceptance path must remain absent: " + file
+			return g
+		}
+	}
+	want, err := sealedGitContents(root, commit, paths)
+	if err != nil {
+		g.Output = "acceptance tests unreadable: " + err.Error()
+		return g
+	}
+	_, files, err := hashPaths(wt, paths)
+	if err != nil {
+		g.Output = "acceptance tests unreadable: " + err.Error()
+		return g
+	}
+	modified := "acceptance tests were modified; they are sealed and must not change"
+	if len(files) != len(want) {
+		g.Output = modified
+		return g
+	}
+	for _, f := range files {
+		blob, ok := want[f.Path]
+		if !ok {
+			g.Output = modified
+			return g
+		}
+		disk, err := os.ReadFile(filepath.Join(wt, filepath.FromSlash(f.Path)))
+		if err != nil {
+			g.Output = "acceptance tests unreadable: " + err.Error()
+			return g
+		}
+		if bytes.Equal(disk, blob) {
+			continue
+		}
+		if bytes.IndexByte(blob, '\r') >= 0 || !bytes.Equal(bytes.ReplaceAll(disk, []byte("\r\n"), []byte("\n")), blob) {
+			g.Output = modified + ": " + f.Path
+			return g
+		}
+	}
+	g.Passed = true
+	return g
+}
+
 // gateSealedManifest checks the original manifest, never the immediate candidate base.
 // Listing the whole acceptance directory also detects newly added files.
 func gateSealedManifest(root, commit string, seal Seal, paths []string) GateResult {

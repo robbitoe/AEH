@@ -1002,6 +1002,7 @@ func RecordChange(r Repo, p PendingRecord, expectedFingerprint string) (version,
 	if cur, _ := parseSemver(spec.Version); semverLess(mustSemver(version), cur) {
 		version = spec.Version
 	}
+	version = belowQueuedTarget(dir, p.Feature, from, version, spec.Version)
 	rel := specRel(p.Feature)
 	full := filepath.Join(dir, filepath.FromSlash(rel))
 	raw, err := os.ReadFile(full)

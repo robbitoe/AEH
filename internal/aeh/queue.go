@@ -592,3 +592,32 @@ func withoutAcceptanceLines(body string) string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+// belowQueuedTarget keeps a record's version below an approval queued for the same
+// feature. Owners queue the next minor version while work is pending; a minor bump by
+// the record would reach it and make activation wait for a manual recovery. A patch bump
+// stays below it. When even that collides, the version is unchanged and activation
+// reports the collision as before.
+func belowQueuedTarget(dir, feature, from, version, current string) string {
+	b, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(queueRel(feature))))
+	if err != nil {
+		return version
+	}
+	q, err := parseQueue(b)
+	if err != nil || q.Activated {
+		return version
+	}
+	target, err := parseSemver(q.Approval.Version)
+	if err != nil || semverLess(mustSemver(version), target) {
+		return version
+	}
+	patch, err := bumpVersion(from, "patch")
+	if err != nil {
+		return version
+	}
+	p := mustSemver(patch)
+	if cur, err := parseSemver(current); err == nil && !semverLess(cur, p) || !semverLess(p, target) {
+		return version
+	}
+	return patch
+}
