@@ -28,23 +28,36 @@ type Seal struct {
 	ApprovedAt  time.Time  `json:"approved_at"`
 	SealedBy    string     `json:"sealed_by,omitempty"`
 	SpecContent string     `json:"spec_content_sha256,omitempty"`
+	Retired     []string   `json:"retired,omitempty"`
 }
 
 // sealFromContents seals runner-verified Git blob bytes, keyed by repository-relative path.
 // The caller supplies the complete manifest, including plan.yaml when sealing its directory.
-func sealFromContents(id string, contents map[string][]byte, specDigest string, at time.Time) Seal {
+func sealFromContents(id string, contents map[string][]byte, specDigest string, at time.Time, retired ...[]string) Seal {
 	s := Seal{Outcome: id, SealedBy: "runner", SpecContent: specDigest, ApprovedAt: at}
+	if len(retired) > 0 {
+		s.Retired = append([]string(nil), retired[0]...)
+		sort.Strings(s.Retired)
+	}
 	for p, b := range contents {
 		sum := sha256.Sum256(b)
 		s.Files = append(s.Files, SealFile{Path: p, SHA256: hex.EncodeToString(sum[:])})
 	}
 	sort.Slice(s.Files, func(i, j int) bool { return s.Files[i].Path < s.Files[j].Path })
+	s.Hash = sealHash(s.Files, s.Retired)
+	return s
+}
+
+// Empty absences preserve the pre-stage-5 hash format byte for byte.
+func sealHash(files []SealFile, retired []string) string {
 	h := sha256.New()
-	for _, f := range s.Files {
+	for _, f := range files {
 		fmt.Fprintf(h, "%s  %s\n", f.SHA256, f.Path)
 	}
-	s.Hash = hex.EncodeToString(h.Sum(nil))
-	return s
+	for _, p := range retired {
+		fmt.Fprintf(h, "absent  %s\n", p)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // hashPaths hashes every file under the given paths (files or directories) relative to dir.

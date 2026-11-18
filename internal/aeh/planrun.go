@@ -47,9 +47,12 @@ type PlanState struct {
 	MemoryCommit string `json:"memory_commit,omitempty"`
 	// Owners is the contract fingerprint of the pinned memory (which code every feature owns
 	// and the feature's spec); the run checks its pinned snapshot against it.
-	Owners          string           `json:"owners_sha256,omitempty"`
-	PriorCode       string           `json:"prior_code_sha,omitempty"`
-	Delta           CriteriaDelta    `json:"delta"`
+	Owners    string        `json:"owners_sha256,omitempty"`
+	PriorCode string        `json:"prior_code_sha,omitempty"`
+	Delta     CriteriaDelta `json:"delta"`
+	// Retired is this delta's exact deletion set; Absences also includes historical retirements.
+	Retired         []RetiredTest    `json:"retired_tests,omitempty"`
+	Absences        []string         `json:"retired_paths,omitempty"`
 	Route           string           `json:"route"`
 	Roles           []string         `json:"roles"`
 	Inputs          string           `json:"inputs_sha256"`
@@ -575,11 +578,13 @@ func (p *planner) reserve(id, observed, memoryCommit string) (PlanState, error) 
 		}
 	}
 	switch {
-	case len(st.Delta.Changed) > 0 || len(st.Delta.Removed) > 0:
-		return st, fmt.Errorf("plan %s: criteria changed %v or removed %v since %s; replacing sealed tests is not supported yet. Restore them, or keep them and add new criteria",
-			p.spec.Feature, st.Delta.Changed, st.Delta.Removed, last.Outcome)
-	case len(st.Delta.New) == 0:
+	case len(st.Delta.New) == 0 && len(st.Delta.Changed) == 0 && len(st.Delta.Removed) > 0:
+		return st, fmt.Errorf("plan %s: a delta with only removed criteria needs a plan without implementation; this comes with stage 5 L3", p.spec.Feature)
+	case len(st.Delta.New) == 0 && len(st.Delta.Changed) == 0:
 		return st, fmt.Errorf("plan %s: the approved spec adds no criteria; nothing to plan", p.spec.Feature)
+	}
+	if st.Retired, st.Absences, err = p.retirement(&st); err != nil {
+		return st, err
 	}
 	st.Route = RouteChange
 	if !hasLast && p.kind != PlanCharacterize {
@@ -712,10 +717,12 @@ func (p *planner) inputsDigestFor(st *PlanState) (string, error) {
 		Effective         map[string]string
 		Profiles          map[string]Profile
 		Prompts           map[string]string
-		Kind              string `json:",omitempty"`
-		ObservedBase      string `json:",omitempty"`
+		Kind              string        `json:",omitempty"`
+		ObservedBase      string        `json:",omitempty"`
+		Retired           []RetiredTest `json:",omitempty"`
+		Absences          []string      `json:",omitempty"`
 	}{st.Base, st.SpecDigest, prior, st.Delta, p.pcfg, p.cfg.Commands, p.cfg.PassEnv, p.owners, p.cfg.Protected, p.cfg.Triage.Rules,
-		p.cfg.Reviewers, p.cfg.Reviewers.declared, p.cfg.Reviewer, effective, p.cfg.Profiles, p.prompts, st.Kind, st.ObservedBase}
+		p.cfg.Reviewers, p.cfg.Reviewers.declared, p.cfg.Reviewer, effective, p.cfg.Profiles, p.prompts, st.Kind, st.ObservedBase, st.Retired, st.Absences}
 	b, err := json.Marshal(v)
 	if err != nil {
 		return "", err
@@ -801,7 +808,7 @@ func (p *planner) previousSuite() (files, missing []string, err error) {
 	}
 	seen := map[string]bool{}
 	for _, f := range strings.Split(out, "\x00") {
-		if f != "" && path.Base(f) != "plan.yaml" {
+		if f != "" && path.Base(f) != "plan.yaml" && !containsPath(p.state.Absences, f) {
 			seen[f] = true
 		}
 	}
@@ -809,6 +816,9 @@ func (p *planner) previousSuite() (files, missing []string, err error) {
 	// that the base no longer has is reported, never silently dropped.
 	for _, c := range p.state.Delta.Unchanged {
 		for _, t := range c.Tests {
+			if containsPath(p.state.Absences, t) {
+				continue
+			}
 			if seen[t] {
 				continue
 			}
@@ -1072,6 +1082,7 @@ func (p *planner) attempt(ctx context.Context, a *PlanAttempt, feedback string) 
 	for _, f := range files {
 		changed = append(changed, f.Path)
 	}
+	changed = append(changed, retiredPaths(st.Retired)...)
 	st.Route, st.Roles = applyRules(st.Route, st.Roles, rulesForFiles(p.cfg.Triage.Rules, changed))
 	dir := p.testDir()
 	planYAML, ok := gitBlob(r.Root, candidate, dir+"plan.yaml")
@@ -1206,7 +1217,7 @@ func approvedOn(reviews []ReviewVerdict, role, sha string) bool {
 func (p *planner) testDir() string { return p.pcfg.AcceptanceDir + "/" + p.state.ID + "/" }
 
 func (p *planner) input() PlanInput {
-	return PlanInput{OutcomeID: p.state.ID, Kind: p.state.Kind, Spec: p.spec, Delta: p.state.Delta, Protected: p.cfg.Protected, Config: p.cfg}
+	return PlanInput{OutcomeID: p.state.ID, Kind: p.state.Kind, Spec: p.spec, Delta: p.state.Delta, Protected: p.cfg.Protected, Config: p.cfg, Retired: p.state.Retired, Absences: p.state.Absences}
 }
 
 // planVerdict reads the author's last non-empty line: "PLAN: READY" or "PLAN: TOO-LARGE".
@@ -1257,19 +1268,42 @@ func planCandidateFiles(root, base, commit string) ([]PlanCandidateFile, error) 
 // them as one commit on the base. That commit is what is checked, reviewed and published.
 func (p *planner) freeze(candidate string, files []PlanCandidateFile, plan PlanFile, route string) (string, error) {
 	st, root := p.state, p.repo.Root
+	if err := verifyRetiredBase(root, st.Base, st.Retired); err != nil {
+		return "", err
+	}
 	contents := map[string][]byte{}
 	for _, f := range files {
+		if f.Status == 'D' {
+			continue
+		}
 		b, ok := gitBlob(root, candidate, f.Path)
 		if !ok {
 			return "", fmt.Errorf("read %s from the candidate", f.Path)
 		}
 		contents[f.Path] = []byte(b)
 	}
+	// Retain every surviving sealed file, including partial coverage of a criterion that
+	// also needs recovery. The manifest must never resurrect a retired shared file.
+	for _, c := range st.Delta.Unchanged {
+		for _, file := range c.Tests {
+			if containsPath(st.Absences, file) {
+				continue
+			}
+			b, ok := gitBlob(root, st.PriorCode, file)
+			if !ok {
+				return "", fmt.Errorf("read prior sealed test %s", file)
+			}
+			contents[file] = []byte(b)
+		}
+	}
 	var ids []string
-	for _, c := range st.Delta.New {
+	for _, c := range st.Delta.redCriteria() {
 		ids = append(ids, fmt.Sprintf("AC-%d", c.ID))
 	}
 	changelog := fmt.Sprintf("Adds %s.", strings.Join(ids, ", "))
+	if len(st.Delta.Changed) > 0 || len(st.Delta.Removed) > 0 {
+		changelog = fmt.Sprintf("Implements the approved delta for %s.", strings.Join(ids, ", "))
+	}
 	if st.Kind == PlanCharacterize {
 		changelog = fmt.Sprintf("Characterizes %s.", strings.Join(ids, ", "))
 	}
@@ -1278,7 +1312,7 @@ func (p *planner) freeze(candidate string, files []PlanCandidateFile, plan PlanF
 	if err != nil {
 		return "", err
 	}
-	seal := sealFromContents(st.ID, contents, st.SpecDigest, time.Now().UTC())
+	seal := sealFromContents(st.ID, contents, st.SpecDigest, time.Now().UTC(), st.Absences)
 	sealJSON, err := json.MarshalIndent(seal, "", "  ")
 	if err != nil {
 		return "", err
@@ -1297,6 +1331,11 @@ func (p *planner) freeze(candidate string, files []PlanCandidateFile, plan PlanF
 	env := []string{"GIT_INDEX_FILE=" + filepath.Join(tmp, "index")}
 	if _, err := gitEnv(root, env, nil, "read-tree", candidate); err != nil {
 		return "", err
+	}
+	for _, f := range st.Retired {
+		if _, err := gitEnv(root, env, nil, "update-index", "--force-remove", "--", f.Path); err != nil {
+			return "", err
+		}
 	}
 	for rel, b := range generated {
 		sha, err := gitEnv(root, nil, b, "hash-object", "-w", "--no-filters", "--stdin")
@@ -1325,14 +1364,20 @@ func (p *planner) freeze(candidate string, files []PlanCandidateFile, plan PlanF
 	if err != nil {
 		return "", err
 	}
-	if len(got) != len(files)+len(generated) {
-		return "", fmt.Errorf("frozen plan commit changes %d paths, expected %d", len(got), len(files)+len(generated))
-	}
 	want := map[string]PlanCandidateFile{}
 	for _, f := range files {
 		want[f.Path] = f
 	}
+	for _, f := range st.Retired {
+		want[f.Path] = PlanCandidateFile{Path: f.Path, Status: 'D'}
+	}
+	if len(got) != len(want)+len(generated) {
+		return "", fmt.Errorf("frozen plan commit changes %d paths, expected %d", len(got), len(want)+len(generated))
+	}
 	for _, f := range got {
+		if c, ok := want[f.Path]; ok && c.Status == 'D' && f.Status == 'D' {
+			continue
+		}
 		if f.Status != 'A' {
 			return "", fmt.Errorf("frozen plan commit has unexpected change %c %s", f.Status, f.Path)
 		}
@@ -1351,6 +1396,17 @@ func (p *planner) freeze(candidate string, files []PlanCandidateFile, plan PlanF
 		if err1 != nil || err2 != nil || a != b {
 			return "", fmt.Errorf("frozen plan commit changed %s from the checked candidate", f.Path)
 		}
+	}
+	paths := []string{p.testDir()}
+	for _, c := range st.Delta.Unchanged {
+		for _, file := range c.Tests {
+			if !containsPath(st.Absences, file) {
+				paths = append(paths, file)
+			}
+		}
+	}
+	if g := gateSealedManifest(root, frozen, seal, paths); !g.Passed {
+		return "", fmt.Errorf("frozen plan manifest: %s", g.Output)
 	}
 	return frozen, nil
 }
@@ -1371,8 +1427,8 @@ func gitEnv(dir string, env []string, stdin []byte, args ...string) (string, err
 	return strings.TrimSpace(out.String()), nil
 }
 
-// redGreen checks the frozen commit: it builds, every new test file fails on its own (the
-// feature does not exist yet), and the sealed tests of unchanged criteria still pass. Each
+// redGreen checks the frozen commit: it builds, new/changed tests fail per file, recovery
+// passes per file, and the surviving previous suite passes together with recovery. Each
 // command runs in the verify worktree, whose checkout must stay intact even when a command
 // fails as expected. A failure is evidence, not proof: the reviewer judges why it fails.
 func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile) ([]PlanCheckEntry, string, string, bool, error) {
@@ -1414,28 +1470,46 @@ func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile
 	if p.state.Kind == PlanCharacterize {
 		return p.green(ctx, wt, files, checks, settle)
 	}
+	kinds, err := fileKinds(p.state.Delta, plan)
+	if err != nil {
+		return checks, "scope", err.Error(), false, nil
+	}
 	for i, f := range files {
-		g, err := p.acceptanceCommand(ctx, fmt.Sprintf("red-%d", i+1), wt, []string{dir + f})
+		kind := "red"
+		if kinds[f] {
+			kind = "green"
+		}
+		g, err := p.acceptanceCommand(ctx, fmt.Sprintf("%s-%d", kind, i+1), wt, []string{dir + f})
 		if err != nil {
 			return checks, "", "", false, err
 		}
 		g.Output = redactDiagnostic(g.Output)
-		checks = append(checks, PlanCheckEntry{Name: "red " + dir + f, Passed: !g.Passed && !g.Uncertain, Detail: tail(g.Output, 500)})
+		passed := g.Passed == kinds[f] && !g.Uncertain
+		checks = append(checks, PlanCheckEntry{Name: kind + " " + dir + f, Passed: passed, Detail: tail(g.Output, 500)})
 		if uncertain, damaged := settle(g); uncertain {
-			return checks, "red", g.Output, true, nil
+			return checks, kind, g.Output, true, nil
 		} else if damaged != "" {
-			return checks, "red", damaged, false, nil
+			return checks, kind, damaged, false, nil
 		}
-		if g.Passed {
+		if kinds[f] && !g.Passed {
+			return checks, "green", fmt.Sprintf("recovery %s%s must pass on the base:\n%s", dir, f, g.Output), false, nil
+		}
+		if !kinds[f] && g.Passed {
 			return checks, "red", fmt.Sprintf("%s%s passes before the feature exists; each test must fail until the criterion is implemented", dir, f), false, nil
 		}
 	}
+	// Recovery and surviving tests must pass together, as well as separately.
 	tests, missing, err := p.previousSuite()
 	if err != nil {
 		return checks, "", "", false, err
 	}
 	if len(missing) > 0 {
 		return checks, "previous", "sealed tests of unchanged criteria are missing: " + strings.Join(missing, ", "), false, nil
+	}
+	for _, f := range files {
+		if kinds[f] {
+			tests = append(tests, dir+f)
+		}
 	}
 	if len(tests) > 0 {
 		g, err := p.acceptanceCommand(ctx, "previous", wt, tests)

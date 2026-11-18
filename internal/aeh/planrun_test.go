@@ -339,8 +339,8 @@ func TestPlanRequiresTheLastImplementationInTheBase(t *testing.T) {
 	}
 }
 
-// Changing an implemented criterion is out of scope until test revision exists (stage 5).
-func TestPlanRefusesChangedCriteria(t *testing.T) {
+// Replacement requires the original sealed hash, not just an implementation mapping.
+func TestPlanRefusesUnsealedReplacement(t *testing.T) {
 	f := newPlanFixture(t, countCall+authorOK, reviewOK)
 	snap, _ := LoadMemory(f.repo)
 	spec, _ := snap.Spec("pay")
@@ -350,7 +350,7 @@ func TestPlanRefusesChangedCriteria(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := PlanFeature(context.Background(), f.repo, "pay", nil)
-	if err == nil || !strings.Contains(err.Error(), "changed [1]") {
+	if err == nil || !strings.Contains(err.Error(), "no sealed hash") {
 		t.Fatalf("changed criterion planned: %v", err)
 	}
 	// With the change undone and a new criterion added, the delta is only the new one.
