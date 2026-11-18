@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"sort"
 	"strings"
 	"time"
 
@@ -56,6 +55,9 @@ func RunOutcome(ctx context.Context, r Repo, id string, log io.Writer) (State, e
 	if generated && plan.Kind == PlanCharacterize {
 		return State{}, characterizeRunError(id)
 	}
+	if generated && plan.NoImplementation {
+		return State{}, fmt.Errorf("%s has nothing to implement: it only retires or clarifies tests and was recorded when planned; merge %s", id, IntegrationBranch(id))
+	}
 	if generated {
 		if plan.Phase != PlanLogged {
 			return State{}, fmt.Errorf("plan %s is not finished; run aeh plan %s", id, plan.Feature)
@@ -85,6 +87,9 @@ func RunOutcome(ctx context.Context, r Repo, id string, log io.Writer) (State, e
 	}
 	if o.Kind == PlanCharacterize {
 		return State{}, characterizeRunError(id)
+	}
+	if o.Kind == PlanRevise {
+		return State{}, fmt.Errorf("%s has nothing to implement; merge %s", id, IntegrationBranch(id))
 	}
 	return run(ctx, r, cfg, o, log, nil)
 }
@@ -1466,26 +1471,9 @@ func (ru *runner) implementation() (*Implementation, error) {
 	if err != nil {
 		return nil, err
 	}
-	sort.Slice(crit, func(i, j int) bool { return crit[i].ID < crit[j].ID })
-	unchanged := map[int]ImplementedCriterion{}
-	for _, c := range g.Plan.Delta.Unchanged {
-		unchanged[c.ID] = c
-	}
 	im := &Implementation{Outcome: ru.outcome.ID, Approval: g.Plan.SpecDigest, SpecVersion: g.Plan.SpecVersion, Code: ru.state.Head, Retired: append([]RetiredTest(nil), g.Plan.Retired...)}
-	for _, c := range crit {
-		var tests []string
-		for _, file := range unchanged[c.ID].Tests {
-			if !containsPath(g.Plan.Absences, file) {
-				tests = append(tests, file)
-			}
-		}
-		for _, file := range g.Trace.Trace[fmt.Sprintf("AC-%d", c.ID)] {
-			tests = append(tests, ru.outcome.Acceptance[0]+file)
-		}
-		if len(tests) == 0 {
-			return nil, fmt.Errorf("plan %s has no tests for AC-%d", im.Outcome, c.ID)
-		}
-		im.Criteria = append(im.Criteria, ImplementedCriterion{ID: c.ID, Text: c.Text, Tests: tests})
+	if im.Criteria, err = implementedCriteria(im.Outcome, crit, g.Plan.Delta, g.Plan.Absences, g.Trace, ru.outcome.Acceptance[0]); err != nil {
+		return nil, err
 	}
 	return im, nil
 }

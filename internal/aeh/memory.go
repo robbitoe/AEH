@@ -88,6 +88,32 @@ type SpecApproval struct {
 	// digest of the feature's last implementation then, or "none". Empty in approvals written
 	// before stage 5, which are not checked.
 	DeltaBase string `yaml:"delta_base,omitempty"`
+	// Clarifications are the changed criteria the owner marked as wording-only when
+	// approving: their new tests may pass on the base, and QA must confirm the equivalence.
+	// Each is bound to the exact old and new texts, so a different delta voids it.
+	Clarifications []Clarification `yaml:"clarifications,omitempty"`
+}
+
+// Clarification marks one changed criterion as a clarification of its old text.
+type Clarification struct {
+	ID  int    `yaml:"id" json:"id"`
+	Old string `yaml:"old_sha256" json:"old_sha256"`
+	New string `yaml:"new_sha256" json:"new_sha256"`
+}
+
+// criterionDigest identifies a criterion text for a clarification.
+func criterionDigest(text string) string {
+	sum := sha256.Sum256([]byte(normalizeCriterion(text)))
+	return hex.EncodeToString(sum[:])
+}
+
+// ApproveOptions are the owner's choices when approving a spec.
+type ApproveOptions struct {
+	// Clarify lists the changed criteria (by number) to mark as clarifications. SetClarify
+	// says the owner passed the list, possibly empty ("none"); without it, an approval that
+	// is current keeps its clarifications and a new approval has none.
+	Clarify    []int
+	SetClarify bool
 }
 
 // noImplementation is the DeltaBase of an approval given before any implementation.
@@ -631,7 +657,68 @@ func parseApproval(b []byte) (*SpecApproval, error) {
 	if a.DeltaBase != "" && a.DeltaBase != noImplementation && !isSHA256Hex(a.DeltaBase) {
 		return nil, fmt.Errorf("%s: delta_base must be %q or a sha256 in hex", approvalFile, noImplementation)
 	}
+	for i, c := range a.Clarifications {
+		if c.ID < 1 || (i > 0 && c.ID <= a.Clarifications[i-1].ID) || !isSHA256Hex(c.Old) || !isSHA256Hex(c.New) {
+			return nil, fmt.Errorf("%s: clarifications must have sorted, unique positive IDs and sha256 texts", approvalFile)
+		}
+		if !containsInt(a.Criteria, c.ID) {
+			return nil, fmt.Errorf("%s: clarification AC-%d is not an approved criterion", approvalFile, c.ID)
+		}
+	}
 	return &a, nil
+}
+
+func containsInt(list []int, n int) bool {
+	for _, x := range list {
+		if x == n {
+			return true
+		}
+	}
+	return false
+}
+
+// clarificationsFor checks the owner's list against the spec: each must be a criterion
+// whose text changed since the last implementation. It binds each to both texts.
+func clarificationsFor(spec Spec, crit []SpecCriterion, ids []int) ([]Clarification, error) {
+	last, ok := spec.LastImplementation()
+	prev := map[int]string{}
+	if ok {
+		for _, c := range last.Criteria {
+			prev[c.ID] = c.Text
+		}
+	}
+	now := map[int]string{}
+	for _, c := range crit {
+		now[c.ID] = c.Text
+	}
+	var out []Clarification
+	seen := map[int]bool{}
+	for _, id := range ids {
+		old, had := prev[id]
+		text, has := now[id]
+		switch {
+		case seen[id]:
+			return nil, fmt.Errorf("AC-%d is listed twice", id)
+		case !had || !has || old == text:
+			return nil, fmt.Errorf("AC-%d is not a changed criterion: a clarification marks a criterion whose text changed since the last implementation", id)
+		}
+		seen[id] = true
+		out = append(out, Clarification{ID: id, Old: criterionDigest(old), New: criterionDigest(text)})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func sameClarifications(a, b []Clarification) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // ownerApprovals returns the versions and contents the owner approved for a feature, oldest
@@ -717,6 +804,11 @@ func semverLess(a, b [3]int) bool {
 // ApproveSpec records the owner's approval of a feature's spec as it reads now, in one memory
 // commit. Approving an unchanged, already approved spec does nothing and returns false.
 func ApproveSpec(r Repo, feature string) (Spec, bool, error) {
+	return ApproveSpecWith(r, feature, ApproveOptions{})
+}
+
+// ApproveSpecWith is ApproveSpec with the owner's options (clarifications).
+func ApproveSpecWith(r Repo, feature string, opt ApproveOptions) (Spec, bool, error) {
 	unlock, err := lockProject(r)
 	if err != nil {
 		return Spec{}, false, err
@@ -752,14 +844,21 @@ func ApproveSpec(r Repo, feature string) (Spec, bool, error) {
 	// A spec whose version moved past its approval (the owner raised only the version, or a
 	// record bumped it) is approved again under its own version, so that version enters
 	// history and its content cannot change later.
-	if spec.Approved() && spec.Approval.Version == spec.Version && !spec.staleApproval() {
+	var clarifications []Clarification
+	if opt.SetClarify {
+		if clarifications, err = clarificationsFor(spec, crit, opt.Clarify); err != nil {
+			return Spec{}, false, fmt.Errorf("approve %s: %w", feature, err)
+		}
+	}
+	if spec.Approved() && spec.Approval.Version == spec.Version && !spec.staleApproval() &&
+		(!opt.SetClarify || sameClarifications(spec.Approval.Clarifications, clarifications)) {
 		return spec, false, nil
 	}
 	if strings.Contains(spec.Body, specPlaceholder) {
 		return Spec{}, false, fmt.Errorf("approve %s: the spec still has the placeholder text; describe the feature first", feature)
 	}
 	today := memoryNow().UTC().Format("2006-01-02")
-	a := SpecApproval{Version: spec.Version, Content: content, Date: today, MaxCriterion: ident.High, DeltaBase: spec.deltaBase()}
+	a := SpecApproval{Version: spec.Version, Content: content, Date: today, MaxCriterion: ident.High, DeltaBase: spec.deltaBase(), Clarifications: clarifications}
 	for _, c := range crit {
 		a.Criteria = append(a.Criteria, c.ID)
 		if c.ID > a.MaxCriterion {
@@ -932,7 +1031,7 @@ func implementationRecord(dir string, spec Spec, pinned *Spec, p PendingRecord) 
 	if err != nil {
 		return nil, fmt.Errorf("feature %s: acceptance criteria: %w", spec.Feature, err)
 	}
-	if len(crit) == 0 {
+	if len(crit) == 0 && (pinned == nil || len(im.Retired) == 0) {
 		return nil, fmt.Errorf("feature %s has no acceptance criteria to implement", spec.Feature)
 	}
 	if pinned != nil {
@@ -959,8 +1058,8 @@ func implementationRecord(dir string, spec Spec, pinned *Spec, p PendingRecord) 
 		}
 	}
 	im.MaxCriterion = ident.High
-	if n := crit[len(crit)-1].ID; n > im.MaxCriterion {
-		im.MaxCriterion = n
+	if len(crit) > 0 && crit[len(crit)-1].ID > im.MaxCriterion {
+		im.MaxCriterion = crit[len(crit)-1].ID
 	}
 	if err := im.validate(); err != nil {
 		return nil, fmt.Errorf("implementation: %w", err)

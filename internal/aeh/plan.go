@@ -27,6 +27,11 @@ type PlanFile struct {
 // existing code, with nothing to implement.
 const PlanCharacterize = "characterize"
 
+// PlanRevise is the outcome kind of a plan without implementation: it only retires tests of
+// removed criteria and adds green tests for clarifications or recovery. It is recorded when
+// published; the owner merges it.
+const PlanRevise = "revise"
+
 // PlanTask covers the new and changed criteria in one implementation task.
 type PlanTask struct {
 	Goal  string   `yaml:"goal"`
@@ -66,6 +71,9 @@ func validatePlanForm(p PlanFile) error {
 		}
 	case "":
 		goal := strings.TrimSpace(p.Task.Goal)
+		if goal == "" && len(p.Task.Paths) == 0 {
+			break // no task: allowed only for a delta with nothing to implement (see validatePlanCandidate)
+		}
 		if goal == "" || len(goal) > 500 || strings.ContainsAny(goal, "\r\n\u0085\u2028\u2029") {
 			return errors.New("plan.yaml: task.goal must be one non-empty line of at most 500 bytes")
 		}
@@ -79,9 +87,6 @@ func validatePlanForm(p PlanFile) error {
 		}
 	default:
 		return fmt.Errorf("plan.yaml: kind %q is unknown; omit it, or use characterize for a characterization plan", p.Kind)
-	}
-	if len(p.Trace) == 0 {
-		return errors.New("plan.yaml: trace must map each new AC-<n> to test files")
 	}
 	for _, id := range sortedTraceIDs(p.Trace) {
 		if !planCriterionID.MatchString(id) {
@@ -174,6 +179,8 @@ type PlanInput struct {
 	Config    Config
 	Retired   []RetiredTest
 	Absences  []string
+	// NoImplementation: the delta has nothing to build, so the plan has no task.
+	NoImplementation bool
 }
 
 // validatePlanCandidate checks scope, form, containment and declared traceability only.
@@ -271,6 +278,14 @@ func validatePlanCandidate(in PlanInput, files []PlanCandidateFile, plan PlanFil
 			}
 		}
 	}
+	hasTask := plan.Task.Goal != "" || len(plan.Task.Paths) > 0
+	switch {
+	case in.Kind == PlanCharacterize:
+	case in.NoImplementation && hasTask:
+		return errors.New("plan: this delta has nothing to implement (only removed criteria, clarifications or recovery); remove task")
+	case !in.NoImplementation && !hasTask:
+		return errors.New("plan: task is required: define one implementation task for the new and changed criteria")
+	}
 	want := map[string]bool{}
 	for _, c := range in.Delta.coverageCriteria() {
 		id := fmt.Sprintf("AC-%d", c.ID)
@@ -333,7 +348,10 @@ func generatedOutcome(in PlanInput, plan PlanFile, route string, changelog strin
 		Change: "minor", Changelog: changelog, Route: route,
 		Acceptance: []string{cfg.AcceptanceDir + "/" + in.OutcomeID + "/"},
 	}
-	if in.Kind != PlanCharacterize {
+	switch {
+	case in.NoImplementation:
+		o.Kind = PlanRevise
+	case in.Kind != PlanCharacterize:
 		o.Tasks = []Task{{ID: "T1", Goal: plan.Task.Goal, Paths: append([]string(nil), plan.Task.Paths...), MaxDiffLines: cfg.MaxDiffLines}}
 	}
 	var lines []string

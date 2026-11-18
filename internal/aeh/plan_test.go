@@ -31,7 +31,7 @@ func TestParsePlanFile(t *testing.T) {
 		{"merge", "task: {<<: {goal: g, paths: [src/]}}\ntrace: {AC-1: [x]}\n", "merge"},
 		{"tag", strings.Replace(samplePlan, "Create an order", "!!str Create an order", 1), "tags"},
 		{"empty", "", "plan.yaml"},
-		{"null", "null\n", "task.goal"},
+		{"null", "null\n", ""}, // no task and no trace: checked against the delta by validatePlanCandidate
 		{"sequence", "[]\n", "parse plan.yaml"},
 		{"empty goal", strings.Replace(samplePlan, "Create an order", "'   '", 1), "task.goal"},
 		{"multiline goal", strings.Replace(samplePlan, "Create an order", "\"create\\nan order\"", 1), "task.goal"},
@@ -42,7 +42,8 @@ func TestParsePlanFile(t *testing.T) {
 		{"wrong paths type", strings.Replace(samplePlan, "[src/checkout/]", "src/checkout/", 1), "unmarshal"},
 		{"wildcard", strings.Replace(samplePlan, "src/checkout/", "src/*/", 1), "literal"},
 		{"parent path", strings.Replace(samplePlan, "src/checkout/", "src/../checkout/", 1), "task path"},
-		{"empty trace", "task: {goal: g, paths: [src/]}\ntrace: {}\n", "trace must"},
+		{"empty trace", "task: {goal: g, paths: [src/]}\ntrace: {}\n", ""},
+		{"half task", "task: {paths: [src/]}\ntrace: {AC-1: [a.sh]}\n", "task.goal"},
 		{"bad criterion", strings.Replace(samplePlan, "AC-1:", "C-1:", 1), "positive integer"},
 		{"zero criterion", strings.Replace(samplePlan, "AC-1:", "AC-0:", 1), "positive integer"},
 		{"leading zero", strings.Replace(samplePlan, "AC-1:", "AC-01:", 1), "positive integer"},

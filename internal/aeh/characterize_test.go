@@ -325,7 +325,7 @@ func TestCharacterizeSchema(t *testing.T) {
 		"ok":        {"kind: characterize\ntrace:\n  AC-1: [a.sh]\n", ""},
 		"with task": {"kind: characterize\ntask:\n  goal: x\n  paths: [src/]\ntrace:\n  AC-1: [a.sh]\n", "has no task"},
 		"unknown":   {"kind: implement\ntask:\n  goal: x\n  paths: [src/]\ntrace:\n  AC-1: [a.sh]\n", "unknown"},
-		"no task":   {"trace:\n  AC-1: [a.sh]\n", "task.goal"},
+		"no task":   {"trace:\n  AC-1: [a.sh]\n", ""}, // allowed by the form; the delta decides
 	} {
 		_, err := parsePlanFile([]byte(tc.yaml))
 		if (tc.want == "") != (err == nil) || (err != nil && !strings.Contains(err.Error(), tc.want)) {
@@ -336,10 +336,12 @@ func TestCharacterizeSchema(t *testing.T) {
 		o    Outcome
 		want string
 	}{
-		"ok":         {Outcome{ID: "X", Title: "x", Kind: PlanCharacterize, Acceptance: []string{"t/"}}, ""},
-		"tasks":      {Outcome{ID: "X", Title: "x", Kind: PlanCharacterize, Acceptance: []string{"t/"}, Tasks: []Task{{Goal: "g"}}}, "has no tasks"},
-		"no tests":   {Outcome{ID: "X", Title: "x", Kind: PlanCharacterize}, "acceptance"},
-		"other kind": {Outcome{ID: "X", Title: "x", Kind: "spike"}, "must be empty or characterize"},
+		"ok":          {Outcome{ID: "X", Title: "x", Kind: PlanCharacterize, Acceptance: []string{"t/"}}, ""},
+		"tasks":       {Outcome{ID: "X", Title: "x", Kind: PlanCharacterize, Acceptance: []string{"t/"}, Tasks: []Task{{Goal: "g"}}}, "has no tasks"},
+		"no tests":    {Outcome{ID: "X", Title: "x", Kind: PlanCharacterize}, "acceptance"},
+		"other kind":  {Outcome{ID: "X", Title: "x", Kind: "spike"}, "must be empty, characterize or revise"},
+		"revise":      {Outcome{ID: "X", Title: "x", Kind: PlanRevise, Acceptance: []string{"t/"}}, ""},
+		"revise task": {Outcome{ID: "X", Title: "x", Kind: PlanRevise, Acceptance: []string{"t/"}, Tasks: []Task{{Goal: "g"}}}, "has no tasks"},
 	} {
 		err := tc.o.normalize()
 		if (tc.want == "") != (err == nil) || (err != nil && !strings.Contains(err.Error(), tc.want)) {

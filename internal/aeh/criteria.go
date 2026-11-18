@@ -371,7 +371,7 @@ func (im Implementation) validate() error {
 	if im.ObservedBase != "" && !isFullSHA(im.ObservedBase) {
 		return fmt.Errorf("observed_base_sha %q is not a full commit SHA", im.ObservedBase)
 	}
-	if len(im.Criteria) == 0 {
+	if len(im.Criteria) == 0 && len(im.Retired) == 0 {
 		return errors.New("no criteria")
 	}
 	if err := validateRetiredTests(im.Retired); err != nil {
@@ -586,6 +586,8 @@ type CriterionChange struct {
 	ID      int    `json:"id"`
 	OldText string `json:"old_text"`
 	NewText string `json:"new_text"`
+	// Clarified: the owner approved this change as wording only; its tests are green.
+	Clarified bool `json:"clarified,omitempty"`
 }
 
 func criteriaDelta(crit []SpecCriterion, last *Implementation) CriteriaDelta {

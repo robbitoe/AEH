@@ -51,21 +51,24 @@ type PlanState struct {
 	PriorCode string        `json:"prior_code_sha,omitempty"`
 	Delta     CriteriaDelta `json:"delta"`
 	// Retired is this delta's exact deletion set; Absences also includes historical retirements.
-	Retired         []RetiredTest    `json:"retired_tests,omitempty"`
-	Absences        []string         `json:"retired_paths,omitempty"`
-	Route           string           `json:"route"`
-	Roles           []string         `json:"roles"`
-	Inputs          string           `json:"inputs_sha256"`
-	Attempts        []PlanAttempt    `json:"attempts,omitempty"`
-	PlanCommit      string           `json:"plan_commit,omitempty"`
-	Author          string           `json:"author,omitempty"` // profile of the accepted plan's test author
-	Reviews         []ReviewVerdict  `json:"reviews,omitempty"`
-	Question        string           `json:"question,omitempty"`
-	RestartRequired bool             `json:"restart_required,omitempty"`
-	Answers         []string         `json:"answers,omitempty"`
-	LadderFrom      int              `json:"ladder_from"` // attempts before this index belong to earlier ladder rounds
-	UpdatedAt       time.Time        `json:"updated_at"`
-	Checks          []PlanCheckEntry `json:"checks,omitempty"` // of the published attempt
+	Retired []RetiredTest `json:"retired_tests,omitempty"`
+	// NoImplementation: the delta has nothing to build (only removed criteria,
+	// clarifications or recovery); the plan has no task and is recorded when published.
+	NoImplementation bool             `json:"no_implementation,omitempty"`
+	Absences         []string         `json:"retired_paths,omitempty"`
+	Route            string           `json:"route"`
+	Roles            []string         `json:"roles"`
+	Inputs           string           `json:"inputs_sha256"`
+	Attempts         []PlanAttempt    `json:"attempts,omitempty"`
+	PlanCommit       string           `json:"plan_commit,omitempty"`
+	Author           string           `json:"author,omitempty"` // profile of the accepted plan's test author
+	Reviews          []ReviewVerdict  `json:"reviews,omitempty"`
+	Question         string           `json:"question,omitempty"`
+	RestartRequired  bool             `json:"restart_required,omitempty"`
+	Answers          []string         `json:"answers,omitempty"`
+	LadderFrom       int              `json:"ladder_from"` // attempts before this index belong to earlier ladder rounds
+	UpdatedAt        time.Time        `json:"updated_at"`
+	Checks           []PlanCheckEntry `json:"checks,omitempty"` // of the published attempt
 }
 
 // PlanAttempt is one run of the test author and the checks on its candidate.
@@ -424,6 +427,10 @@ func planFeature(ctx context.Context, r Repo, feature, kind string, log io.Write
 		p.logf("%s characterized on %s at %s and recorded in memory. Nothing to implement: merge %s into your base.", id, IntegrationBranch(id), short(st.PlanCommit), IntegrationBranch(id))
 		return st, nil
 	}
+	if st.NoImplementation {
+		p.logf("%s: %s on %s at %s, recorded in memory. Nothing to implement: merge %s into your base.", id, revisionSummary(st.Delta), IntegrationBranch(id), short(st.PlanCommit), IntegrationBranch(id))
+		return st, nil
+	}
 	p.logf("%s planned on %s at %s. Build it with: aeh run %s", id, IntegrationBranch(id), short(st.PlanCommit), id)
 	return st, nil
 }
@@ -493,7 +500,7 @@ func finishPublishedCharacterization(r Repo, cfg Config, memDir string, spec Spe
 		}
 		p := &planner{repo: r, cfg: cfg, pcfg: cfg.plan(), spec: spec, memDir: memDir, log: log, kind: PlanCharacterize, state: &st}
 		if st.Phase == PlanPublished {
-			if err := p.recordCharacterization(); err != nil {
+			if err := p.recordPlan(); err != nil {
 				return st, true, err
 			}
 		}
@@ -578,11 +585,10 @@ func (p *planner) reserve(id, observed, memoryCommit string) (PlanState, error) 
 		}
 	}
 	switch {
-	case len(st.Delta.New) == 0 && len(st.Delta.Changed) == 0 && len(st.Delta.Removed) > 0:
-		return st, fmt.Errorf("plan %s: a delta with only removed criteria needs a plan without implementation; this comes with stage 5 L3", p.spec.Feature)
-	case len(st.Delta.New) == 0 && len(st.Delta.Changed) == 0:
+	case len(st.Delta.New) == 0 && len(st.Delta.Changed) == 0 && len(st.Delta.Removed) == 0:
 		return st, fmt.Errorf("plan %s: the approved spec adds no criteria; nothing to plan", p.spec.Feature)
 	}
+	st.NoImplementation = p.kind != PlanCharacterize && st.Delta.noImplementation()
 	if st.Retired, st.Absences, err = p.retirement(&st); err != nil {
 		return st, err
 	}
@@ -615,14 +621,22 @@ func (p *planner) currentDelta() (string, CriteriaDelta, error) {
 	if err != nil {
 		return "", CriteriaDelta{}, fmt.Errorf("plan %s: acceptance criteria: %w", p.spec.Feature, err)
 	}
-	if len(crit) == 0 {
+	// After an implementation, a spec without the criteria section removes every criterion.
+	im, ok := p.spec.LastImplementation()
+	if len(crit) == 0 && !ok {
 		return "", CriteriaDelta{}, fmt.Errorf("plan %s: the spec has no %q section; add criteria and approve it", p.spec.Feature, criteriaHeading)
 	}
-	im, ok := p.spec.LastImplementation()
-	if !ok {
-		return "", criteriaDelta(crit, nil), nil
+	var d CriteriaDelta
+	prior := ""
+	if ok {
+		d, prior = criteriaDelta(crit, &im), im.Code
+	} else {
+		d = criteriaDelta(crit, nil)
 	}
-	return im.Code, criteriaDelta(crit, &im), nil
+	if err := applyClarifications(&d, p.spec.Approval); err != nil {
+		return "", CriteriaDelta{}, fmt.Errorf("plan %s: %w: aeh memory approve %s --clarify ...", p.spec.Feature, err, p.spec.Feature)
+	}
+	return prior, d, nil
 }
 
 func sameDelta(a, b CriteriaDelta) bool {
@@ -1040,32 +1054,45 @@ func (p *planner) attempt(ctx context.Context, a *PlanAttempt, feedback string) 
 		}
 	}()
 	in := p.input()
-	data := newPlanPromptData(in)
-	data.Feedback = feedback
-	prompt, err := renderPrompt(p.authorPrompt(), p.prompts[p.authorPrompt()], data)
-	if err != nil {
-		return "", err
-	}
-	p.logf("  plan attempt %d with profile %q", a.N, a.Profile)
-	outPath, err := runAgent(ctx, p.cfg.Profiles[a.Profile], p.cfg.PassEnv, wt, prompt, runDir, "plan")
-	if err != nil {
-		if uncertainExit(err) {
-			keep = true
-			a.FailedStep, a.Feedback = "author", err.Error()
-			return p.blockNow(fmt.Sprintf("The plan author %q was interrupted or timed out (worktree kept at %s). Confirm all processes stopped and review possible effects before answering to retry.", a.Profile, wt)), nil
+	if p.authorless() {
+		// Only retirements: nothing for a test author to write. The runner writes the plan
+		// file itself; the deletions happen when the commit is frozen.
+		p.logf("  plan attempt %d: nothing to write; the runner retires the tests", a.N)
+		dir := filepath.Join(wt, filepath.FromSlash(p.testDir()))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", err
 		}
-		return fail("author", err.Error())
-	}
-	out, _ := os.ReadFile(outPath)
-	switch planVerdict(string(out)) {
-	case "TOO-LARGE":
-		a.FailedStep, a.Feedback = "author", "the author says the new criteria do not fit one task:\n"+tail(string(out), 2000)
-		// Blocked in the same save as the attempt: the owner's pause cannot be lost to a crash.
-		return p.blockNow(fmt.Sprintf("The plan author says the new criteria of %s %s do not fit one task of %d changed lines:\n%s\nSplit the spec into smaller versions (approve fewer new criteria at a time), or answer to retry.",
-			st.Feature, st.SpecVersion, p.pcfg.MaxDiffLines, tail(string(out), 1500))), nil
-	case "READY":
-	default:
-		return fail("author", `the author's output must end with "PLAN: READY" or "PLAN: TOO-LARGE"`)
+		if err := os.WriteFile(filepath.Join(dir, "plan.yaml"), []byte("trace: {}\n"), 0o644); err != nil {
+			return "", err
+		}
+	} else {
+		data := newPlanPromptData(in)
+		data.Feedback = feedback
+		prompt, err := renderPrompt(p.authorPrompt(), p.prompts[p.authorPrompt()], data)
+		if err != nil {
+			return "", err
+		}
+		p.logf("  plan attempt %d with profile %q", a.N, a.Profile)
+		outPath, err := runAgent(ctx, p.cfg.Profiles[a.Profile], p.cfg.PassEnv, wt, prompt, runDir, "plan")
+		if err != nil {
+			if uncertainExit(err) {
+				keep = true
+				a.FailedStep, a.Feedback = "author", err.Error()
+				return p.blockNow(fmt.Sprintf("The plan author %q was interrupted or timed out (worktree kept at %s). Confirm all processes stopped and review possible effects before answering to retry.", a.Profile, wt)), nil
+			}
+			return fail("author", err.Error())
+		}
+		out, _ := os.ReadFile(outPath)
+		switch planVerdict(string(out)) {
+		case "TOO-LARGE":
+			a.FailedStep, a.Feedback = "author", "the author says the new criteria do not fit one task:\n"+tail(string(out), 2000)
+			// Blocked in the same save as the attempt: the owner's pause cannot be lost to a crash.
+			return p.blockNow(fmt.Sprintf("The plan author says the new criteria of %s %s do not fit one task of %d changed lines:\n%s\nSplit the spec into smaller versions (approve fewer new criteria at a time), or answer to retry.",
+				st.Feature, st.SpecVersion, p.pcfg.MaxDiffLines, tail(string(out), 1500))), nil
+		case "READY":
+		default:
+			return fail("author", `the author's output must end with "PLAN: READY" or "PLAN: TOO-LARGE"`)
+		}
 	}
 	candidate, err := candidateCommit(wt, st.Base, fmt.Sprintf("aeh: plan %s (attempt %d, %s)", st.ID, a.N, a.Profile))
 	if err != nil {
@@ -1114,6 +1141,12 @@ func (p *planner) attempt(ctx context.Context, a *PlanAttempt, feedback string) 
 		return "", err
 	}
 	return p.verifyFrozen(ctx, a)
+}
+
+// authorless reports a plan without implementation whose delta needs no new tests: it only
+// retires the coverage of removed criteria.
+func (p *planner) authorless() bool {
+	return p.state.NoImplementation && len(p.state.Delta.coverageCriteria()) == 0
 }
 
 // verifyFrozen runs the deterministic checks and the role reviews on a frozen plan commit. It
@@ -1217,7 +1250,7 @@ func approvedOn(reviews []ReviewVerdict, role, sha string) bool {
 func (p *planner) testDir() string { return p.pcfg.AcceptanceDir + "/" + p.state.ID + "/" }
 
 func (p *planner) input() PlanInput {
-	return PlanInput{OutcomeID: p.state.ID, Kind: p.state.Kind, Spec: p.spec, Delta: p.state.Delta, Protected: p.cfg.Protected, Config: p.cfg, Retired: p.state.Retired, Absences: p.state.Absences}
+	return PlanInput{OutcomeID: p.state.ID, Kind: p.state.Kind, Spec: p.spec, Delta: p.state.Delta, Protected: p.cfg.Protected, Config: p.cfg, Retired: p.state.Retired, Absences: p.state.Absences, NoImplementation: p.state.NoImplementation}
 }
 
 // planVerdict reads the author's last non-empty line: "PLAN: READY" or "PLAN: TOO-LARGE".
@@ -1306,6 +1339,9 @@ func (p *planner) freeze(candidate string, files []PlanCandidateFile, plan PlanF
 	}
 	if st.Kind == PlanCharacterize {
 		changelog = fmt.Sprintf("Characterizes %s.", strings.Join(ids, ", "))
+	}
+	if st.NoImplementation {
+		changelog = revisionSummary(st.Delta) + "."
 	}
 	o := generatedOutcome(p.input(), plan, route, changelog)
 	outcome, err := marshalOutcome(o)
@@ -1454,6 +1490,21 @@ func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile
 	}
 	if !g.Passed {
 		return checks, "build", "the build fails with the new tests:\n" + g.Output, false, nil
+	}
+	if p.state.NoImplementation {
+		// No run follows: this commit is recorded as the implementation, so the project's own
+		// test suite must pass on it, not only on the base (a retired file may be referenced).
+		g := gateCommand(ctx, "test", wt, p.cfg.Commands.Test, p.timeout(), p.cfg.PassEnv)
+		g.Output = redactDiagnostic(g.Output)
+		checks = append(checks, PlanCheckEntry{Name: "test", Passed: g.Passed && !g.Uncertain})
+		if uncertain, damaged := settle(g); uncertain {
+			return checks, "test", g.Output, true, nil
+		} else if damaged != "" {
+			return checks, "test", damaged, false, nil
+		}
+		if !g.Passed {
+			return checks, "test", "the test suite fails without the retired tests:\n" + g.Output, false, nil
+		}
 	}
 	dir := p.testDir()
 	seen := map[string]bool{}
@@ -1628,6 +1679,17 @@ func (p *planner) review(ctx context.Context, role, author, commit, wt, diff, pl
 	default:
 		g.Output = role + " reviewer gave no verdict"
 	}
+	if ids := p.state.Delta.clarifiedIDs(); role == RoleQA && v.Verdict == "APPROVE" && len(ids) > 0 {
+		// A green replacement test cannot show that the behavior did not change: QA must
+		// confirm, criterion by criterion, that each clarification only rewords.
+		if no, err := parseEquivalence(string(out), ids); err != nil {
+			g.Passed, v.Verdict = false, "INVALID"
+			g.Output = "QA review is invalid: " + err.Error()
+		} else if len(no) > 0 {
+			g.Passed, v.Verdict = false, "REJECT"
+			g.Output = fmt.Sprintf("QA found that %s change behavior, not only wording: approve them as changed criteria (without --clarify)", strings.Join(no, ", "))
+		}
+	}
 	if checkoutErr != nil {
 		g.Passed, g.Output, v.Verdict = false, checkoutErr.Error(), "INVALID"
 	}
@@ -1658,8 +1720,8 @@ func (p *planner) publish() error {
 // implementation is recorded when aeh run accepts the outcome.
 func (p *planner) logMemory() error {
 	st := p.state
-	if st.Kind == PlanCharacterize {
-		return p.recordCharacterization()
+	if st.Kind == PlanCharacterize || st.NoImplementation {
+		return p.recordPlan()
 	}
 	marker := "AEH-Plan: " + st.ID + " " + st.PlanCommit
 	done := func() error {
@@ -1700,32 +1762,47 @@ func (p *planner) logMemory() error {
 // code_sha is the commit that holds the sealed tests, observed_base_sha the inspected commit.
 // A later plan requires code_sha in its base, that is, merged by the owner. RecordChange is
 // idempotent by outcome and commit, so a crash after the memory commit only repeats it.
-func (p *planner) recordCharacterization() error {
+func (p *planner) recordPlan() error {
 	st := p.state
+	what, again := "characterization", "aeh adopt seal"
+	if st.NoImplementation {
+		what, again = "revision", "aeh plan"
+	}
 	planYAML, ok := gitBlob(p.repo.Root, st.PlanCommit, p.testDir()+"plan.yaml")
 	if !ok {
-		return fmt.Errorf("characterization %s: plan commit %s has no plan.yaml", st.ID, short(st.PlanCommit))
+		return fmt.Errorf("%s %s: plan commit %s has no plan.yaml", what, st.ID, short(st.PlanCommit))
 	}
 	plan, err := parsePlanFile([]byte(planYAML))
 	if err != nil {
-		return fmt.Errorf("characterization %s: %w", st.ID, err)
+		return fmt.Errorf("%s %s: %w", what, st.ID, err)
 	}
-	im := &Implementation{Outcome: st.ID, Approval: st.SpecDigest, SpecVersion: st.SpecVersion, Code: st.PlanCommit, ObservedBase: st.ObservedBase}
-	for _, c := range st.Delta.New {
-		var tests []string
-		for _, f := range plan.Trace[fmt.Sprintf("AC-%d", c.ID)] {
-			tests = append(tests, p.testDir()+f)
-		}
-		if len(tests) == 0 {
-			return fmt.Errorf("characterization %s has no tests for AC-%d", st.ID, c.ID)
-		}
-		im.Criteria = append(im.Criteria, ImplementedCriterion{ID: c.ID, Text: c.Text, Tests: tests})
-	}
-	sort.Slice(im.Criteria, func(i, j int) bool { return im.Criteria[i].ID < im.Criteria[j].ID })
+	// A characterization covers its new criteria; a revision covers every criterion of the
+	// pinned spec, with the surviving sealed tests and the plan's green tests.
+	crit := st.Delta.New
 	note := fmt.Sprintf("characterization tests of the existing behavior observed at %s; merge %s", short(st.ObservedBase), IntegrationBranch(st.ID))
+	if st.NoImplementation {
+		if crit, _, err = p.spec.Criteria(); err != nil {
+			return fmt.Errorf("%s %s: %w", what, st.ID, err)
+		}
+		note = fmt.Sprintf("%s without code changes; merge %s", revisionSummary(st.Delta), IntegrationBranch(st.ID))
+	}
+	im := &Implementation{Outcome: st.ID, Approval: st.SpecDigest, SpecVersion: st.SpecVersion, Code: st.PlanCommit, ObservedBase: st.ObservedBase,
+		Retired: append([]RetiredTest(nil), st.Retired...)}
+	if im.Criteria, err = implementedCriteria(st.ID, crit, st.Delta, st.Absences, plan, p.testDir()); err != nil {
+		return fmt.Errorf("%s %s: %w", what, st.ID, err)
+	}
+	// One plan, one predecessor: if another implementation was recorded since the plan was
+	// reserved (and it is not this plan's own record after a crash), the plan is superseded;
+	// it needs a restart, so aeh plan no longer resumes it.
+	if cur, err := LoadMemory(p.repo); err == nil {
+		if now, ok := cur.Spec(st.Feature); ok && lastCode(now) != st.PriorCode && lastCode(now) != st.PlanCommit {
+			return p.restart(fmt.Sprintf("Another implementation of %s was recorded after plan %s was reserved; this plan is superseded and was not recorded. Plan the feature again: %s %s",
+				st.Feature, st.ID, again, st.Feature))
+		}
+	}
 	rec := PendingRecord{OutcomeID: st.ID, Feature: st.Feature, Change: "minor", Note: note, Commit: st.PlanCommit, Implementation: im, MemoryBase: st.MemoryCommit}
 	if _, _, err := RecordChange(p.repo, rec, ""); err != nil {
-		return fmt.Errorf("characterization %s: %w; run aeh adopt seal %s again to finish", st.ID, err, st.Feature)
+		return fmt.Errorf("%s %s: %w; run %s %s again to finish", what, st.ID, err, again, st.Feature)
 	}
 	st.Phase, st.Status = PlanLogged, PlanLogged
 	return savePlanState(p.repo, st)
