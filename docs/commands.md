@@ -155,6 +155,8 @@ A queued approval refuses new changes linked through `--feature` or touching its
 
 `aeh answer <ID> "<text>"` answers a blocked outcome or plan so it can run again (`aeh run`, `aeh plan` or `aeh adopt seal`).
 
+For an agent's terminal `SPEC-QUESTION`, the answer preserves the saved cursor and does not consume a ladder step. Then run `aeh run <ID>`: an implementer uses the same profile in a new attempt/worktree; a reviewer uses the same profile and candidate SHA, preserving the other reviews of that SHA. This also resumes a question from `aeh do` by its printed `DO-...` ID. Implementation and review prompts receive the owner's answers. Empty answers and answers to work that is no longer blocked are refused without changing state; recognized secrets in answers are redacted. State is saved atomically before returning. Status and evidence show the question, asking role/profile/provider and attempts resumed from the cursor. A queued spec approval never replaces an answer: answer and finish, or `aeh abandon <ID>`. Plans keep their existing ladder/answer behavior.
+
 Abandoned work refuses answers.
 
 ### `aeh abandon`

@@ -768,6 +768,19 @@ func printStatus(repo aeh.Repo) error {
 			attempts += len(t.Attempts)
 		}
 		fmt.Printf("%-22s %-9s tasks %d/%d  attempts %-3d %s\n", s.ID, s.Status, done, len(s.Tasks), attempts, s.Title)
+		if s.Cursor != nil {
+			fmt.Println("  " + s.Cursor.Summary())
+		}
+		for _, task := range s.Tasks {
+			for _, a := range task.Attempts {
+				if a.SpecQuestion != nil && s.Cursor == nil {
+					fmt.Println("  " + a.SpecQuestion.Summary())
+				}
+				if a.ResumedFromCursor {
+					fmt.Printf("  task %s attempt %d resumed from cursor\n", task.ID, a.N)
+				}
+			}
+		}
 		if s.Status == aeh.StatusBlocked {
 			fmt.Println("  question: " + strings.ReplaceAll(firstLines(s.Question, 4), "\n", "\n            "))
 		}

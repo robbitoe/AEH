@@ -23,22 +23,26 @@ const (
 
 // Attempt is one try of a task with one profile.
 type Attempt struct {
-	Reviews     []ReviewVerdict `json:"reviews,omitempty"`
-	RolesNotRun []string        `json:"roles_not_run,omitempty"`
-	N           int             `json:"n"`
-	Profile     string          `json:"profile"`
-	Passed      bool            `json:"passed"`
-	FailedGate  string          `json:"failed_gate,omitempty"`
-	RunDir      string          `json:"run_dir"`
-	Base        string          `json:"base,omitempty"`
-	Commit      string          `json:"commit,omitempty"`
-	Worktree    string          `json:"retained_worktree,omitempty"`
-	StartedAt   time.Time       `json:"started_at"`
-	Seconds     float64         `json:"seconds"`
+	SpecQuestion      *SpecCursor     `json:"spec_question,omitempty"`
+	ResumedFromCursor bool            `json:"resumed_from_cursor,omitempty"`
+	LadderIndex       int             `json:"ladder_index,omitempty"`
+	Reviews           []ReviewVerdict `json:"reviews,omitempty"`
+	RolesNotRun       []string        `json:"roles_not_run,omitempty"`
+	N                 int             `json:"n"`
+	Profile           string          `json:"profile"`
+	Passed            bool            `json:"passed"`
+	FailedGate        string          `json:"failed_gate,omitempty"`
+	RunDir            string          `json:"run_dir"`
+	Base              string          `json:"base,omitempty"`
+	Commit            string          `json:"commit,omitempty"`
+	Worktree          string          `json:"retained_worktree,omitempty"`
+	StartedAt         time.Time       `json:"started_at"`
+	Seconds           float64         `json:"seconds"`
 }
 
 // ReviewVerdict binds a role's decision to the exact candidate and selected reviewer.
 type ReviewVerdict struct {
+	Question     string `json:"question,omitempty"`
 	Role         string `json:"role"`
 	Profile      string `json:"profile"`
 	Provider     string `json:"provider"`
@@ -56,6 +60,8 @@ type TaskState struct {
 
 // State is the local, ignored record of an outcome's execution.
 type State struct {
+	Cursor          *SpecCursor `json:"spec_cursor,omitempty"`
+	ResumeOutcome   *Outcome    `json:"resume_outcome,omitempty"` // ephemeral aeh do contract
 	Version         int         `json:"version"`
 	InitialRoute    string      `json:"initial_route"`
 	EffectiveRoute  string      `json:"effective_route"`
@@ -206,7 +212,17 @@ func Answer(r Repo, id, text string) error {
 	if s.Status != StatusBlocked {
 		return errors.New("outcome " + id + " is not blocked (status: " + s.Status + ")")
 	}
-	s.Answers = append(s.Answers, strings.TrimSpace(text))
+	text = redactDiagnostic(strings.TrimSpace(text))
+	if text == "" {
+		return errors.New("answer must not be empty")
+	}
+	if s.Cursor != nil {
+		s.Cursor.Answer = text
+		// Keep the clarification with its question in every later prompt, even
+		// after a rejection creates a different candidate and clears the cursor.
+		text = fmt.Sprintf("Question: %s\nOwner answer: %s", s.Cursor.Question, text)
+	}
+	s.Answers = append(s.Answers, text)
 	s.Question = ""
 	s.Status = StatusPending
 	for i := range s.Tasks {

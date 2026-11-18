@@ -141,11 +141,20 @@ func (ru *runner) writeReport() string {
 			if !a.Passed {
 				result = "failed at " + a.FailedGate
 			}
+			if a.SpecQuestion != nil {
+				result = "paused for SPEC-QUESTION"
+			}
+			if a.ResumedFromCursor {
+				result += "; resumed from cursor"
+			}
 			fmt.Fprintf(&b, "| %s | %d | %s | %s | %s | %.0f |\n", t.ID, a.N, a.Profile, result, gateSummary(r.Root, a.RunDir), a.Seconds)
 		}
 	}
 	for _, task := range st.Tasks {
 		for _, attempt := range task.Attempts {
+			if attempt.SpecQuestion != nil {
+				fmt.Fprintf(&b, "\n%s attempt %d: %s\n", task.ID, attempt.N, attempt.SpecQuestion.Summary())
+			}
 			for _, v := range attempt.Reviews {
 				fmt.Fprintf(&b, "\n%s attempt %d: review **%s** · Profile: `%s` · Provider: `%s` · SHA: `%s` · Verdict: **%s** · Prompt: `%s`\n", task.ID, attempt.N, v.Role, v.Profile, v.Provider, v.SHA, v.Verdict, v.PromptSource)
 			}
