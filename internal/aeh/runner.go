@@ -95,6 +95,16 @@ func RunOutcome(ctx context.Context, r Repo, id string, log io.Writer) (State, e
 		return State{}, err
 	}
 	o, err := r.LoadOutcome(id)
+	_, outcomeStatErr := os.Stat(r.OutcomePath(id))
+	if err != nil && errors.Is(outcomeStatErr, os.ErrNotExist) && strings.HasPrefix(id, "DO-") {
+		s, stateErr := loadState(r, id)
+		if stateErr != nil {
+			return s, stateErr
+		}
+		if s.ResumeOutcome != nil {
+			o, err = *s.ResumeOutcome, nil
+		}
+	}
 	if err != nil {
 		return State{}, err
 	}
@@ -194,6 +204,9 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer, gen 
 		st.Title = o.Title
 	}
 	st.Feature, st.Paths, st.Change, st.Changelog = o.Feature, paths, o.Change, o.Changelog
+	if strings.HasPrefix(o.ID, "DO-") {
+		st.ResumeOutcome = &o
+	}
 	switch st.Status {
 	case StatusAccepted:
 		return st, fmt.Errorf("%s is already accepted on branch %s", o.ID, st.Branch)
@@ -475,16 +488,42 @@ func (ru *runner) runTask(ctx context.Context, t Task, ts *TaskState) (bool, str
 	if maxLines <= 0 {
 		maxLines = ru.cfg.Limits.MaxDiffLines
 	}
+	from := 0
+	cursor := ru.state.Cursor
+	if cursor != nil && cursor.Task == t.ID {
+		first, from = cursor.First, cursor.LadderIndex
+		if from < 0 || from >= maxAttempts || cursor.Answer == "" {
+			return false, "", fmt.Errorf("task %s: invalid or unanswered spec cursor", t.ID)
+		}
+		for _, name := range []string{cursor.Author, cursor.Profile} {
+			if err := ru.cfg.checkProfile(name); err != nil {
+				return false, "", fmt.Errorf("resume spec cursor: %w", err)
+			}
+		}
+	}
 	ts.Status = StatusRunning
 	var last attemptResult
-	for i := 0; i < maxAttempts; i++ {
+	for i := from; i < maxAttempts; i++ {
 		profile := first
 		if i == maxAttempts-1 {
 			profile = ru.cfg.escalate(first)
 		}
+		if cursor != nil && cursor.Task == t.ID {
+			profile = cursor.Author
+		}
 		n := len(ts.Attempts) + 1
 		res, err := ru.attempt(ctx, t, n, profile, maxLines, last)
+		res.LadderIndex = i
 		res.Seconds = time.Since(res.StartedAt).Seconds()
+		if cursor != nil && cursor.Task == t.ID {
+			res.ResumedFromCursor = true
+		}
+		if res.SpecQuestion != nil && err == nil {
+			ru.pauseSpec(t, &res, i, first)
+			ts.Status = StatusBlocked
+		} else if err == nil {
+			ru.state.Cursor = nil
+		}
 		ts.Attempts = append(ts.Attempts, res.Attempt)
 		if res.Passed {
 			ts.Status = StatusDone
@@ -496,6 +535,10 @@ func (ru *runner) runTask(ctx context.Context, t Task, ts *TaskState) (bool, str
 		if err != nil {
 			return false, "", err
 		}
+		if res.SpecQuestion != nil {
+			return false, res.SpecQuestion.Question, nil
+		}
+		cursor = nil
 		if res.Passed {
 			return true, "", nil
 		}
@@ -569,17 +612,48 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 	record := func() error {
 		return writePrivateJSON(filepath.Join(runDir, "gates.json"), gates)
 	}
-	if _, err := runAgent(ctx, ru.cfg.Profiles[profile], ru.cfg.PassEnv, wt, prompt, runDir, "agent"); err != nil {
-		res.FailedGate, res.Feedback = "agent", err.Error()
-		res.Uncertain = uncertainExit(err)
-		if res.Uncertain {
-			res.Worktree = wt
+	var output string
+	var resume *Attempt
+	if c := ru.state.Cursor; c != nil && c.Task == t.ID && c.Phase == "review" {
+		for _, a := range ru.state.task(t.ID).Attempts {
+			if a.N == c.Attempt && a.Commit == c.Candidate && a.Base == base {
+				copy := a
+				resume = &copy
+			}
 		}
-		check(GateResult{Name: res.FailedGate, Output: res.Feedback, Uncertain: res.Uncertain})
-		return res, record()
+		if resume == nil {
+			return res, fmt.Errorf("task %s: cursor candidate does not match recorded attempt", t.ID)
+		}
+	} else {
+		outPath, runErr := runAgent(ctx, ru.cfg.Profiles[profile], ru.cfg.PassEnv, wt, prompt, runDir, "agent")
+		if runErr != nil {
+			err := runErr
+			res.FailedGate, res.Feedback = "agent", err.Error()
+			res.Uncertain = uncertainExit(err)
+			if res.Uncertain {
+				res.Worktree = wt
+			}
+			check(GateResult{Name: res.FailedGate, Output: res.Feedback, Uncertain: res.Uncertain})
+			return res, record()
+		}
+		out, err := os.ReadFile(outPath)
+		if err != nil {
+			return res, fmt.Errorf("read implementer output: %w", err)
+		}
+		output = string(out)
 	}
 
-	commit, err := candidateCommit(wt, base, fmt.Sprintf("aeh: %s %s %s (attempt %d, %s)", o.ID, t.ID, firstLine(t.Goal), n, profile))
+	var commit string
+	if resume != nil {
+		commit = resume.Commit
+		for _, v := range resume.Reviews {
+			if v.SHA == commit && v.Verdict == "APPROVE" {
+				res.Reviews = append(res.Reviews, v)
+			}
+		}
+	} else {
+		commit, err = candidateCommit(wt, base, fmt.Sprintf("aeh: %s %s %s (attempt %d, %s)", o.ID, t.ID, firstLine(t.Goal), n, profile))
+	}
 	if err != nil {
 		res.FailedGate, res.Feedback = "scope", err.Error()
 		check(GateResult{Name: res.FailedGate, Output: res.Feedback})
@@ -611,6 +685,16 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 		if err := writePrivateJSON(filepath.Join(runDir, "requirements.json"), map[string]any{"route": ru.state.EffectiveRoute, "roles": ru.state.Roles, "rules": ru.state.RulesHit, "missing": question}); err != nil {
 			return res, err
 		}
+		return res, record()
+	}
+	question, invalid := agentTerminal(output)
+	// A clean question with no candidate changes needs no verification run. It
+	// approves nothing. When changes exist, failed gates take precedence below.
+	if len(changes) == 0 && question != "" {
+		if err := verifyCheckout(wt, base); err != nil {
+			return res, fmt.Errorf("question checkout: %w", err)
+		}
+		res.SpecQuestion = &SpecCursor{Phase: "implementation", Role: "implementer", Profile: profile, Provider: ru.cfg.Profiles[profile].Provider, Question: question}
 		return res, record()
 	}
 	// Hash and scope read Git objects in the main repository, so nothing from the
@@ -649,15 +733,37 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 	if passed && ru.generated != nil {
 		passed = check(ru.acceptanceGate(ctx, verified, commit))
 	}
+	if passed && (question != "" || invalid) {
+		if question != "" {
+			res.SpecQuestion = &SpecCursor{Phase: "implementation", Role: "implementer", Profile: profile, Provider: ru.cfg.Profiles[profile].Provider, Question: question}
+			return res, record()
+		}
+		passed = check(GateResult{Name: "agent", Output: "invalid SPEC-QUESTION terminal result"})
+	}
 	if passed {
 		roles := requiredRoles(ru.state.EffectiveRoute, ru.state.Roles)
 		res.RolesNotRun = nil
 		for i, role := range roles {
+			if approvedOn(res.Reviews, role, commit) {
+				continue
+			}
 			g, verdict, err := ru.review(ctx, t, role, profile, commit, verified, diff, runDir)
 			if err != nil {
 				return res, err
 			}
 			res.Reviews = append(res.Reviews, verdict)
+			if verdict.Question != "" {
+				res.SpecQuestion = &SpecCursor{Phase: "review", Role: role, Profile: verdict.Profile, Provider: verdict.Provider, Question: verdict.Question}
+				res.RolesNotRun = append(res.RolesNotRun, roles[i+1:]...)
+				// A state file names an object but does not make it reachable to
+				// Git GC. Keep the paused candidate as durable evidence, including
+				// after abandonment, without advancing the integration branch.
+				ref := fmt.Sprintf("refs/aeh/questions/%s/%s-a%d", o.ID, t.ID, n)
+				if _, err := git(r.Root, "update-ref", ref, commit); err != nil {
+					return res, fmt.Errorf("retain question candidate: %w", err)
+				}
+				return res, record()
+			}
 			passed = check(g)
 			if !passed {
 				res.RolesNotRun = append(res.RolesNotRun, roles[i+1:]...)
@@ -709,8 +815,18 @@ func (ru *runner) review(ctx context.Context, t Task, role, author, commit, wt, 
 		return g, v, err
 	}
 	v.Profile, v.Provider = profile, ru.cfg.Profiles[profile].Provider
+	if c := ru.state.Cursor; c != nil && c.Task == t.ID && c.Phase == "review" && c.Role == role {
+		profile = c.Profile
+		if err := ru.cfg.independent(author, profile); err != nil {
+			return g, v, fmt.Errorf("resume reviewer: %w", err)
+		}
+		v.Profile, v.Provider = profile, ru.cfg.Profiles[profile].Provider
+	}
+	if err := ru.cfg.checkProfile(profile); err != nil {
+		return g, v, fmt.Errorf("review profile: %w", err)
+	}
 	start := time.Now()
-	prompt, err := renderPrompt("review-"+role+".md", ru.reviewPrompts[role], promptData{Outcome: ru.outcome, Task: t, Diff: diff})
+	prompt, err := renderPrompt("review-"+role+".md", ru.reviewPrompts[role], promptData{Outcome: ru.outcome, Task: t, Diff: diff, Answers: ru.state.Answers})
 	if err != nil {
 		return g, v, err
 	}
@@ -730,6 +846,19 @@ func (ru *runner) review(ctx context.Context, t Task, role, author, commit, wt, 
 	if err != nil {
 		return g, v, fmt.Errorf("read reviewer output: %w", err)
 	}
+	if checkoutErr != nil {
+		g.Output = checkoutErr.Error()
+		return g, v, nil
+	}
+	question, invalid := agentTerminal(string(out))
+	if invalid {
+		g.Output = "invalid SPEC-QUESTION terminal result"
+		return g, v, nil
+	}
+	if question != "" {
+		v.Verdict, v.Question, g.Output = "SPEC-QUESTION", question, question
+		return g, v, nil
+	}
 	switch parseVerdict(string(out)) {
 	case "APPROVE":
 		g.Passed = true
@@ -740,14 +869,14 @@ func (ru *runner) review(ctx context.Context, t Task, role, author, commit, wt, 
 	default:
 		g.Output = "reviewer gave no verdict"
 	}
-	if checkoutErr != nil {
-		g.Passed, g.Output, v.Verdict = false, checkoutErr.Error(), "INVALID"
-	}
 	return g, v, nil
 }
 
 // parseVerdict accepts one exact verdict on the final nonempty line of plain stdout.
 func parseVerdict(out string) string {
+	if question, invalid := agentTerminal(out); question != "" || invalid {
+		return ""
+	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	for i, line := range lines {
 		switch strings.TrimSpace(line) {
@@ -873,6 +1002,18 @@ func (ru *runner) completeTaskReviews(ctx context.Context, t Task, a *Attempt, m
 			}
 			question = fmt.Sprintf("Task %s required %s review failed on its accepted SHA %s:\n%s\n", t.ID, role, a.Commit, tail(strings.TrimSpace(g.Output), 1500))
 			switch {
+			case verdict.Question != "":
+				question = verdict.Question
+				c := &SpecCursor{Task: t.ID, Phase: "review", Role: role, Profile: verdict.Profile, Provider: verdict.Provider,
+					Author: a.Profile, Candidate: a.Commit, Attempt: a.N, LadderIndex: a.LadderIndex,
+					RetriesUsed: a.LadderIndex, First: ru.cfg.Ladder[0], AddedReview: true, Question: question}
+				if c.LadderIndex == maxAttempts-1 {
+					c.RetriesUsed = 0
+				}
+				if t.Start != "" {
+					c.First = t.Start
+				}
+				a.SpecQuestion, ru.state.Cursor = c, c
 			case g.Uncertain:
 				question += "Confirm all processes stopped and review possible effects before answering to retry. See the attempt artifacts."
 			case verdict.Verdict == "REJECT":
@@ -884,6 +1025,9 @@ func (ru *runner) completeTaskReviews(ctx context.Context, t Task, a *Attempt, m
 				question += "Resolve the review failure; aeh answer followed by aeh run retries the missing review."
 			}
 			ru.state.Status, ru.state.Question = StatusBlocked, question
+		} else if c := ru.state.Cursor; c != nil && c.Task == t.ID && c.AddedReview {
+			a.ResumedFromCursor = true
+			ru.state.Cursor = nil
 		}
 		recordErr := writePrivateJSON(filepath.Join(runDir, "gates.json"), gates)
 		if err := errors.Join(recordErr, saveState(r, ru.state)); err != nil {
@@ -1011,7 +1155,7 @@ func (ru *runner) block(question string) error {
 	}
 	ru.writeReport()
 	hint := fmt.Sprintf("Reply with: aeh answer %s \"...\" and run it again", ru.outcome.ID)
-	if strings.HasPrefix(ru.outcome.ID, "DO-") {
+	if strings.HasPrefix(ru.outcome.ID, "DO-") && ru.state.Cursor == nil {
 		hint = "Refine the request and run `aeh do` again, or turn it into an outcome."
 	}
 	if ru.state.RestartRequired {

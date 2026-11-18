@@ -57,3 +57,10 @@ Attempt {{.Attempt}}. The previous attempt was discarded after failing the "{{.F
 
 You are starting again from a clean copy. Fix the cause; do not work around the check.
 {{- end}}
+
+## Specification questions
+
+If the spec is ambiguous or contradicts itself, ask the owner instead of guessing.
+End plain stdout with `SPEC-QUESTION: <question>` as the last nonempty line.
+The question must be one line of 1 to 500 UTF-8 bytes, without controls or secrets.
+Use exactly one terminal result: never include a VERDICT line with a question.

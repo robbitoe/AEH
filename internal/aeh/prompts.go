@@ -205,5 +205,12 @@ func renderPrompt(name, text string, data promptData) (string, error) {
 	if err := tmpl.Execute(&buf, data); err != nil {
 		return "", err
 	}
+	// Legacy project overrides may predate .Answers. Owner clarification is
+	// required context on resume even when that template never renders it.
+	for _, answer := range data.Answers {
+		if !strings.Contains(buf.String(), answer) {
+			fmt.Fprintf(&buf, "\n\n## Answer from the owner\n\n%s\n", answer)
+		}
+	}
 	return buf.String(), nil
 }

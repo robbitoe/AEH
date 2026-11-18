@@ -27,3 +27,17 @@ briefly, each with its file and why it matters. Then end your answer with exactl
 VERDICT: APPROVE
 or
 VERDICT: REJECT
+
+## Specification questions
+
+If the spec is ambiguous or contradicts itself, ask the owner instead of guessing.
+End plain stdout with `SPEC-QUESTION: <question>` as the last nonempty line.
+The question must be one line of 1 to 500 UTF-8 bytes, without controls or secrets.
+Use exactly one terminal result: never include a VERDICT line with a question.
+{{- if .Answers}}
+
+## Answers from the owner
+
+{{range .Answers}}- {{.}}
+{{end}}
+{{- end}}
