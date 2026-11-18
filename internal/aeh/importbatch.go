@@ -453,6 +453,11 @@ func importMemoryBatch(r Repo, b memoryBatch) (commit string, imported bool, err
 	if head != b.ExpectedHead {
 		return "", false, fmt.Errorf("import %s: %w (expected %s, found %s)", b.Session, ErrMemoryChanged, short(b.ExpectedHead), short(head))
 	}
+	// A recovered promotion changes ownership too; a completed import's marker above
+	// remains idempotent even while a newer approval is queued.
+	if err := admitFeatureImports(r, dir, b.Files); err != nil {
+		return "", false, fmt.Errorf("import %s: %w", b.Session, err)
+	}
 	if err := checkTrackedCase(dir, b.Files); err != nil {
 		return "", false, fmt.Errorf("import %s: %w", b.Session, err)
 	}

@@ -65,6 +65,8 @@ type Spec struct {
 	Body    string
 	// Approval is the owner's last approval of this spec, or nil; see Approved.
 	Approval *SpecApproval
+	// Queued is set on the result of approving a version that cannot yet become current.
+	Queued *QueuedApproval
 	// Implemented lists the accepted implementations of approved contents, oldest first.
 	Implemented []Implementation
 	// rev is the memory commit the spec was read from, or "" for the working tree. Criteria
@@ -285,11 +287,16 @@ func MemoryDir(r Repo) (string, error) {
 
 // InitMemory creates the memory repository. It returns false when it already exists.
 func InitMemory(r Repo) (bool, error) {
-	unlock, err := lockProject(r)
+	unlock, err := lockLiveProject(r)
 	if err != nil {
 		return false, err
 	}
 	defer unlock()
+	return initMemoryLocked(r)
+}
+
+// initMemoryLocked also lets abandon record a marker for a manual run predating memory.
+func initMemoryLocked(r Repo) (bool, error) {
 	main, err := MainCheckout(r)
 	if err != nil {
 		return false, err
@@ -564,7 +571,7 @@ func (m MemorySnapshot) ContractFingerprint(declared string) string {
 
 // CreateSpec adds a feature at version 0.1.0 with an empty body for the owner to write.
 func CreateSpec(r Repo, feature, title string, paths []string) (Spec, error) {
-	unlock, err := lockProject(r)
+	unlock, err := lockLiveProject(r)
 	if err != nil {
 		return Spec{}, err
 	}
@@ -587,6 +594,9 @@ func CreateSpec(r Repo, feature, title string, paths []string) (Spec, error) {
 	}
 	front := specFront{Feature: feature, Title: strings.TrimSpace(title), Version: "0.1.0", Paths: paths}
 	if err := front.validate(); err != nil {
+		return Spec{}, err
+	}
+	if err := admitWork(r, feature, paths, ""); err != nil {
 		return Spec{}, err
 	}
 	fm, err := yaml.Marshal(front)
@@ -728,12 +738,19 @@ func ownerApprovals(dir, feature string) ([]SpecApproval, error) {
 	aRel, sRel := approvalRel(feature), specRel(feature)
 	// --full-history: path simplification would skip a side branch whose files a merge did
 	// not keep, hiding an approval that is still in HEAD's history.
-	log, err := git(dir, "log", "--full-history", "--reverse", "--format=%H", "--", aRel, sRel)
+	log, err := git(dir, "log", "--full-history", "--reverse", "--format=%H", "--", aRel, sRel, queueRel(feature))
 	if err != nil {
 		return nil, fmt.Errorf("approval history of %s: %w", feature, err)
 	}
 	var out []SpecApproval
 	for _, sha := range strings.Fields(log) {
+		if b, ok := gitBlob(dir, sha, queueRel(feature)); ok {
+			q, err := parseQueue([]byte(b))
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, q.Approval)
+		}
 		b, ok := gitBlob(dir, sha, aRel)
 		if !ok {
 			continue
@@ -809,7 +826,7 @@ func ApproveSpec(r Repo, feature string) (Spec, bool, error) {
 
 // ApproveSpecWith is ApproveSpec with the owner's options (clarifications).
 func ApproveSpecWith(r Repo, feature string, opt ApproveOptions) (Spec, bool, error) {
-	unlock, err := lockProject(r)
+	unlock, err := lockLiveProject(r)
 	if err != nil {
 		return Spec{}, false, err
 	}
@@ -827,6 +844,17 @@ func ApproveSpecWith(r Repo, feature string, opt ApproveOptions) (Spec, bool, er
 	}
 	if err := memoryClean(snap.Dir); err != nil {
 		return Spec{}, false, fmt.Errorf("approve %s: %w; commit your spec edits in the memory repository first", feature, err)
+	}
+	replacing, err := queuedReplacement(snap, spec)
+	if err != nil {
+		return Spec{}, false, err
+	}
+	except := ""
+	if replacing {
+		except = feature
+	}
+	if err := admitWorkExceptQueue(r, feature, spec.Paths, "", except); err != nil {
+		return Spec{}, false, err
 	}
 	// Criteria are checked before the already-approved shortcut, so an approval never stands
 	// for criteria aeh cannot plan from.
@@ -866,6 +894,13 @@ func ApproveSpecWith(r Repo, feature string, opt ApproveOptions) (Spec, bool, er
 		}
 	}
 	sort.Ints(a.Criteria)
+	if q, err := enqueueApproval(r, snap, spec, a); err != nil {
+		return Spec{}, false, fmt.Errorf("queue approval %s: %w", feature, err)
+	} else if q != nil {
+		spec.Queued = q
+		spec.Approval = &a
+		return spec, true, nil
+	}
 	b, err := yaml.Marshal(a)
 	if err != nil {
 		return Spec{}, false, err
@@ -896,6 +931,16 @@ func RecordChange(r Repo, p PendingRecord, expectedFingerprint string) (version,
 	}
 	if !isFullSHA(p.Commit) {
 		return "", "", fmt.Errorf("record %s: commit %q is not a full SHA", p.OutcomeID, p.Commit)
+	}
+	main, err := MainCheckout(r)
+	if err != nil {
+		return "", "", err
+	}
+	r = Repo{Root: main}
+	if s, err := loadState(r, p.OutcomeID); err != nil {
+		return "", "", fmt.Errorf("record %s: load acceptance: %w", p.OutcomeID, err)
+	} else if s.Status == StatusAbandoned {
+		return "", "", fmt.Errorf("record %s: abandoned work cannot be accepted", p.OutcomeID)
 	}
 	note, err := changelogNote(p.Note)
 	if err != nil {
@@ -1166,7 +1211,12 @@ func ListPending(r Repo) ([]PendingRecord, error) {
 // RecordPending retries the pending record of an outcome by hand. The owner asked for it, so the
 // snapshot check is skipped; the record stays idempotent.
 func RecordPending(r Repo, id string) (version, memoryCommit string, err error) {
-	unlock, err := lockProject(r)
+	main, err := MainCheckout(r)
+	if err != nil {
+		return "", "", err
+	}
+	r = Repo{Root: main}
+	unlock, err := lockLiveProject(r)
 	if err != nil {
 		return "", "", err
 	}
@@ -1182,7 +1232,21 @@ func RecordPending(r Repo, id string) (version, memoryCommit string, err error) 
 	if err != nil {
 		return "", "", err
 	}
-	return version, memoryCommit, ClearPending(r, id)
+	s, err := loadState(r, id)
+	if err != nil {
+		return "", "", err
+	}
+	s.Status, s.MemoryVersion, s.MemoryCommit, s.MemoryError = StatusAccepted, version, memoryCommit, ""
+	if err := saveState(r, &s); err != nil {
+		return "", "", err
+	}
+	if err := ClearPending(r, id); err != nil {
+		return "", "", err
+	}
+	if err := reconcileQueues(r); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: reconcile queues after recording: %v\n", err)
+	}
+	return version, memoryCommit, nil
 }
 
 // MemoryStatus summarizes memory for `aeh memory status`.
@@ -1192,11 +1256,24 @@ type MemoryStatus struct {
 	Dirty   string // git status of the memory repository; empty when clean
 	Specs   []Spec
 	Pending []PendingRecord
+	Work    []PendingWork
+	Queues  []QueuedApproval
+	Errors  []string // recovery/queue errors; readers can still inspect the memory and registry
 }
 
 func ReadMemoryStatus(r Repo) (MemoryStatus, error) {
+	main, err := MainCheckout(r)
+	if err != nil {
+		return MemoryStatus{}, err
+	}
+	r = Repo{Root: main}
+	unlock, recovery, err := lockLiveProjectMode(r, true)
+	if err != nil {
+		return MemoryStatus{}, err
+	}
+	defer unlock()
 	snap, err := LoadMemory(r)
-	st := MemoryStatus{Dir: snap.Dir, Present: snap.Present, Specs: snap.Specs}
+	st := MemoryStatus{Dir: snap.Dir, Present: snap.Present, Specs: snap.Specs, Queues: recovery.Queues, Errors: recovery.Errors}
 	if err != nil {
 		return st, err
 	}
@@ -1207,7 +1284,14 @@ func ReadMemoryStatus(r Repo) (MemoryStatus, error) {
 		}
 	}
 	st.Pending, err = ListPending(r)
-	return st, err
+	if err != nil {
+		return st, err
+	}
+	st.Work, err = pendingWork(r)
+	if err != nil {
+		return st, err
+	}
+	return st, nil
 }
 
 // LastAccepted returns the newest "accepted on" changelog entry of a spec, or "".
@@ -1225,6 +1309,17 @@ var acceptedLine = regexp.MustCompile(`^- (\S+) \((\d{4}-\d{2}-\d{2})\) (\S+) ac
 
 // LintMemory checks memory and its privacy settings. Errors make memory unusable; warnings do not.
 func LintMemory(r Repo) (errs, warnings []string, err error) {
+	unlock, recovery, err := lockLiveProjectMode(r, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer unlock()
+	errs = append(errs, recovery.Errors...)
+	for _, q := range recovery.Queues {
+		if q.ActivationWaiting != "" {
+			warnings = append(warnings, fmt.Sprintf("queued approval %s %s: activation waiting: %s", q.Feature, q.Approval.Version, q.ActivationWaiting))
+		}
+	}
 	main, err := MainCheckout(r)
 	if err != nil {
 		return nil, nil, err

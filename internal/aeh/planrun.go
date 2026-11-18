@@ -225,7 +225,7 @@ func planFeature(ctx context.Context, r Repo, feature, kind string, log io.Write
 		return PlanState{}, err
 	}
 	r = Repo{Root: main}
-	unlockProject, err := lockProject(r)
+	unlockProject, err := lockLiveProject(r)
 	if err != nil {
 		return PlanState{}, err
 	}
@@ -262,6 +262,14 @@ func planFeature(ctx context.Context, r Repo, feature, kind string, log io.Write
 	if !ok {
 		return PlanState{}, fmt.Errorf("feature %q does not exist in memory", feature)
 	}
+	// Adoption and implementation share admission; an existing blocker may resume.
+	open, err := unfinishedPlan(r, feature)
+	if err != nil {
+		return PlanState{}, err
+	}
+	if err := admitWork(r, feature, spec.Paths, open); err != nil {
+		return PlanState{}, err
+	}
 	if kind == PlanCharacterize {
 		// Recording a characterization bumps the spec's version, which names the next plan: a
 		// published one is found by feature, never by the version it moved past.
@@ -288,6 +296,9 @@ func planFeature(ctx context.Context, r Repo, feature, kind string, log io.Write
 	st, exists, err := LoadPlanState(r, id)
 	if err != nil {
 		return st, err
+	}
+	if st.Status == StatusAbandoned {
+		return st, fmt.Errorf("plan %s is abandoned and cannot resume", id)
 	}
 	var observed string
 	if !exists {
@@ -423,6 +434,11 @@ func planFeature(ctx context.Context, r Repo, feature, kind string, log io.Write
 			return st, err
 		}
 	}
+	defer func() {
+		if err := reconcileQueues(r); err != nil {
+			p.logf("warning: reconcile queues after logged plan: %v", err)
+		}
+	}()
 	if kind == PlanCharacterize {
 		p.logf("%s characterized on %s at %s and recorded in memory. Nothing to implement: merge %s into your base.", id, IntegrationBranch(id), short(st.PlanCommit), IntegrationBranch(id))
 		return st, nil
@@ -445,7 +461,7 @@ func unfinishedPlan(r Repo, feature string) (string, error) {
 	var open *PlanState
 	for i := range plans {
 		p := &plans[i]
-		if p.Feature != feature || p.Phase == PlanLogged || p.RestartRequired {
+		if p.Feature != feature || p.Phase == PlanLogged || p.RestartRequired || p.Status == StatusAbandoned {
 			continue
 		}
 		if open == nil || p.UpdatedAt.Before(open.UpdatedAt) {
@@ -1879,6 +1895,9 @@ func answerPlan(r Repo, id, text string) error {
 	}
 	if !ok {
 		return fmt.Errorf("plan %s does not exist", id)
+	}
+	if st.Status == StatusAbandoned {
+		return fmt.Errorf("plan %s is abandoned and cannot receive answers", id)
 	}
 	if st.RestartRequired {
 		return errors.New(st.Question)

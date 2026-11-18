@@ -160,7 +160,8 @@ func TestPlanResumesFromItsPinnedMemory(t *testing.T) {
 	// Tampering with the pin is refused: another commit in history holds another version.
 	path, _ := planStatePath(f.repo, planID)
 	raw := readFile(t, path)
-	head := mustGit(t, memDir(t, f.repo), "rev-parse", "HEAD")
+	queues := mustGit(t, memDir(t, f.repo), "log", "--reverse", "--format=%H", "--", queueRel("pay"))
+	head := mustGit(t, memDir(t, f.repo), "rev-parse", strings.Fields(queues)[0]+"^")
 	write(t, filepath.Dir(path), filepath.Base(path), strings.Replace(raw, st.MemoryCommit, head, 1))
 	if _, err := RunOutcome(context.Background(), f.repo, planID, nil); err == nil || !strings.Contains(err.Error(), "does not hold pay 0.1.0 as planned") {
 		t.Fatalf("a run accepted a pin with another version: %v", err)
@@ -226,6 +227,8 @@ func TestGeneratedRunFinishesItsPinnedVersion(t *testing.T) {
 	// The owner approves a newer version with a second criterion before the run.
 	editSpec(t, f.repo, "pay", "then src/pay.txt says paid.\n", "then src/pay.txt says paid.\n- AC-2: Given a paid cart, when paid again, then nothing changes.\n")
 	raiseVersion(t, f.repo, "pay")
+	// Keep the target above the old run's recorded minor bump (0.2.0).
+	editSpec(t, f.repo, "pay", "version: 0.1.1", "version: 0.3.0")
 	if _, _, err := ApproveSpec(f.repo, "pay"); err != nil {
 		t.Fatal(err)
 	}
@@ -261,12 +264,12 @@ func TestGeneratedRunFinishesItsPinnedVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if next.ID != "pay-v0_2_0" || len(next.Delta.New) != 1 || next.Delta.New[0].ID != 2 || len(next.Delta.Unchanged) != 1 {
+	if next.ID != "pay-v0_3_0" || len(next.Delta.New) != 1 || next.Delta.New[0].ID != 2 || len(next.Delta.Unchanged) != 1 {
 		t.Fatalf("next plan delta: %+v", next)
 	}
 }
 
-// A plan reserved before stage 5 has no pin: its run reads memory as it is, as before.
+// A legacy plan reads the version in force: a newer queued approval leaves it current.
 func TestGeneratedRunWithoutPinReadsCurrentMemory(t *testing.T) {
 	f, _ := generatedFixture(t, implementPay)
 	path, err := planStatePath(f.repo, planID)
@@ -288,8 +291,8 @@ func TestGeneratedRunWithoutPinReadsCurrentMemory(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := generatedRunState(t, f, planID)
-	if st.Status != StatusBlocked || !st.RestartRequired || st.Question != "spec changed since plan; approve it and run aeh plan again" || f.count("impl") != 0 {
-		t.Fatalf("unpinned run ignored the spec change: %+v", st)
+	if st.Status != StatusAccepted || st.RestartRequired || st.MemoryError != "" || f.count("impl") != 1 {
+		t.Fatalf("unpinned run did not finish the version in force: %+v", st)
 	}
 }
 

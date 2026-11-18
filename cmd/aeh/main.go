@@ -64,14 +64,15 @@ Execution
         --feature <f> --change patch|minor|major --note "..."
                                     the feature this change modifies; recorded in memory
   aeh answer <ID> "<text>"          answer a blocked outcome so it can run again
+  aeh abandon <ID>                  abandon unfinished work, preserving its branch and evidence
 
 Memory (local, private: .aeh/memory/ of the main checkout, never published by aeh)
   aeh memory init                   create the memory repository
   aeh memory new <feature> --title "..." --paths a/**,b/**
                                     add a feature spec at version 0.1.0
   aeh memory approve <feature> [--clarify AC-<n>,...|none]
-                                    approve the spec as it reads now (required by route new)
-  aeh memory status                 features, versions, approvals and pending records
+                                    approve the exact spec; queue it while unfinished work remains
+  aeh memory status                 features, pending work, queued approvals and blockers
   aeh memory lint                   check memory and its privacy settings
   aeh memory record <ID>            retry a pending memory record of an accepted outcome
 
@@ -183,6 +184,16 @@ func dispatch(ctx context.Context, args []string) (int, error) {
 		}
 		return 0, nil
 
+	case "abandon":
+		if len(args) != 2 {
+			return 2, errors.New("usage: aeh abandon <ID>")
+		}
+		if err := aeh.Abandon(repo, args[1]); err != nil {
+			return 1, err
+		}
+		fmt.Printf("%s abandoned; branch and evidence kept\n", args[1])
+		return 0, nil
+
 	case "answer":
 		if len(args) < 3 {
 			return 2, errors.New(`usage: aeh answer <ID> "<text>"`)
@@ -273,7 +284,12 @@ func memoryCommand(repo aeh.Repo, args []string) (int, error) {
 		if err != nil {
 			return 1, err
 		}
-		if changed {
+		if s.Queued != nil {
+			fmt.Printf("approved %s %s, queued; version in force remains %s\n", s.Feature, s.Version, s.Queued.CurrentVersion)
+			for _, b := range s.Queued.Blockers {
+				fmt.Printf("  blocker: %s (%s)\n", b.ID, b.Reason)
+			}
+		} else if changed {
 			fmt.Printf("approved %s %s; editing its title, paths or text voids the approval\n", s.Feature, s.Version)
 		} else {
 			fmt.Printf("%s %s is already approved as it reads now\n", s.Feature, s.Version)
@@ -284,6 +300,9 @@ func memoryCommand(repo aeh.Repo, args []string) (int, error) {
 		st, err := aeh.ReadMemoryStatus(repo)
 		if err != nil {
 			return 1, err
+		}
+		for _, diagnostic := range st.Errors {
+			fmt.Println("error:", diagnostic)
 		}
 		if !st.Present {
 			fmt.Println("no memory yet; create it with: aeh memory init")
@@ -310,6 +329,17 @@ func memoryCommand(repo aeh.Repo, args []string) (int, error) {
 				approval = "edited after approval of " + s.Approval.Version
 			}
 			fmt.Printf("%-24s %-9s %-28s %s\n", s.Feature, s.Version, approval, last)
+			fmt.Print(pendingMemoryText(s.Feature, st.Work, st.Queues))
+		}
+		for _, q := range st.Queues {
+			found := false
+			for _, s := range st.Specs {
+				found = found || s.Feature == q.Feature
+			}
+			if !found {
+				fmt.Printf("%s: spec missing\n", q.Feature)
+				fmt.Print(pendingMemoryText(q.Feature, st.Work, st.Queues))
+			}
 		}
 		for _, p := range st.Pending {
 			fmt.Printf("pending record: %s -> %s (%s); retry with: aeh memory record %s\n", p.OutcomeID, p.Feature, p.Change, p.OutcomeID)
@@ -345,6 +375,28 @@ func memoryCommand(repo aeh.Repo, args []string) (int, error) {
 		return 0, nil
 	}
 	return 2, fmt.Errorf("unknown memory command %q; run `aeh help`", args[0])
+}
+
+func pendingMemoryText(feature string, work []aeh.PendingWork, queues []aeh.QueuedApproval) string {
+	var text strings.Builder
+	for _, w := range work {
+		if w.Feature == feature {
+			fmt.Fprintf(&text, "  pending work: %s (%s)\n", w.ID, w.Reason)
+		}
+	}
+	for _, q := range queues {
+		if q.Feature != feature {
+			continue
+		}
+		fmt.Fprintf(&text, "  queued approval: %s (in force: %s)\n", q.Approval.Version, q.CurrentVersion)
+		if q.ActivationWaiting != "" {
+			fmt.Fprintf(&text, "    activation waiting: %s\n", q.ActivationWaiting)
+		}
+		for _, b := range q.Blockers {
+			fmt.Fprintf(&text, "    blocker: %s (%s)\n", b.ID, b.Reason)
+		}
+	}
+	return text.String()
 }
 
 func adoptCommand(ctx context.Context, repo aeh.Repo, args []string) (int, error) {
@@ -655,6 +707,9 @@ func printDiscovery(st aeh.DiscoveryState, all bool) {
 }
 
 func printStatus(repo aeh.Repo) error {
+	if err := aeh.RecoverLiveWork(repo); err != nil {
+		return err
+	}
 	states, err := aeh.ListStates(repo)
 	if err != nil {
 		return err

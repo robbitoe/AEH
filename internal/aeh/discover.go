@@ -296,7 +296,7 @@ func openDiscovery(r Repo, slug string, log io.Writer) (*discoverySession, func(
 		return nil, nil, err
 	}
 	r = Repo{Root: main}
-	unlock, err := lockProject(r)
+	unlock, err := lockLiveProject(r)
 	if err != nil {
 		return nil, nil, err
 	}
