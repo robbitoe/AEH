@@ -1347,9 +1347,10 @@ func loadGeneratedRun(r Repo, cfg Config, st PlanState) (Outcome, *generatedRun,
 	if err != nil {
 		return o, nil, err
 	}
-	want := sealFromContents(st.ID, contents, st.SpecDigest, gen.Seal.ApprovedAt)
+	want := sealFromContents(st.ID, contents, st.SpecDigest, gen.Seal.ApprovedAt, st.Absences)
+	legacyManifest := len(st.Absences) == 0 && gen.Seal.Hash == want.Hash && reflect.DeepEqual(gen.Seal.Files, want.Files)
 	if gen.Seal.Outcome != st.ID || gen.Seal.SealedBy != "runner" || gen.Seal.SpecContent != st.SpecDigest ||
-		gen.Seal.Hash != want.Hash || !reflect.DeepEqual(gen.Seal.Files, want.Files) {
+		!reflect.DeepEqual(gen.Seal.Retired, want.Retired) {
 		return o, nil, fmt.Errorf("plan %s seal does not match its pinned acceptance files or spec", st.ID)
 	}
 	gen.Trace, err = parsePlanFile(contents[dir+"plan.yaml"])
@@ -1366,6 +1367,9 @@ func loadGeneratedRun(r Repo, cfg Config, st PlanState) (Outcome, *generatedRun,
 			return o, nil, fmt.Errorf("plan %s has no prior implementation commit", st.ID)
 		}
 		for _, file := range c.Tests {
+			if containsPath(st.Absences, file) {
+				continue
+			}
 			if err := checkPlanTestPath(file); err != nil {
 				return o, nil, err
 			}
@@ -1387,7 +1391,10 @@ func loadGeneratedRun(r Repo, cfg Config, st PlanState) (Outcome, *generatedRun,
 			gen.Paths = append(gen.Paths, file)
 		}
 	}
-	gen.Manifest = sealFromContents(st.ID, contents, st.SpecDigest, gen.Seal.ApprovedAt)
+	gen.Manifest = sealFromContents(st.ID, contents, st.SpecDigest, gen.Seal.ApprovedAt, st.Absences)
+	if !legacyManifest && (gen.Seal.Hash != gen.Manifest.Hash || !reflect.DeepEqual(gen.Seal.Files, gen.Manifest.Files)) {
+		return o, nil, fmt.Errorf("plan %s seal does not match its pinned acceptance files or spec", st.ID)
+	}
 	// Plan roles include rules observed while authoring tests, even if implementation
 	// paths alone would not predict those roles.
 	o.Reviewers = requiredRoles(st.Route, o.Reviewers, st.Roles)
@@ -1421,7 +1428,8 @@ func (ru *runner) generatedContract() any {
 		Reviews                                               []ReviewVerdict
 		Checks                                                []PlanCheckEntry
 		Manifest                                              Seal
-	}{"plan", p.PlanCommit, p.Author, p.SpecDigest, p.PriorCode, p.Delta, p.Route, p.Roles, p.Reviews, p.Checks, ru.generated.Manifest}
+		Retired                                               []RetiredTest `json:",omitempty"`
+	}{"plan", p.PlanCommit, p.Author, p.SpecDigest, p.PriorCode, p.Delta, p.Route, p.Roles, p.Reviews, p.Checks, ru.generated.Manifest, p.Retired}
 }
 
 func (ru *runner) sealedGate(base, commit string) GateResult {
@@ -1463,13 +1471,16 @@ func (ru *runner) implementation() (*Implementation, error) {
 	for _, c := range g.Plan.Delta.Unchanged {
 		unchanged[c.ID] = c
 	}
-	im := &Implementation{Outcome: ru.outcome.ID, Approval: g.Plan.SpecDigest, SpecVersion: g.Plan.SpecVersion, Code: ru.state.Head}
+	im := &Implementation{Outcome: ru.outcome.ID, Approval: g.Plan.SpecDigest, SpecVersion: g.Plan.SpecVersion, Code: ru.state.Head, Retired: append([]RetiredTest(nil), g.Plan.Retired...)}
 	for _, c := range crit {
-		tests := append([]string(nil), unchanged[c.ID].Tests...)
-		if len(tests) == 0 {
-			for _, file := range g.Trace.Trace[fmt.Sprintf("AC-%d", c.ID)] {
-				tests = append(tests, ru.outcome.Acceptance[0]+file)
+		var tests []string
+		for _, file := range unchanged[c.ID].Tests {
+			if !containsPath(g.Plan.Absences, file) {
+				tests = append(tests, file)
 			}
+		}
+		for _, file := range g.Trace.Trace[fmt.Sprintf("AC-%d", c.ID)] {
+			tests = append(tests, ru.outcome.Acceptance[0]+file)
 		}
 		if len(tests) == 0 {
 			return nil, fmt.Errorf("plan %s has no tests for AC-%d", im.Outcome, c.ID)

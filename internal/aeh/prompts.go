@@ -83,8 +83,41 @@ func newPlanPromptData(in PlanInput) promptData {
 	for _, c := range in.Delta.New {
 		fmt.Fprintf(&delta, "- AC-%d: %s\n", c.ID, c.Text)
 	}
+	if len(in.Delta.Changes) > 0 {
+		delta.WriteString("\nChanged criteria (replacement tests must be red):\n")
+		for _, c := range in.Delta.Changes {
+			fmt.Fprintf(&delta, "- AC-%d old text: %s\n  New text: %s\n", c.ID, c.OldText, c.NewText)
+		}
+	}
+	if len(in.Retired) > 0 {
+		delta.WriteString("\nRetired tests (the runner deletes these; never recreate their paths):\n")
+		for _, f := range in.Retired {
+			fmt.Fprintf(&delta, "- %s (%s)\n", f.Path, f.Reason)
+		}
+	}
+	if len(in.Delta.Removed) > 0 {
+		delta.WriteString("\nRemoved criterion IDs:\n")
+		for _, id := range in.Delta.Removed {
+			fmt.Fprintf(&delta, "- AC-%d\n", id)
+		}
+	}
+	if len(in.Delta.Recovery) > 0 {
+		delta.WriteString("\nRecovery criteria (new tests must be green, in separate files from red tests):\n")
+		for _, c := range in.Delta.Recovery {
+			fmt.Fprintf(&delta, "- AC-%d: %s; previous tests: %s\n", c.ID, c.Text, strings.Join(c.Tests, ", "))
+		}
+	}
 	delta.WriteString("\nUnchanged criteria (do not test again):\n")
 	for _, c := range in.Delta.Unchanged {
+		recover := false
+		for _, r := range in.Delta.Recovery {
+			if r.ID == c.ID {
+				recover = true
+			}
+		}
+		if recover {
+			continue
+		}
 		fmt.Fprintf(&delta, "- AC-%d: %s\n", c.ID, c.Text)
 	}
 	return promptData{

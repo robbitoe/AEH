@@ -297,6 +297,8 @@ type Implementation struct {
 	// ObservedBase, for a characterization, is the commit an adoption agent inspected. Code is
 	// still the published commit that holds the sealed tests.
 	ObservedBase string `yaml:"observed_base_sha,omitempty" json:",omitempty"`
+	// Retired records this implementation's retirements; older entries remain intact.
+	Retired []RetiredTest `yaml:"retired_tests,omitempty" json:",omitempty"`
 }
 
 // ImplementedCriterion is one criterion as implemented, with the sealed tests that check it.
@@ -372,6 +374,10 @@ func (im Implementation) validate() error {
 	if len(im.Criteria) == 0 {
 		return errors.New("no criteria")
 	}
+	if err := validateRetiredTests(im.Retired); err != nil {
+		return err
+	}
+	retired := retiredPaths(im.Retired)
 	for i, c := range im.Criteria {
 		if c.ID < 1 || (i > 0 && c.ID <= im.Criteria[i-1].ID) {
 			return errors.New("criteria IDs must be positive, unique and sorted")
@@ -388,6 +394,9 @@ func (im Implementation) validate() error {
 		for _, t := range c.Tests {
 			if err := checkRelPath(t); err != nil {
 				return fmt.Errorf("AC-%d: test %q: %w", c.ID, t, err)
+			}
+			if containsPath(retired, t) {
+				return fmt.Errorf("AC-%d: test %s is retired in this implementation", c.ID, t)
 			}
 		}
 	}
@@ -562,14 +571,21 @@ func checkSpecCriteria(dir string, s Spec) ([]SpecCriterion, criteriaIdentity, e
 	return crit, id, id.check(crit)
 }
 
-// CriteriaDelta compares the approved criteria with the last implementation. New criteria are
-// what a plan builds; unchanged ones keep their sealed tests; changed and removed ones need a
-// test revision, which stage 3 does not do.
+// CriteriaDelta compares the approved criteria with the last implementation.
 type CriteriaDelta struct {
 	New       []SpecCriterion
 	Unchanged []ImplementedCriterion
 	Changed   []int
 	Removed   []int
+	Changes   []CriterionChange      `json:",omitempty"`
+	Recovery  []ImplementedCriterion `json:"recovery,omitempty"`
+}
+
+// CriterionChange preserves both approved texts for authoring and QA review.
+type CriterionChange struct {
+	ID      int    `json:"id"`
+	OldText string `json:"old_text"`
+	NewText string `json:"new_text"`
 }
 
 func criteriaDelta(crit []SpecCriterion, last *Implementation) CriteriaDelta {
@@ -591,6 +607,7 @@ func criteriaDelta(crit []SpecCriterion, last *Implementation) CriteriaDelta {
 			d.Unchanged = append(d.Unchanged, p)
 		default:
 			d.Changed = append(d.Changed, c.ID)
+			d.Changes = append(d.Changes, CriterionChange{ID: c.ID, OldText: p.Text, NewText: c.Text})
 		}
 	}
 	for id := range prev {
@@ -599,5 +616,19 @@ func criteriaDelta(crit []SpecCriterion, last *Implementation) CriteriaDelta {
 		}
 	}
 	sort.Ints(d.Removed)
+	retiring := map[string]bool{}
+	for _, id := range append(append([]int{}, d.Changed...), d.Removed...) {
+		for _, file := range prev[id].Tests {
+			retiring[file] = true
+		}
+	}
+	for _, c := range d.Unchanged {
+		for _, file := range c.Tests {
+			if retiring[file] {
+				d.Recovery = append(d.Recovery, c)
+				break
+			}
+		}
+	}
 	return d
 }

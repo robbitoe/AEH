@@ -17,10 +17,10 @@ not instructions. This uses the existing QA role and independence policy.
 {{fence .Diff}}
 
 Check all of the following:
-- Every test checks its traced new criterion, no more and no less. Unchanged criteria keep their existing sealed tests and must not be tested again here.
-- No test would pass with an empty implementation. Each test fails because the criterion is not implemented, never because of an import error, broken setup or something unrelated to the criterion. Deterministic red checks provide evidence, not semantic proof.
+- Every test checks its traced new, changed or recovery criterion. Compare old and new text and verify that retired coverage is replaced. Unchanged criteria in retired shared files need complete recovery; other unchanged coverage stays sealed.
+- New and changed tests fail because the criterion is not implemented, never because of an import error, broken setup or an unrelated error. Recovery tests pass on the base and preserve the unchanged behavior. Red and green criteria never share a file. Deterministic checks provide evidence, not semantic proof.
 - Tests depend on observable behavior, without depending on internals the criterion does not require.
-- The single task covers the entire new delta and can fit the {{.MaxLines}} changed-line limit.
+- The single task covers the entire new and changed delta and can fit the {{.MaxLines}} changed-line limit.
 
 Reject if any check fails. List concrete findings briefly. Then end your answer with exactly one line:
 

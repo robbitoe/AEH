@@ -27,7 +27,7 @@ type PlanFile struct {
 // existing code, with nothing to implement.
 const PlanCharacterize = "characterize"
 
-// PlanTask covers the entire new-criteria delta in one implementation task.
+// PlanTask covers the new and changed criteria in one implementation task.
 type PlanTask struct {
 	Goal  string   `yaml:"goal"`
 	Paths []string `yaml:"paths"`
@@ -172,6 +172,8 @@ type PlanInput struct {
 	Delta     CriteriaDelta
 	Protected []string
 	Config    Config
+	Retired   []RetiredTest
+	Absences  []string
 }
 
 // validatePlanCandidate checks scope, form, containment and declared traceability only.
@@ -192,6 +194,7 @@ func validatePlanCandidate(in PlanInput, files []PlanCandidateFile, plan PlanFil
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Path < ordered[j].Path })
 	present := map[string]bool{}
 	folded := map[string]bool{}
+	retired := retiredPaths(in.Retired)
 	var total int64
 	for _, f := range ordered {
 		// A test path is published, recorded in memory's implementation history and shown in
@@ -201,6 +204,15 @@ func validatePlanCandidate(in PlanInput, files []PlanCandidateFile, plan PlanFil
 		}
 		if err := checkPlanTestPath(f.Path); err != nil {
 			return fmt.Errorf("plan: changed path %q: %w", f.Path, err)
+		}
+		if containsPath(retired, f.Path) {
+			if strings.HasPrefix(strings.ToLower(f.Path), "aeh/") || f.Status != 'D' {
+				return fmt.Errorf("plan: retired path %q permits only deletion (D)", f.Path)
+			}
+			continue
+		}
+		if containsPath(in.Absences, f.Path) {
+			return fmt.Errorf("plan: retired path %q must remain absent", f.Path)
 		}
 		if !strings.HasPrefix(f.Path, dir) {
 			return fmt.Errorf("plan: path %q is outside %s; write only inside the test directory", f.Path, dir)
@@ -260,7 +272,7 @@ func validatePlanCandidate(in PlanInput, files []PlanCandidateFile, plan PlanFil
 		}
 	}
 	want := map[string]bool{}
-	for _, c := range in.Delta.New {
+	for _, c := range in.Delta.coverageCriteria() {
 		id := fmt.Sprintf("AC-%d", c.ID)
 		want[id] = true
 		if len(plan.Trace[id]) == 0 {
@@ -270,7 +282,7 @@ func validatePlanCandidate(in PlanInput, files []PlanCandidateFile, plan PlanFil
 	traced := map[string]bool{}
 	for _, id := range sortedTraceIDs(plan.Trace) {
 		if !want[id] {
-			return fmt.Errorf("plan: criterion %s is outside the new delta; remove it (unchanged criteria keep their sealed tests)", id)
+			return fmt.Errorf("plan: criterion %s is outside the planned delta; unchanged criteria keep their sealed tests unless recovery is required", id)
 		}
 		for _, file := range plan.Trace[id] {
 			if !present[file] {
@@ -280,10 +292,16 @@ func validatePlanCandidate(in PlanInput, files []PlanCandidateFile, plan PlanFil
 		}
 	}
 	for _, f := range ordered {
+		if f.Status == 'D' {
+			continue
+		}
 		file := strings.TrimPrefix(f.Path, dir)
 		if file != "plan.yaml" && !traced[file] {
 			return fmt.Errorf("plan: test file %q is untraced; map it to a new criterion or remove it", f.Path)
 		}
+	}
+	if _, err := fileKinds(in.Delta, plan); err != nil {
+		return err
 	}
 	return nil
 }
@@ -305,8 +323,8 @@ func planPathContained(pattern, task string) bool {
 	return base == "" || task == base || strings.HasPrefix(task, base+"/")
 }
 
-// generatedOutcome uses one rule for both first and subsequent implementations: adding
-// new criteria is a minor change. Criterion text goes in Then; Outcome needs no synthetic
+// generatedOutcome uses a minor change for first and subsequent implementations.
+// Criterion text goes in Then; Outcome needs no synthetic
 // Given/When placeholders and its existing normalization accepts this representation.
 func generatedOutcome(in PlanInput, plan PlanFile, route string, changelog string) Outcome {
 	cfg := in.Config.plan()
@@ -319,7 +337,7 @@ func generatedOutcome(in PlanInput, plan PlanFile, route string, changelog strin
 		o.Tasks = []Task{{ID: "T1", Goal: plan.Task.Goal, Paths: append([]string(nil), plan.Task.Paths...), MaxDiffLines: cfg.MaxDiffLines}}
 	}
 	var lines []string
-	for _, c := range in.Delta.New {
+	for _, c := range in.Delta.redCriteria() {
 		text := normalizeCriterion(c.Text)
 		lines = append(lines, fmt.Sprintf("AC-%d: %s", c.ID, text))
 		o.Criteria = append(o.Criteria, Criterion{Then: text})

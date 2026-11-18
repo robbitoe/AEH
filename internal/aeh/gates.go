@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -85,7 +87,18 @@ func gateDrift(paths []string, memory MemorySnapshot, declared string) GateResul
 // gateHash fails if the sealed acceptance tests differ inside the worktree.
 func gateHash(wt string, s Seal, paths []string) GateResult {
 	g := GateResult{Name: "hash"}
-	hash, _, err := hashPaths(wt, paths)
+	_, files, err := hashPaths(wt, paths)
+	for _, file := range s.Retired {
+		if e := checkPlanTestPath(file); e != nil {
+			g.Output = e.Error()
+			return g
+		}
+		if _, e := os.Lstat(filepath.Join(wt, filepath.FromSlash(file))); !errors.Is(e, os.ErrNotExist) {
+			g.Output = "retired acceptance path must remain absent: " + file
+			return g
+		}
+	}
+	hash := sealHash(files, s.Retired)
 	switch {
 	case err != nil:
 		g.Output = "acceptance tests unreadable: " + err.Error()
@@ -150,12 +163,27 @@ func sealedGitContents(root, commit string, paths []string) (map[string][]byte, 
 // Listing the whole acceptance directory also detects newly added files.
 func gateSealedManifest(root, commit string, seal Seal, paths []string) GateResult {
 	g := GateResult{Name: "hash"}
+	for _, file := range seal.Retired {
+		if err := checkPlanTestPath(file); err != nil {
+			g.Output = err.Error()
+			return g
+		}
+		out, err := git(root, "--literal-pathspecs", "ls-tree", "-z", commit, "--", file)
+		if err != nil {
+			g.Output = fmt.Sprintf("inspect retired path %s: %v", file, err)
+			return g
+		}
+		if out != "" {
+			g.Output = "retired acceptance path must remain absent: " + file
+			return g
+		}
+	}
 	contents, err := sealedGitContents(root, commit, paths)
 	if err != nil {
 		g.Output = "acceptance tests unreadable: " + err.Error()
 		return g
 	}
-	actual := sealFromContents(seal.Outcome, contents, seal.SpecContent, seal.ApprovedAt)
+	actual := sealFromContents(seal.Outcome, contents, seal.SpecContent, seal.ApprovedAt, seal.Retired)
 	if actual.Hash != seal.Hash {
 		g.Output = "acceptance tests were modified; they are sealed and must not change"
 		return g
