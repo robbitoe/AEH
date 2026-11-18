@@ -2,6 +2,7 @@ package aeh
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -201,5 +202,65 @@ func TestPlanCandidateTaskFollowsTheDelta(t *testing.T) {
 	withTask, _ := parsePlanFile([]byte(samplePlan))
 	if err := validatePlanCandidate(in, sampleCandidate(in), withTask); err == nil || !strings.Contains(err.Error(), "remove task") {
 		t.Fatalf("a task was accepted for a delta with nothing to implement: %v", err)
+	}
+}
+
+// A plan without implementation is recorded without a run: the project's test suite must pass
+// on its commit, not only on the base.
+func TestPlanWithoutImplementationRunsTheTestSuite(t *testing.T) {
+	f, old := retirementFixture(t, false)
+	write(t, f.dir, "tests/suite.sh", "test -f tests/acceptance/"+old.ID+"/pay.sh\n")
+	f.commitAll("the suite needs the old test")
+	editSpec(t, f.repo, "pay", "## Acceptance criteria\n- AC-1: Given a cart, when the user pays, then src/pay.txt says paid.\n", "")
+	if _, _, err := ApproveSpec(f.repo, "pay"); err != nil {
+		t.Fatal(err)
+	}
+	st, err := PlanFeature(context.Background(), f.repo, "pay", nil)
+	if err != nil || st.Status != StatusBlocked || st.Phase == PlanLogged || st.Attempts[0].FailedStep != "test" {
+		t.Fatalf("a broken suite was published: %+v %v", st, err)
+	}
+	if im := lastRecordedImplementation(t, f); im.Outcome == st.ID {
+		t.Fatalf("a plan with a failing suite was recorded: %+v", im)
+	}
+}
+
+// A published plan without implementation is superseded when another implementation is
+// recorded first: it is marked for restart, and aeh plan no longer resumes it.
+func TestSupersededRevisionNeedsRestart(t *testing.T) {
+	f, _ := retirementFixture(t, false)
+	editSpec(t, f.repo, "pay", "## Acceptance criteria\n- AC-1: Given a cart, when the user pays, then src/pay.txt says paid.\n", "")
+	if _, _, err := ApproveSpec(f.repo, "pay"); err != nil {
+		t.Fatal(err)
+	}
+	dir := memDir(t, f.repo)
+	// The reviewer leaves an uncommitted change in memory: the record waits after publication.
+	f.setScript("qa", countCall+reviewOK+`; printf '\nOwner notes\n' >> `+yamlQuote(filepath.ToSlash(filepath.Join(dir, "wiki", "log.md"))))
+	if _, err := PlanFeature(context.Background(), f.repo, "pay", nil); err == nil {
+		t.Fatal("the record should wait for clean memory")
+	}
+	plans, _ := ListPlanStates(f.repo)
+	var st PlanState
+	for _, p := range plans {
+		if p.Phase == PlanPublished {
+			st = p
+		}
+	}
+	if st.ID == "" {
+		t.Fatalf("no published plan: %+v", plans)
+	}
+	// Meanwhile another implementation is recorded (here by a hand edit of the owner).
+	p := filepath.Join(dir, filepath.FromSlash(implementedRel("pay")))
+	text := readFile(t, p)
+	last := lastRecordedImplementation(t, f)
+	text = strings.Replace(text, last.Code, fakeSHA('c'), -1)
+	write(t, filepath.Dir(p), filepath.Base(p), readFile(t, p)+strings.Replace(text, "- outcome: "+last.Outcome, "- outcome: pay-other", 1))
+	mustGit(t, dir, append(memoryGitIdentity, "commit", "-qam", "owner notes and another implementation")...)
+	_, err := PlanFeature(context.Background(), f.repo, "pay", nil)
+	again, _, _ := LoadPlanState(f.repo, st.ID)
+	if err == nil || !strings.Contains(err.Error(), "superseded") || !again.RestartRequired {
+		t.Fatalf("a superseded revision: %v %+v", err, again)
+	}
+	if open, _ := unfinishedPlan(f.repo, "pay"); open == st.ID {
+		t.Fatal("aeh plan still resumes the superseded plan")
 	}
 }

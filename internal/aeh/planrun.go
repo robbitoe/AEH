@@ -1491,6 +1491,21 @@ func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile
 	if !g.Passed {
 		return checks, "build", "the build fails with the new tests:\n" + g.Output, false, nil
 	}
+	if p.state.NoImplementation {
+		// No run follows: this commit is recorded as the implementation, so the project's own
+		// test suite must pass on it, not only on the base (a retired file may be referenced).
+		g := gateCommand(ctx, "test", wt, p.cfg.Commands.Test, p.timeout(), p.cfg.PassEnv)
+		g.Output = redactDiagnostic(g.Output)
+		checks = append(checks, PlanCheckEntry{Name: "test", Passed: g.Passed && !g.Uncertain})
+		if uncertain, damaged := settle(g); uncertain {
+			return checks, "test", g.Output, true, nil
+		} else if damaged != "" {
+			return checks, "test", damaged, false, nil
+		}
+		if !g.Passed {
+			return checks, "test", "the test suite fails without the retired tests:\n" + g.Output, false, nil
+		}
+	}
 	dir := p.testDir()
 	seen := map[string]bool{}
 	var files []string
@@ -1775,6 +1790,15 @@ func (p *planner) recordPlan() error {
 		Retired: append([]RetiredTest(nil), st.Retired...)}
 	if im.Criteria, err = implementedCriteria(st.ID, crit, st.Delta, st.Absences, plan, p.testDir()); err != nil {
 		return fmt.Errorf("%s %s: %w", what, st.ID, err)
+	}
+	// One plan, one predecessor: if another implementation was recorded since the plan was
+	// reserved (and it is not this plan's own record after a crash), the plan is superseded;
+	// it needs a restart, so aeh plan no longer resumes it.
+	if cur, err := LoadMemory(p.repo); err == nil {
+		if now, ok := cur.Spec(st.Feature); ok && lastCode(now) != st.PriorCode && lastCode(now) != st.PlanCommit {
+			return p.restart(fmt.Sprintf("Another implementation of %s was recorded after plan %s was reserved; this plan is superseded and was not recorded. Plan the feature again: %s %s",
+				st.Feature, st.ID, again, st.Feature))
+		}
 	}
 	rec := PendingRecord{OutcomeID: st.ID, Feature: st.Feature, Change: "minor", Note: note, Commit: st.PlanCommit, Implementation: im, MemoryBase: st.MemoryCommit}
 	if _, _, err := RecordChange(p.repo, rec, ""); err != nil {
