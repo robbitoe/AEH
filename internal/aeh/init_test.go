@@ -1,6 +1,7 @@
 package aeh
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -44,6 +45,10 @@ func TestInitTemplateLoadsAndPipesPrompts(t *testing.T) {
 			if strings.Contains(arg, "{{prompt}}") {
 				t.Errorf("profile %s passes the prompt as an argument", name)
 			}
+		}
+		// Discovery runs agents outside a Git repository, which Codex refuses without the flag.
+		if len(p.Command) > 0 && p.Command[0] == "codex" && !slices.Contains(p.Command, "--skip-git-repo-check") {
+			t.Errorf("codex profile %s lacks --skip-git-repo-check", name)
 		}
 	}
 }

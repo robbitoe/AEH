@@ -36,6 +36,8 @@ type promptData struct {
 	// Plans: a delta with nothing to implement (no task), and the clarified criteria.
 	NoImplementation bool
 	Clarifications   string
+	// Plan is set for every plan prompt: reviewers reject instead of asking SPEC-QUESTION.
+	Plan bool
 
 	// Discovery: the owner's idea, earlier questions with the latest answers, and limits.
 	Idea         string
@@ -145,6 +147,7 @@ func newPlanPromptData(in PlanInput) promptData {
 		Build:   in.Config.Commands.Build, Test: in.Config.Commands.Test, Acceptance: in.Config.Commands.Acceptance,
 		MaxLines: cfg.MaxDiffLines, MaxFiles: cfg.MaxFiles, MaxBytes: cfg.MaxBytes,
 		NoImplementation: in.NoImplementation, Clarifications: strings.Join(clarifiedIDs, ", "),
+		Plan:             true,
 	}
 }
 

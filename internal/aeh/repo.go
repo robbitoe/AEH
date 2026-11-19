@@ -45,8 +45,11 @@ func (r Repo) WorktreePath(name string) string {
 	if err != nil {
 		base = os.TempDir()
 	}
-	sum := sha256.Sum256([]byte(r.Root))
-	project := filepath.Base(r.Root) + "-" + hex.EncodeToString(sum[:4])
+	// Clean the root first: the same directory spelled with other separators must map to
+	// the same key (callers that resolve the main checkout get a cleaned path).
+	root := filepath.Clean(r.Root)
+	sum := sha256.Sum256([]byte(root))
+	project := filepath.Base(root) + "-" + hex.EncodeToString(sum[:4])
 	return filepath.Join(base, "aeh", "worktrees", project, name)
 }
 func (r Repo) ReportPath(id string) string { return filepath.Join(r.Root, ".aeh", "reports", id+".md") }

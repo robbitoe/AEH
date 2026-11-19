@@ -36,11 +36,17 @@ or
 VERDICT: REJECT
 
 ## Specification questions
+{{- if .Plan}}
+
+This is a plan review, where questions are not available. If the spec is ambiguous or
+contradicts itself, reject and name the decision the owner must make; never guess.
+{{- else}}
 
 If the spec is ambiguous or contradicts itself, ask the owner instead of guessing.
 End plain stdout with `SPEC-QUESTION: <question>` as the last nonempty line.
 The question must be one line of 1 to 500 UTF-8 bytes, without controls or secrets.
 Use exactly one terminal result: never include a VERDICT line with a question.
+{{- end}}
 {{- if .Answers}}
 
 ## Answers from the owner

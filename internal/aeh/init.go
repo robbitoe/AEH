@@ -74,16 +74,18 @@ notify:
 # from authors; transport is "cli" (an "api" transport is planned, not available yet).
 # {{prompt}} is replaced with the prompt text, {{prompt_file}} with a file holding it;
 # set stdin: true to pipe it instead. Check the flags against the CLI version you have installed.
+# Discovery runs agents in an output directory that is not a Git repository; Codex refuses
+# such a directory unless --skip-git-repo-check is given. aeh always chooses the directory.
 profiles:
   medio:
     provider: openai
-    command: ["codex", "exec", "--sandbox", "workspace-write", "-"]
+    command: ["codex", "exec", "--skip-git-repo-check", "--sandbox", "workspace-write", "-"]
     stdin: true
     timeout_minutes: 30
     # quota_exit_codes: []  # Set only when the CLI documents a distinct quota exit code.
   codex-review:
     provider: openai
-    command: ["codex", "exec", "--sandbox", "read-only", "-"]
+    command: ["codex", "exec", "--skip-git-repo-check", "--sandbox", "read-only", "-"]
     stdin: true
     timeout_minutes: 15
   # Claude Code reads the prompt from stdin (on Windows a multi-line argument to the
