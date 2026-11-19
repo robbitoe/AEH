@@ -49,7 +49,7 @@ Sends a test event to `notify.webhook` in `aeh/config.yaml`.
 
 ### `aeh discover review`
 
-`aeh discover review <slug>` runs the advisory review again on the draft book as memory has it now. It is for a review without a verdict (invalid, unavailable, interrupted), for example after fixing the reviewer's profile. A review with a verdict is never replaced.
+`aeh discover review <slug>` runs the advisory review again on the draft book as memory has it now. It is for a review without a verdict (invalid, unavailable, interrupted), for example after fixing the reviewer's profile (a Codex reviewer needs `--skip-git-repo-check`, since the review runs outside a Git repository). A review with a verdict is never replaced.
 
 ### `aeh discover promote`
 

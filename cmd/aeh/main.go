@@ -288,7 +288,12 @@ func memoryCommand(repo aeh.Repo, args []string) (int, error) {
 			return 1, err
 		}
 		if s.Queued != nil {
-			fmt.Printf("approved %s %s, queued; version in force remains %s\n", s.Feature, s.Version, s.Queued.CurrentVersion)
+			if len(s.Queued.Blockers) == 0 {
+				// It replaced an earlier queued approval; the next aeh command activates it.
+				fmt.Printf("approved %s %s, queued without blockers; the next aeh command activates it (version in force until then: %s)\n", s.Feature, s.Version, s.Queued.CurrentVersion)
+			} else {
+				fmt.Printf("approved %s %s, queued; version in force remains %s\n", s.Feature, s.Version, s.Queued.CurrentVersion)
+			}
 			for _, b := range s.Queued.Blockers {
 				fmt.Printf("  blocker: %s (%s)\n", b.ID, b.Reason)
 			}
