@@ -49,7 +49,7 @@ func parseQueue(b []byte) (QueuedApproval, error) {
 	if err != nil {
 		return q, fmt.Errorf("queued spec: %w", err)
 	}
-	if s.Feature != q.Feature || s.Version != q.Approval.Version || approvalDigest(s.Title, s.Paths, s.Body) != q.Approval.Content {
+	if s.Feature != q.Feature || s.Version != q.Approval.Version || approvalDigest(s.Title, s.Paths, s.Body, q.Approval.Relocations) != q.Approval.Content {
 		return q, errors.New("approval queue: spec does not match its approval")
 	}
 	if err := checkSlug(q.Feature); err != nil {
@@ -314,7 +314,7 @@ func previousApprovedSpec(dir string, s Spec) (string, error) {
 			continue
 		}
 		sp, err := parseSpec(text)
-		if err == nil && approvalDigest(sp.Title, sp.Paths, sp.Body) == s.Approval.Content {
+		if err == nil && approvalDigest(sp.Title, sp.Paths, sp.Body, s.Approval.Relocations) == s.Approval.Content {
 			return text, nil
 		}
 	}
@@ -459,7 +459,7 @@ func reconcileQueue(r Repo, dir string, q *QueuedApproval) error {
 		return err
 	}
 	a := q.Approval
-	a.Content = approvalDigest(sp.Title, sp.Paths, sp.Body)
+	a.Content = approvalDigest(sp.Title, sp.Paths, sp.Body, a.Relocations)
 	b, err := yaml.Marshal(a)
 	if err != nil {
 		return err
@@ -547,7 +547,7 @@ func queuedReplacement(snap MemorySnapshot, spec Spec) (bool, error) {
 		if collision == "" {
 			return false, nil
 		}
-		if approvalDigest(spec.Title, spec.Paths, spec.Body) != q.Approval.Content || !semverLess(mustSemver(q.Approval.Version), mustSemver(spec.Version)) || !semverLess(mustSemver(collision), mustSemver(spec.Version)) {
+		if approvalDigest(spec.Title, spec.Paths, spec.Body, q.Approval.Relocations) != q.Approval.Content || !semverLess(mustSemver(q.Approval.Version), mustSemver(spec.Version)) || !semverLess(mustSemver(collision), mustSemver(spec.Version)) {
 			return false, fmt.Errorf("queued approval %s: collision with recorded version %s; approve the same queued content with a version above %s and %s", q.Feature, collision, collision, q.Approval.Version)
 		}
 		return true, nil

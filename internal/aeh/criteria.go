@@ -546,7 +546,7 @@ func loadCriteriaIdentity(dir string, s Spec) (criteriaIdentity, error) {
 			continue
 		}
 		sp, err := parseSpec(text)
-		if err != nil || approvalDigest(sp.Title, sp.Paths, sp.Body) != a.Content {
+		if err != nil || approvalDigest(sp.Title, sp.Paths, sp.Body, a.Relocations) != a.Content {
 			continue
 		}
 		crit, _, err := sp.Criteria()
@@ -621,6 +621,7 @@ type CriteriaDelta struct {
 	Removed   []int
 	Changes   []CriterionChange      `json:",omitempty"`
 	Recovery  []ImplementedCriterion `json:"recovery,omitempty"`
+	Relocated []ImplementedCriterion `json:"relocated,omitempty"`
 }
 
 // CriterionChange preserves both approved texts for authoring and QA review.

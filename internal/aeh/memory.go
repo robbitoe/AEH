@@ -94,6 +94,8 @@ type SpecApproval struct {
 	// approving: their new tests may pass on the base, and QA must confirm the equivalence.
 	// Each is bound to the exact old and new texts, so a different delta voids it.
 	Clarifications []Clarification `yaml:"clarifications,omitempty"`
+	// Relocations are the literal owner-declared moves included in Content.
+	Relocations []Relocation `yaml:"relocations,omitempty" json:",omitempty"`
 }
 
 // Clarification marks one changed criterion as a clarification of its old text.
@@ -116,6 +118,10 @@ type ApproveOptions struct {
 	// is current keeps its clarifications and a new approval has none.
 	Clarify    []int
 	SetClarify bool
+	// Without SetRelocate, recomputing an existing approval keeps its pairs. A new content
+	// approval needs an explicit declaration; completed moves must not recur in later deltas.
+	Relocations []Relocation
+	SetRelocate bool
 }
 
 // noImplementation is the DeltaBase of an approval given before any implementation.
@@ -147,16 +153,21 @@ func (s Spec) staleApproval() bool {
 // is exempt, so any edit voids it. Recording an accepted change carries a valid approval
 // forward in the same memory commit (see RecordChange); a hand edit never does.
 func (s Spec) Approved() bool {
-	return s.Approval != nil && s.Approval.Content == approvalDigest(s.Title, s.Paths, s.Body)
+	return s.Approval != nil && s.Approval.Content == approvalDigest(s.Title, s.Paths, s.Body, s.Approval.Relocations)
 }
 
-// approvalDigest hashes what the owner approves: title, paths and body text.
-func approvalDigest(title string, paths []string, body string) string {
+// approvalDigest hashes what the owner approves: title, paths, body text and declared moves.
+// With no moves it preserves the digest format of approvals written before relocation.
+func approvalDigest(title string, paths []string, body string, pairs ...[]Relocation) string {
 	v := struct {
-		Title string
-		Paths []string
-		Body  string
-	}{title, paths, strings.TrimRight(body, "\n")}
+		Title       string
+		Paths       []string
+		Body        string
+		Relocations []Relocation `json:",omitempty"`
+	}{Title: title, Paths: paths, Body: strings.TrimRight(body, "\n")}
+	if len(pairs) > 0 {
+		v.Relocations = pairs[0]
+	}
 	b, _ := json.Marshal(v)
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
@@ -676,6 +687,9 @@ func parseApproval(b []byte) (*SpecApproval, error) {
 			return nil, fmt.Errorf("%s: clarification AC-%d is not an approved criterion", approvalFile, c.ID)
 		}
 	}
+	if err := validateRelocationPairs(a.Relocations); err != nil {
+		return nil, fmt.Errorf("%s: %w", approvalFile, err)
+	}
 	return &a, nil
 }
 
@@ -765,7 +779,7 @@ func ownerApprovals(dir, feature string) ([]SpecApproval, error) {
 			continue
 		}
 		sp, err := parseSpec(text)
-		if err != nil || sp.Version != a.Version || approvalDigest(sp.Title, sp.Paths, sp.Body) != a.Content {
+		if err != nil || sp.Version != a.Version || approvalDigest(sp.Title, sp.Paths, sp.Body, a.Relocations) != a.Content {
 			continue
 		}
 		out = append(out, *a)
@@ -825,7 +839,7 @@ func ApproveSpec(r Repo, feature string) (Spec, bool, error) {
 	return ApproveSpecWith(r, feature, ApproveOptions{})
 }
 
-// ApproveSpecWith is ApproveSpec with the owner's options (clarifications).
+// ApproveSpecWith is ApproveSpec with the owner's clarifications and path relocations.
 func ApproveSpecWith(r Repo, feature string, opt ApproveOptions) (Spec, bool, error) {
 	unlock, err := lockLiveProject(r)
 	if err != nil {
@@ -875,7 +889,34 @@ func ApproveSpecWith(r Repo, feature string, opt ApproveOptions) (Spec, bool, er
 	// The approval digest leaves the version out (records bump it), so the version rule is
 	// checked even for a spec that reads as approved: lowering only the version, or restoring
 	// an old approved pair, must not pass for the newest approval.
-	content := approvalDigest(spec.Title, spec.Paths, spec.Body)
+	pairs := opt.Relocations
+	if !opt.SetRelocate && spec.Approved() {
+		pairs = spec.Approval.Relocations
+	}
+	if replacing {
+		queues, err := listQueues(snap.Dir)
+		if err != nil {
+			return Spec{}, false, fmt.Errorf("approve %s queued relocations: %w", feature, err)
+		}
+		for _, q := range queues {
+			if q.Feature == feature {
+				if opt.SetRelocate && approvalDigest(spec.Title, spec.Paths, spec.Body, pairs) != q.Approval.Content {
+					return Spec{}, false, fmt.Errorf("approve %s: collision recovery must keep the queued relocation pairs", feature)
+				}
+				pairs = q.Approval.Relocations
+			}
+		}
+	}
+	if len(pairs) > 0 {
+		cfg, err := r.LoadConfig()
+		if err != nil {
+			return Spec{}, false, fmt.Errorf("approve %s relocations: %w", feature, err)
+		}
+		if err := validateRelocations(snap, spec, cfg, pairs); err != nil {
+			return Spec{}, false, fmt.Errorf("approve %s: %w", feature, err)
+		}
+	}
+	content := approvalDigest(spec.Title, spec.Paths, spec.Body, pairs)
 	if err := checkApprovalVersion(snap.Dir, spec, content); err != nil {
 		return Spec{}, false, fmt.Errorf("approve %s: %w", feature, err)
 	}
@@ -889,6 +930,7 @@ func ApproveSpecWith(r Repo, feature string, opt ApproveOptions) (Spec, bool, er
 		}
 	}
 	if spec.Approved() && spec.Approval.Version == spec.Version && !spec.staleApproval() &&
+		content == spec.Approval.Content &&
 		(!opt.SetClarify || sameClarifications(spec.Approval.Clarifications, clarifications)) {
 		return spec, false, nil
 	}
@@ -896,7 +938,7 @@ func ApproveSpecWith(r Repo, feature string, opt ApproveOptions) (Spec, bool, er
 		return Spec{}, false, fmt.Errorf("approve %s: the spec still has the placeholder text; describe the feature first", feature)
 	}
 	today := memoryNow().UTC().Format("2006-01-02")
-	a := SpecApproval{Version: spec.Version, Content: content, Date: today, MaxCriterion: ident.High, DeltaBase: spec.deltaBase(), Clarifications: clarifications}
+	a := SpecApproval{Version: spec.Version, Content: content, Date: today, MaxCriterion: ident.High, DeltaBase: spec.deltaBase(), Clarifications: clarifications, Relocations: pairs}
 	for _, c := range crit {
 		a.Criteria = append(a.Criteria, c.ID)
 		if c.ID > a.MaxCriterion {
@@ -1045,7 +1087,7 @@ func RecordChange(r Repo, p PendingRecord, expectedFingerprint string) (version,
 		// The owner approved the spec as it read before this record; aeh only bumped the
 		// version and appended its own changelog line, so the approval carries forward.
 		a := *spec.Approval
-		a.Content = approvalDigest(updated.Title, updated.Paths, updated.Body)
+		a.Content = approvalDigest(updated.Title, updated.Paths, updated.Body, a.Relocations)
 		var b []byte
 		if b, err = yaml.Marshal(a); err == nil {
 			err = w.write(dir, approvalRel(p.Feature), b)

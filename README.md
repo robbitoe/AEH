@@ -247,6 +247,15 @@ ladder: [implementer]
 
 Define those profiles and independent QA/security reviewers in the same config. `plan.ladder` defaults to the implementation ladder when omitted, so configure separate authors for generated outcomes. Every reachable implementer must differ from the accepted test author, and also from its provider under the default `provider` independence policy. With `reviewers.independence: profile`, different profiles of one provider are allowed. The run checks the whole reachable ladder before any agent starts.
 
+For a path move preserving behavior, change the approved ownership paths and declare the move:
+
+```sh
+aeh memory approve checkout --relocate src/=lib/
+aeh plan checkout
+```
+
+The declaration is pinned with the approval, including queued approvals and version reapprovals. Prefixes must be literal, distinct, non-nested and unprotected; the source must be owned but no longer covered by the approved version, and the destination covered and unclaimed. At the planning base, the source must have tracked files and the destination must have none. Sealed tests of unchanged criteria that mention the source run green on that base before retirement as `relocated`. Their replacements reference the destination; AEH maps new test references back for every base check, then seals the original destination tests. QA receives both diffs and checks preserved assertions and that mapping changes only code-loading or file names. New test files cannot contain source literals. Relocations always have an implementation task, including a move with no behavior change. `--clarify` tests also run mapped and must pass. Dropping or simplifying a path pattern without `--relocate` keeps unchanged tests sealed. A warning names any `commands` entry still mentioning the source; `aeh/config.yaml` remains owner-protected. Update custom `plan.md` and `review-plan.md` prompt overrides to describe these checks; profiles keep their existing roles and independence rules. See [the command reference](docs/commands.md#aeh-memory-approve) for validation and mapping details.
+
 ```sh
 aeh memory approve checkout           # owner approval of this exact spec
 aeh plan checkout                     # generates, checks, reviews and seals the plan
