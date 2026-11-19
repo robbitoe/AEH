@@ -73,7 +73,7 @@ Memory (local, private: .aeh/memory/ of the main checkout, never published by ae
   aeh memory init                   create the memory repository
   aeh memory new <feature> --title "..." --paths a/**,b/**
                                     add a feature spec at version 0.1.0
-  aeh memory approve <feature> [--clarify AC-<n>,...|none]
+  aeh memory approve <feature> [--clarify AC-<n>,...|none] [--relocate <from>=<to>[,...]]
                                     approve the exact spec; queue it while unfinished work remains
   aeh memory status                 features, pending work, queued approvals and blockers
   aeh memory lint                   check memory and its privacy settings
@@ -259,12 +259,13 @@ func memoryCommand(repo aeh.Repo, args []string) (int, error) {
 		return 0, nil
 
 	case "approve":
-		usage := errors.New("usage: aeh memory approve <feature> [--clarify AC-<n>,...|none]")
+		usage := errors.New("usage: aeh memory approve <feature> [--clarify AC-<n>,...|none] [--relocate <from>=<to>[,...]]")
 		if len(args) < 2 || strings.HasPrefix(args[1], "-") {
 			return 2, usage
 		}
 		fs := flag.NewFlagSet("approve", flag.ContinueOnError)
 		clarify := fs.String("clarify", "", "changed criteria approved as wording-only clarifications (AC-<n>,... or none)")
+		relocate := fs.String("relocate", "", "owner-declared literal path moves (<from>=<to>[,...])")
 		if err := fs.Parse(args[2:]); err != nil || fs.NArg() != 0 {
 			return 2, usage
 		}
@@ -273,7 +274,16 @@ func memoryCommand(repo aeh.Repo, args []string) (int, error) {
 			if f.Name == "clarify" {
 				opt.SetClarify = true
 			}
+			if f.Name == "relocate" {
+				opt.SetRelocate = true
+			}
 		})
+		if opt.SetRelocate {
+			var err error
+			if opt.Relocations, err = aeh.ParseRelocations(*relocate); err != nil {
+				return 2, err
+			}
+		}
 		if opt.SetClarify && *clarify != "none" {
 			for _, item := range strings.Split(*clarify, ",") {
 				n, err := strconv.Atoi(strings.TrimPrefix(strings.TrimSpace(item), "AC-"))

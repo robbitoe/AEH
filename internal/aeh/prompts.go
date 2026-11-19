@@ -15,24 +15,26 @@ var defaultPrompts embed.FS
 
 // promptData is everything a prompt template can use.
 type promptData struct {
-	Outcome    Outcome
-	Task       Task
-	Protected  []string
-	MaxLines   int
-	Build      string
-	Test       string
-	Answers    []string
-	Attempt    int
-	FailedGate string
-	Feedback   string
-	Diff       string
-	MemorySpec string
-	Features   string // triage only: slug, title and paths of every feature
-	TestDir    string // plan author: the only writable directory
-	Acceptance string
-	MaxFiles   int
-	MaxBytes   int
-	PlanYAML   string // plan review: the frozen author's plan
+	Outcome     Outcome
+	Task        Task
+	Protected   []string
+	MaxLines    int
+	Build       string
+	Test        string
+	Answers     []string
+	Attempt     int
+	FailedGate  string
+	Feedback    string
+	Diff        string
+	MappedDiff  string
+	Relocations bool
+	MemorySpec  string
+	Features    string // triage only: slug, title and paths of every feature
+	TestDir     string // plan author: the only writable directory
+	Acceptance  string
+	MaxFiles    int
+	MaxBytes    int
+	PlanYAML    string // plan review: the frozen author's plan
 	// Plans: a delta with nothing to implement (no task), and the clarified criteria.
 	NoImplementation bool
 	Clarifications   string
@@ -128,10 +130,27 @@ func newPlanPromptData(in PlanInput) promptData {
 			fmt.Fprintf(&delta, "- AC-%d: %s; previous tests: %s\n", c.ID, c.Text, strings.Join(c.Tests, ", "))
 		}
 	}
+	if in.Spec.Approval != nil && len(in.Spec.Approval.Relocations) > 0 {
+		delta.WriteString("\nOwner-declared relocations (the implementation task must move these paths):\n")
+		for _, pair := range in.Spec.Approval.Relocations {
+			fmt.Fprintf(&delta, "- %s -> %s\n", pair.From, pair.To)
+		}
+	}
+	if len(in.Delta.Relocated) > 0 {
+		delta.WriteString("\nRelocated criteria (new tests must be green on the mapped base):\n")
+		for _, c := range in.Delta.Relocated {
+			fmt.Fprintf(&delta, "- AC-%d: %s; previous tests: %s\n", c.ID, c.Text, strings.Join(c.Tests, ", "))
+		}
+	}
 	delta.WriteString("\nUnchanged criteria (do not test again):\n")
 	for _, c := range in.Delta.Unchanged {
 		recover := false
 		for _, r := range in.Delta.Recovery {
+			if r.ID == c.ID {
+				recover = true
+			}
+		}
+		for _, r := range in.Delta.Relocated {
 			if r.ID == c.ID {
 				recover = true
 			}
@@ -147,7 +166,8 @@ func newPlanPromptData(in PlanInput) promptData {
 		Build:   in.Config.Commands.Build, Test: in.Config.Commands.Test, Acceptance: in.Config.Commands.Acceptance,
 		MaxLines: cfg.MaxDiffLines, MaxFiles: cfg.MaxFiles, MaxBytes: cfg.MaxBytes,
 		NoImplementation: in.NoImplementation, Clarifications: strings.Join(clarifiedIDs, ", "),
-		Plan:             true,
+		Plan:        true,
+		Relocations: in.Spec.Approval != nil && len(in.Spec.Approval.Relocations) > 0,
 	}
 }
 

@@ -38,7 +38,7 @@ func validateRetiredTests(tests []RetiredTest) error {
 		}
 		seen[t.Path] = true
 		switch t.Reason {
-		case "changed", "removed", "closure of a shared file":
+		case "changed", "removed", "closure of a shared file", "relocated":
 		default:
 			return fmt.Errorf("retired test %s: invalid reason %q", t.Path, t.Reason)
 		}
@@ -70,6 +70,9 @@ func (d CriteriaDelta) greenIDs() map[string]bool {
 	for _, c := range d.Recovery {
 		green[fmt.Sprintf("AC-%d", c.ID)] = true
 	}
+	for _, c := range d.Relocated {
+		green[fmt.Sprintf("AC-%d", c.ID)] = true
+	}
 	return green
 }
 
@@ -87,13 +90,27 @@ func (d CriteriaDelta) clarifiedIDs() []int {
 
 func (d CriteriaDelta) coverageCriteria() []SpecCriterion {
 	crit := d.redCriteria()
+	seen := map[int]bool{}
+	for _, c := range crit {
+		seen[c.ID] = true
+	}
 	for _, c := range d.Changes {
 		if c.Clarified {
 			crit = append(crit, SpecCriterion{ID: c.ID, Text: c.NewText})
+			seen[c.ID] = true
+		}
+	}
+	for _, c := range d.Relocated {
+		if !seen[c.ID] {
+			crit = append(crit, SpecCriterion{ID: c.ID, Text: c.Text})
+			seen[c.ID] = true
 		}
 	}
 	for _, c := range d.Recovery {
-		crit = append(crit, SpecCriterion{ID: c.ID, Text: c.Text})
+		if !seen[c.ID] {
+			crit = append(crit, SpecCriterion{ID: c.ID, Text: c.Text})
+			seen[c.ID] = true
+		}
 	}
 	return crit
 }
@@ -278,9 +295,20 @@ func (p *planner) retirement(st *PlanState) ([]RetiredTest, []string, error) {
 			reasons[f] = "changed"
 		}
 	}
+	for _, c := range st.Delta.Relocated {
+		for _, f := range c.Tests {
+			b, exists := gitBlob(p.repo.Root, st.Base, f)
+			if !exists {
+				return nil, nil, fmt.Errorf("relocated test %s is missing on the base", f)
+			}
+			if containsRelocationFrom([]byte(b), st.Relocations) {
+				reasons[f] = "relocated"
+			}
+		}
+	}
 	for _, c := range st.Delta.Recovery {
 		for _, f := range c.Tests {
-			if reasons[f] != "" {
+			if reasons[f] != "" && reasons[f] != "relocated" {
 				reasons[f] = "closure of a shared file"
 			}
 		}

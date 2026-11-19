@@ -51,7 +51,9 @@ type PlanState struct {
 	PriorCode string        `json:"prior_code_sha,omitempty"`
 	Delta     CriteriaDelta `json:"delta"`
 	// Retired is this delta's exact deletion set; Absences also includes historical retirements.
-	Retired []RetiredTest `json:"retired_tests,omitempty"`
+	Retired        []RetiredTest    `json:"retired_tests,omitempty"`
+	Relocations    []Relocation     `json:"relocations,omitempty"`
+	RelocatedProof []PlanCheckEntry `json:"relocated_proof,omitempty"`
 	// NoImplementation: the delta has nothing to build (only removed criteria,
 	// clarifications or recovery); the plan has no task and is recorded when published.
 	NoImplementation bool             `json:"no_implementation,omitempty"`
@@ -78,6 +80,7 @@ type PlanAttempt struct {
 	RunDir     string          `json:"run_dir"`
 	Candidate  string          `json:"candidate,omitempty"`
 	Frozen     string          `json:"frozen,omitempty"`
+	Mapped     string          `json:"mapped,omitempty"`
 	FailedStep string          `json:"failed_step,omitempty"`
 	Feedback   string          `json:"feedback,omitempty"`
 	Reviews    []ReviewVerdict `json:"reviews,omitempty"`
@@ -152,6 +155,10 @@ func redactPlanState(s *PlanState) {
 	for i := range s.Checks {
 		s.Checks[i].Name = redactDiagnostic(s.Checks[i].Name) // names carry test paths
 		s.Checks[i].Detail = redactDiagnostic(s.Checks[i].Detail)
+	}
+	for i := range s.RelocatedProof {
+		s.RelocatedProof[i].Name = redactDiagnostic(s.RelocatedProof[i].Name)
+		s.RelocatedProof[i].Detail = redactDiagnostic(s.RelocatedProof[i].Detail)
 	}
 }
 
@@ -362,6 +369,9 @@ func planFeature(ctx context.Context, r Repo, feature, kind string, log io.Write
 		return st, fmt.Errorf("feature %s is not approved as it reads now; approve it first: aeh memory approve %s", feature, feature)
 	}
 	p := &planner{repo: r, cfg: cfg, pcfg: cfg.plan(), spec: spec, memDir: memory.Dir, log: log, owners: view.ContractFingerprint(feature), kind: kind}
+	if err := validateRelocations(view, spec, cfg, spec.Approval.Relocations); err != nil {
+		return st, fmt.Errorf("plan %s relocations: %w", feature, err)
+	}
 	if err := p.loadPrompts(); err != nil {
 		return st, err
 	}
@@ -372,6 +382,7 @@ func planFeature(ctx context.Context, r Repo, feature, kind string, log io.Write
 		}
 	}
 	p.state = &st
+	p.relocationWarnings()
 	switch {
 	case st.Phase == PlanLogged:
 		p.logf("%s is already planned on %s; build it with: aeh run %s", id, IntegrationBranch(id), id)
@@ -385,11 +396,12 @@ func planFeature(ctx context.Context, r Repo, feature, kind string, log io.Write
 	if err != nil {
 		return st, err
 	}
-	prior, delta, err := p.currentDelta()
+	prior, delta, err := p.currentDelta(st.Base)
 	if err != nil {
 		return st, err
 	}
-	if inputs != st.Inputs || st.SpecDigest != spec.Approval.Content || prior != st.PriorCode || !sameDelta(delta, st.Delta) {
+	if inputs != st.Inputs || st.SpecDigest != spec.Approval.Content || prior != st.PriorCode || !sameDelta(delta, st.Delta) ||
+		approvalDigest(spec.Title, spec.Paths, spec.Body, st.Relocations) != st.SpecDigest {
 		return st, p.restart("The plan's inputs changed since it was reserved (spec, configuration or prompts). " +
 			"Approve the spec as a new version, which gives the plan a new outcome ID, and run aeh plan again.")
 	}
@@ -590,7 +602,11 @@ func (p *planner) reserve(id, observed, memoryCommit string) (PlanState, error) 
 		return st, err
 	}
 	st.Base = base
-	if st.PriorCode, st.Delta, err = p.currentDelta(); err != nil {
+	st.Relocations = append([]Relocation(nil), p.spec.Approval.Relocations...)
+	if err := relocationPreconditions(p.repo.Root, base, st.Relocations); err != nil {
+		return st, err
+	}
+	if st.PriorCode, st.Delta, err = p.currentDelta(base); err != nil {
 		return st, err
 	}
 	last, hasLast := p.spec.LastImplementation()
@@ -604,9 +620,8 @@ func (p *planner) reserve(id, observed, memoryCommit string) (PlanState, error) 
 	case len(st.Delta.New) == 0 && len(st.Delta.Changed) == 0 && len(st.Delta.Removed) == 0 && !p.spec.PathsMigrating():
 		return st, fmt.Errorf("plan %s: the approved spec adds no criteria; nothing to plan", p.spec.Feature)
 	}
-	// A version that only changes paths reassigns ownership: a plan without implementation
-	// whose record releases the old paths. Moving code needs new or changed criteria.
-	st.NoImplementation = p.kind != PlanCharacterize && st.Delta.noImplementation()
+	// Declared moves always require implementation, even when behavior is unchanged.
+	st.NoImplementation = p.kind != PlanCharacterize && st.Delta.noImplementation() && len(st.Relocations) == 0
 	if st.Retired, st.Absences, err = p.retirement(&st); err != nil {
 		return st, err
 	}
@@ -634,7 +649,7 @@ func (p *planner) reserve(id, observed, memoryCommit string) (PlanState, error) 
 }
 
 // currentDelta reads the approved criteria and the last implementation as memory has them now.
-func (p *planner) currentDelta() (string, CriteriaDelta, error) {
+func (p *planner) currentDelta(base string) (string, CriteriaDelta, error) {
 	crit, _, err := checkSpecCriteria(p.memDir, p.spec)
 	if err != nil {
 		return "", CriteriaDelta{}, fmt.Errorf("plan %s: acceptance criteria: %w", p.spec.Feature, err)
@@ -653,6 +668,9 @@ func (p *planner) currentDelta() (string, CriteriaDelta, error) {
 	}
 	if err := applyClarifications(&d, p.spec.Approval); err != nil {
 		return "", CriteriaDelta{}, fmt.Errorf("plan %s: %w: aeh memory approve %s --clarify ...", p.spec.Feature, err, p.spec.Feature)
+	}
+	if err := relocateCriteria(p.repo.Root, base, &d, p.spec.Approval.Relocations); err != nil {
+		return "", CriteriaDelta{}, err
 	}
 	return prior, d, nil
 }
@@ -753,8 +771,9 @@ func (p *planner) inputsDigestFor(st *PlanState) (string, error) {
 		ObservedBase      string        `json:",omitempty"`
 		Retired           []RetiredTest `json:",omitempty"`
 		Absences          []string      `json:",omitempty"`
+		Relocations       []Relocation  `json:",omitempty"`
 	}{st.Base, st.SpecDigest, prior, st.Delta, p.pcfg, p.cfg.Commands, p.cfg.PassEnv, p.owners, p.cfg.Protected, p.cfg.Triage.Rules,
-		p.cfg.Reviewers, p.cfg.Reviewers.declared, p.cfg.Reviewer, effective, p.cfg.Profiles, p.prompts, st.Kind, st.ObservedBase, st.Retired, st.Absences}
+		p.cfg.Reviewers, p.cfg.Reviewers.declared, p.cfg.Reviewer, effective, p.cfg.Profiles, p.prompts, st.Kind, st.ObservedBase, st.Retired, st.Absences, st.Relocations}
 	b, err := json.Marshal(v)
 	if err != nil {
 		return "", err
@@ -924,6 +943,18 @@ func (p *planner) baseline(ctx context.Context) (bool, string, error) {
 	if len(tests) > 0 {
 		steps = append(steps, func() (GateResult, error) { return p.acceptanceCommand(ctx, "sealed", wt, tests) })
 	}
+	st.RelocatedProof = nil
+	for i, retired := range st.Retired {
+		if retired.Reason != "relocated" {
+			continue
+		}
+		file, name := retired.Path, fmt.Sprintf("relocated-proof-%d", i+1)
+		steps = append(steps, func() (GateResult, error) {
+			g, err := p.acceptanceCommand(ctx, name, wt, []string{file})
+			g.Name = "relocated-proof " + file
+			return g, err
+		})
+	}
 	var results []GateResult
 	for _, step := range steps {
 		g, err := step()
@@ -937,6 +968,10 @@ func (p *planner) baseline(ctx context.Context) (bool, string, error) {
 		// Command output may carry secrets: redact it before it is saved, logged or asked.
 		g.Output = redactDiagnostic(g.Output)
 		results = append(results, g)
+		if strings.HasPrefix(g.Name, "relocated-proof ") {
+			st.RelocatedProof = append(st.RelocatedProof, PlanCheckEntry{Name: g.Name, Passed: g.Passed && !g.Uncertain,
+				Detail: "retired relocated test on base " + st.Base + "\n" + tail(g.Output, 500)})
+		}
 		p.logf("    %-6s %s", g.Name, gateStatus(g))
 		if g.Uncertain {
 			keep = true
@@ -1195,6 +1230,14 @@ func (p *planner) verifyFrozen(ctx context.Context, a *PlanAttempt) (string, err
 	if err := os.WriteFile(filepath.Join(runDir, "diff.patch"), []byte(diff), 0o600); err != nil {
 		return "", err
 	}
+	if a.Mapped == "" {
+		if a.Mapped, err = p.mappedPlanCommit(a.Frozen, plan); err != nil {
+			return fail("mapping", err.Error())
+		}
+		if err := p.save(); err != nil {
+			return "", err
+		}
+	}
 	vwt := p.planWorktree(a.N) + "-verify"
 	if err := p.freshWorktree(vwt, a.Frozen); err != nil {
 		return "", err
@@ -1206,7 +1249,12 @@ func (p *planner) verifyFrozen(ctx context.Context, a *PlanAttempt) (string, err
 		}
 	}()
 	if a.FailedStep == "checking" {
-		checks, step, msg, uncertain, err := p.redGreen(ctx, vwt, a.Frozen, plan)
+		if a.Mapped != a.Frozen {
+			if err := p.freshWorktree(vwt, a.Mapped); err != nil {
+				return "", err
+			}
+		}
+		checks, step, msg, uncertain, err := p.redGreen(ctx, vwt, a.Mapped, plan)
 		if err != nil {
 			return "", err
 		}
@@ -1219,16 +1267,21 @@ func (p *planner) verifyFrozen(ctx context.Context, a *PlanAttempt) (string, err
 		if step != "" {
 			return fail(step, msg)
 		}
-		st.Checks, a.FailedStep = checks, "reviewing"
+		st.Checks, a.FailedStep = append(append([]PlanCheckEntry(nil), st.RelocatedProof...), checks...), "reviewing"
 		if err := p.save(); err != nil {
 			return "", err
+		}
+		if a.Mapped != a.Frozen {
+			if err := p.freshWorktree(vwt, a.Frozen); err != nil {
+				return "", err
+			}
 		}
 	}
 	for _, role := range roleOrder {
 		if !containsString(st.Roles, role) || approvedOn(a.Reviews, role, a.Frozen) {
 			continue
 		}
-		v, g, err := p.review(ctx, role, a.Profile, a.Frozen, vwt, diff, planYAML, runDir)
+		v, g, err := p.review(ctx, role, a.Profile, a.Frozen, a.Mapped, vwt, diff, planYAML, runDir)
 		if err != nil {
 			return "", err
 		}
@@ -1360,6 +1413,9 @@ func (p *planner) freeze(candidate string, files []PlanCandidateFile, plan PlanF
 	}
 	if st.NoImplementation {
 		changelog = revisionSummary(st.Delta) + "."
+	}
+	if len(st.Relocations) > 0 {
+		changelog = "Implements the approved delta and path relocations."
 	}
 	o := generatedOutcome(p.input(), plan, route, changelog)
 	outcome, err := marshalOutcome(o)
@@ -1653,7 +1709,7 @@ func (p *planner) green(ctx context.Context, wt string, files []string, checks [
 
 // review asks one role's independent reviewer about the frozen plan commit. QA uses the plan
 // review prompt; security and DBA use their usual prompts on the same diff.
-func (p *planner) review(ctx context.Context, role, author, commit, wt, diff, planYAML, runDir string) (ReviewVerdict, GateResult, error) {
+func (p *planner) review(ctx context.Context, role, author, commit, mapped, wt, diff, planYAML, runDir string) (ReviewVerdict, GateResult, error) {
 	g := GateResult{Name: "review"}
 	name := "review-" + role + ".md"
 	if role == RoleQA {
@@ -1667,6 +1723,23 @@ func (p *planner) review(ctx context.Context, role, author, commit, wt, diff, pl
 	v.Profile, v.Provider = profile, p.cfg.Profiles[profile].Provider
 	data := newPlanPromptData(p.input())
 	data.PlanYAML, data.Diff = planYAML, diff
+	if len(p.state.Relocations) > 0 {
+		plan, err := parsePlanFile([]byte(planYAML))
+		if err != nil {
+			return v, g, fmt.Errorf("mapped review plan: %w", err)
+		}
+		args := []string{"diff", "--no-ext-diff", "--no-textconv", "--no-renames", p.state.Base, mapped, "--"}
+		files := planTestFiles(plan, p.testDir())
+		args = append(args, files...)
+		if len(files) > 0 {
+			if data.MappedDiff, err = git(p.repo.Root, args...); err != nil {
+				return v, g, fmt.Errorf("mapped review diff: %w", err)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(runDir, "mapped-diff.patch"), []byte(data.MappedDiff), 0o600); err != nil {
+			return v, g, fmt.Errorf("write mapped review diff: %w", err)
+		}
+	}
 	data.Task = Task{ID: "T1", Goal: "acceptance tests and task of " + p.state.ID}
 	prompt, err := renderPrompt(name, p.prompts[name], data)
 	if err != nil {

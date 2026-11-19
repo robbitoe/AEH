@@ -5,12 +5,17 @@ Work inside the current worktree. Do not commit, push or create branches.
 
 ## Test author rules
 
+{{if .Relocations}}- Reference the destination; AEH maps it back for the base checks. New test files must not contain any declared source literal, even in comments.
+- Every base check (build, red and green files, previous suite with green files) uses mapped test bytes on the existing code. No import-failure or build-failure exception applies.
+- Cover relocated criteria with green tests preserving all assertions of the retired tests. The task goal must state the declared move; include its old and new owned paths. Moving code is implementation even with no new or changed criterion.
+{{end}}
+
 - Write only inside {{.TestDir}}. Add new regular files only; no control files, symlinks or submodules.
-- Write test files for every new, changed and recovery criterion in the reference block. The runner deletes the listed retired files; do not edit or delete them yourself. Other unchanged coverage stays sealed.
-- Tests for new and changed criteria must fail on the base. Recovery tests for unchanged criteria must pass on the base. Red and green criteria must never share a file. Check observable behavior, without depending on internals the criterion does not require.
+- Write test files for every new, changed, clarified, relocated and recovery criterion in the reference block. The runner deletes the listed retired files; do not edit or delete them yourself. Other unchanged coverage stays sealed.
+- Tests for new and behavior-changed criteria must fail on the base. Clarified, relocated and recovery criteria must pass on the base. Red and green criteria must never share a file. Check observable behavior, without depending on internals the criterion does not require.
 - Use at most {{.MaxFiles}} files and {{.MaxBytes}} total bytes, including plan.yaml. Keep plan.yaml at most 65536 bytes.
 {{if .NoImplementation}}- This delta has nothing to implement: no new criteria and no behavior changes. Do not define a task: omit `task:` from plan.yaml. Every test you write must pass on the base.
-{{else}}- Define exactly one implementation task covering all new and changed criteria, with a single-line goal of at most 500 bytes. Its literal paths must be inside the feature's paths and outside protected paths, aeh/, .aeh/ and the acceptance directory. No wildcards.
+{{else}}- Define exactly one implementation task covering all new and changed criteria and any declared relocations, with a single-line goal of at most 500 bytes. Its literal paths must be inside the feature's owned union (declared paths and last implementation paths) and outside protected paths, aeh/, .aeh/ and the acceptance directory. No wildcards.
 - The implementation task has a limit of {{.MaxLines}} changed lines. If the delta cannot fit one task at that limit, explain why, stop, and end with exactly:
   PLAN: TOO-LARGE
 {{end}}- Otherwise write {{.TestDir}}plan.yaml with exactly this structure (replace the examples with the actual new, changed and recovery criteria and test paths):
@@ -25,7 +30,7 @@ trace:
 ```
 
 Use one YAML document without extra keys, anchors, aliases, merge keys or explicit tags.
-Trace keys must be exactly the new, changed, clarified and recovery criterion IDs. Values are non-empty lists of clean file
+Trace keys must be exactly the new, changed, clarified, relocated and recovery criterion IDs. Values are non-empty lists of clean file
 paths relative to {{.TestDir}}, never plan.yaml. Trace every test file; no untraced files.
 
 ## Commands configured by the owner
