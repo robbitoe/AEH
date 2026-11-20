@@ -13,7 +13,15 @@ You are the database reviewer of a change written by another agent. Do not modif
 
 {{.Task.Goal}}
 
-## Diff
+{{if .Files}}## Files changed
+
+One line per path: A added, M modified, D deleted, T type changed. Check that every added or deleted file belongs to the task.
+
+```text
+{{.Files}}
+```
+
+{{end}}## Diff
 
 The build and the tests already pass. Look only at how the change treats data.
 
