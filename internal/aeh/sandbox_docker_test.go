@@ -17,6 +17,18 @@ import (
 // AEH_TEST_DOCKER=1; AEH_TEST_IMAGE names a local image with sh (default alpine:3.20).
 func dockerSandbox(t *testing.T, cfg SandboxConfig) (*sandbox, Repo) {
 	t.Helper()
+	cfg.Image = testImageID(t)
+	r := Repo{Root: t.TempDir()}
+	s, err := openSandbox(r, cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s, r
+}
+
+// testImageID skips without AEH_TEST_DOCKER=1 and resolves the test image's ID.
+func testImageID(t *testing.T) string {
+	t.Helper()
 	if os.Getenv("AEH_TEST_DOCKER") != "1" {
 		t.Skip("set AEH_TEST_DOCKER=1 to run tests against a local Docker engine")
 	}
@@ -28,13 +40,7 @@ func dockerSandbox(t *testing.T, cfg SandboxConfig) (*sandbox, Repo) {
 	if err != nil {
 		t.Fatalf("image %s must be present locally: %v", ref, err)
 	}
-	cfg.Image = strings.TrimSpace(string(out))
-	r := Repo{Root: t.TempDir()}
-	s, err := openSandbox(r, cfg, "test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return s, r
+	return strings.TrimSpace(string(out))
 }
 
 func assertNoLeftovers(t *testing.T, s *sandbox) {

@@ -183,7 +183,8 @@ type planner struct {
 	log     io.Writer
 	prompts map[string]string // the author's and QA's plan prompts and review-<role>.md
 	sources map[string]string
-	kind    string // "" or PlanCharacterize
+	kind    string   // "" or PlanCharacterize
+	sb      *sandbox // nil when plan checks run on the host
 }
 
 // authorPrompt and qaPrompt name the prompts of this kind of plan.
@@ -373,6 +374,9 @@ func planFeature(ctx context.Context, r Repo, feature, kind string, log io.Write
 		return st, fmt.Errorf("plan %s relocations: %w", feature, err)
 	}
 	if err := p.loadPrompts(); err != nil {
+		return st, err
+	}
+	if p.sb, err = openFlowSandbox(r, cfg, "plan-"+id); err != nil {
 		return st, err
 	}
 	if !exists {
@@ -772,8 +776,10 @@ func (p *planner) inputsDigestFor(st *PlanState) (string, error) {
 		Retired           []RetiredTest `json:",omitempty"`
 		Absences          []string      `json:",omitempty"`
 		Relocations       []Relocation  `json:",omitempty"`
+		Sandbox           any           `json:",omitempty"`
 	}{st.Base, st.SpecDigest, prior, st.Delta, p.pcfg, p.cfg.Commands, p.cfg.PassEnv, p.owners, p.cfg.Protected, p.cfg.Triage.Rules,
-		p.cfg.Reviewers, p.cfg.Reviewers.declared, p.cfg.Reviewer, effective, p.cfg.Profiles, p.prompts, st.Kind, st.ObservedBase, st.Retired, st.Absences, st.Relocations}
+		p.cfg.Reviewers, p.cfg.Reviewers.declared, p.cfg.Reviewer, effective, p.cfg.Profiles, p.prompts, st.Kind, st.ObservedBase, st.Retired, st.Absences, st.Relocations,
+		sandboxContract(p.sb)}
 	b, err := json.Marshal(v)
 	if err != nil {
 		return "", err
@@ -822,27 +828,10 @@ func (p *planner) preflight() error {
 	return nil
 }
 
-// acceptanceCommand runs the configured acceptance command on a runner-written manifest.
-func (p *planner) acceptanceCommand(ctx context.Context, name, wt string, files []string) (GateResult, error) {
-	// The manifest is passed as a relative path made only of safe characters, so neither the
-	// repository's location nor a file name ever reaches the shell. It lives in the worktree's
-	// .aeh/, which memory's privacy rules require to be ignored, and is removed afterwards.
-	rel := ".aeh/manifest-" + name + ".txt"
-	if !safeManifestName.MatchString(rel) {
-		return GateResult{}, fmt.Errorf("unsafe manifest name %q", rel)
-	}
-	full := filepath.Join(wt, filepath.FromSlash(rel))
-	if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
-		return GateResult{}, err
-	}
-	if err := os.WriteFile(full, []byte(strings.Join(files, "\n")+"\n"), 0o600); err != nil {
-		return GateResult{}, err
-	}
-	defer os.Remove(full)
-	command := strings.Replace(p.cfg.Commands.Acceptance, "{{manifest}}", rel, 1)
-	return gateCommand(ctx, name, wt, command, p.timeout(), p.cfg.PassEnv), nil
-}
-
+// safeManifestName keeps the manifest path that reaches the shell made only of safe
+// characters (see verification.acceptance), so neither the repository's location nor a
+// file name ever does. On the host it lives in the worktree's .aeh/, which memory's
+// privacy rules require to be ignored, and is removed afterwards.
 var safeManifestName = regexp.MustCompile(`^\.aeh/manifest-[a-z0-9-]+\.txt$`)
 
 func (p *planner) timeout() time.Duration {
@@ -910,7 +899,7 @@ func (p *planner) freshWorktree(wt, commit string) error {
 // baseline checks, before any agent runs, that the base builds, passes its tests and passes
 // the sealed tests of unchanged criteria. A red base is the environment's problem, not the
 // test author's, so it blocks without consuming attempts.
-func (p *planner) baseline(ctx context.Context) (bool, string, error) {
+func (p *planner) baseline(ctx context.Context) (_ bool, _ string, err error) {
 	st := p.state
 	runDir := p.repo.RunDir(st.ID, "plan-baseline")
 	wt := p.repo.WorktreePath(st.ID + "-plan-baseline")
@@ -924,12 +913,21 @@ func (p *planner) baseline(ctx context.Context) (bool, string, error) {
 		}
 	}()
 	p.logf("  baseline on %s", short(st.Base))
+	v, err := newVerification(ctx, p.sb, p.repo.Root, wt, st.Base, p.cfg)
+	if err != nil {
+		return false, fmt.Sprintf("The sandbox could not prepare the baseline of %s: %v\nFix it (aeh sandbox check), then answer to retry.", short(st.Base), err), nil
+	}
+	defer func() {
+		if cerr := v.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 	steps := []func() (GateResult, error){
 		func() (GateResult, error) {
-			return gateCommand(ctx, "build", wt, p.cfg.Commands.Build, p.timeout(), p.cfg.PassEnv), nil
+			return v.raw(ctx, "build", p.cfg.Commands.Build), nil
 		},
 		func() (GateResult, error) {
-			return gateCommand(ctx, "test", wt, p.cfg.Commands.Test, p.timeout(), p.cfg.PassEnv), nil
+			return v.raw(ctx, "test", p.cfg.Commands.Test), nil
 		},
 	}
 	tests, missing, err := p.previousSuite()
@@ -941,7 +939,7 @@ func (p *planner) baseline(ctx context.Context) (bool, string, error) {
 			short(st.Base), strings.Join(missing, ", ")), nil
 	}
 	if len(tests) > 0 {
-		steps = append(steps, func() (GateResult, error) { return p.acceptanceCommand(ctx, "sealed", wt, tests) })
+		steps = append(steps, func() (GateResult, error) { return v.acceptance(ctx, "sealed", p.cfg.Commands.Acceptance, tests) })
 	}
 	st.RelocatedProof = nil
 	for i, retired := range st.Retired {
@@ -950,7 +948,7 @@ func (p *planner) baseline(ctx context.Context) (bool, string, error) {
 		}
 		file, name := retired.Path, fmt.Sprintf("relocated-proof-%d", i+1)
 		steps = append(steps, func() (GateResult, error) {
-			g, err := p.acceptanceCommand(ctx, name, wt, []string{file})
+			g, err := v.acceptance(ctx, name, p.cfg.Commands.Acceptance, []string{file})
 			g.Name = "relocated-proof " + file
 			return g, err
 		})
@@ -961,8 +959,7 @@ func (p *planner) baseline(ctx context.Context) (bool, string, error) {
 		if err != nil {
 			return false, "", err
 		}
-		g = checkoutGate(g, wt, st.Base)
-		if cerr := verifyCheckout(wt, st.Base); cerr != nil && g.Passed {
+		if cerr := v.damaged(); cerr != nil && g.Passed {
 			g.Passed, g.Output = false, cerr.Error()
 		}
 		// Command output may carry secrets: redact it before it is saved, logged or asked.
@@ -1254,7 +1251,16 @@ func (p *planner) verifyFrozen(ctx context.Context, a *PlanAttempt) (string, err
 				return "", err
 			}
 		}
-		checks, step, msg, uncertain, err := p.redGreen(ctx, vwt, a.Mapped, plan)
+		v, verr := newVerification(ctx, p.sb, r.Root, vwt, a.Mapped, p.cfg)
+		if verr != nil {
+			keep = true
+			a.FailedStep, a.Feedback = "checking", verr.Error()
+			return p.blockNow(fmt.Sprintf("The sandbox could not prepare the plan checks of %s: %v\nFix it (aeh sandbox check), then answer to retry.", short(a.Mapped), verr)), nil
+		}
+		checks, step, msg, uncertain, err := p.redGreen(ctx, v, plan)
+		if cerr := v.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
 		if err != nil {
 			return "", err
 		}
@@ -1541,7 +1547,7 @@ func gitEnv(dir string, env []string, stdin []byte, args ...string) (string, err
 // passes per file, and the surviving previous suite passes together with recovery. Each
 // command runs in the verify worktree, whose checkout must stay intact even when a command
 // fails as expected. A failure is evidence, not proof: the reviewer judges why it fails.
-func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile) ([]PlanCheckEntry, string, string, bool, error) {
+func (p *planner) redGreen(ctx context.Context, v *verification, plan PlanFile) ([]PlanCheckEntry, string, string, bool, error) {
 	var checks []PlanCheckEntry
 	// settle reports, in this order: an uncertain end (timeout or cancellation: block and keep
 	// the worktree, whatever else happened), then damage to the checkout (a failed attempt).
@@ -1549,12 +1555,12 @@ func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile
 		if g.Uncertain {
 			return true, ""
 		}
-		if err := verifyCheckout(wt, commit); err != nil {
+		if err := v.damaged(); err != nil {
 			return false, fmt.Sprintf("%s modified the checkout: %v", g.Name, err)
 		}
 		return false, ""
 	}
-	g := gateCommand(ctx, "build", wt, p.cfg.Commands.Build, p.timeout(), p.cfg.PassEnv)
+	g := v.raw(ctx, "build", p.cfg.Commands.Build)
 	g.Output = redactDiagnostic(g.Output) // before it becomes feedback, state or a question
 	checks = append(checks, PlanCheckEntry{Name: "build", Passed: g.Passed && !g.Uncertain})
 	if uncertain, damaged := settle(g); uncertain {
@@ -1568,7 +1574,7 @@ func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile
 	if p.state.NoImplementation {
 		// No run follows: this commit is recorded as the implementation, so the project's own
 		// test suite must pass on it, not only on the base (a retired file may be referenced).
-		g := gateCommand(ctx, "test", wt, p.cfg.Commands.Test, p.timeout(), p.cfg.PassEnv)
+		g := v.raw(ctx, "test", p.cfg.Commands.Test)
 		g.Output = redactDiagnostic(g.Output)
 		checks = append(checks, PlanCheckEntry{Name: "test", Passed: g.Passed && !g.Uncertain})
 		if uncertain, damaged := settle(g); uncertain {
@@ -1593,7 +1599,7 @@ func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile
 	}
 	sort.Strings(files)
 	if p.state.Kind == PlanCharacterize {
-		return p.green(ctx, wt, files, checks, settle)
+		return p.green(ctx, v, files, checks, settle)
 	}
 	kinds, err := fileKinds(p.state.Delta, plan)
 	if err != nil {
@@ -1604,7 +1610,7 @@ func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile
 		if kinds[f] {
 			kind = "green"
 		}
-		g, err := p.acceptanceCommand(ctx, fmt.Sprintf("%s-%d", kind, i+1), wt, []string{dir + f})
+		g, err := v.acceptance(ctx, fmt.Sprintf("%s-%d", kind, i+1), p.cfg.Commands.Acceptance, []string{dir + f})
 		if err != nil {
 			return checks, "", "", false, err
 		}
@@ -1641,7 +1647,7 @@ func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile
 		}
 	}
 	if len(tests) > 0 {
-		g, err := p.acceptanceCommand(ctx, "previous", wt, tests)
+		g, err := v.acceptance(ctx, "previous", p.cfg.Commands.Acceptance, tests)
 		if err != nil {
 			return checks, "", "", false, err
 		}
@@ -1663,11 +1669,11 @@ func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile
 // code, all of them pass together, and the previous acceptance suite still passes with them
 // added. A pass is evidence, not proof: the QA reviewer judges that each test really runs and
 // pins the confirmed behavior.
-func (p *planner) green(ctx context.Context, wt string, files []string, checks []PlanCheckEntry,
+func (p *planner) green(ctx context.Context, v *verification, files []string, checks []PlanCheckEntry,
 	settle func(GateResult) (bool, string)) ([]PlanCheckEntry, string, string, bool, error) {
 	dir := p.testDir()
 	run := func(step, name string, manifest []string, what string) (string, string, bool, error) {
-		g, err := p.acceptanceCommand(ctx, name, wt, manifest)
+		g, err := v.acceptance(ctx, name, p.cfg.Commands.Acceptance, manifest)
 		if err != nil {
 			return "", "", false, err
 		}

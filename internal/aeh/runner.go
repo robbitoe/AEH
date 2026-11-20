@@ -35,6 +35,7 @@ type runner struct {
 	triagePrompt    string
 	memory          MemorySnapshot
 	generated       *generatedRun
+	sb              *sandbox // nil when gate commands run on the host
 }
 
 // generatedRun is an immutable snapshot of the plan provenance and its Git manifests.
@@ -299,6 +300,9 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer, gen 
 	if err := preflight(cfg, o, st.EffectiveRoute, st.Roles...); err != nil {
 		return st, err
 	}
+	if ru.sb, err = openFlowSandbox(r, cfg, "run-"+o.ID); err != nil {
+		return st, err
+	}
 	branch := IntegrationBranch(o.ID)
 	contract, err := ru.contractHash()
 	if err != nil {
@@ -469,9 +473,11 @@ func (ru *runner) contractHash() (string, error) {
 		Rules           []TriageRule
 		Memory          memoryContract
 		Generated       any `json:",omitempty"`
+		Sandbox         any `json:",omitempty"`
 	}{commands, ru.cfg.PassEnv, ru.cfg.Protected, ru.cfg.Limits, outcome, seal, ru.implementPrompt, ru.reviewPrompts,
 		ru.triagePrompt, ru.state.TriageOutput, ru.state.InitialRoute, ru.cfg.Triage.Rules,
-		memoryContract{ru.memory.ContractFingerprint(outcome.Feature), outcome.Feature, outcome.Change, outcome.Changelog}, ru.generatedContract()})
+		memoryContract{ru.memory.ContractFingerprint(outcome.Feature), outcome.Feature, outcome.Change, outcome.Changelog}, ru.generatedContract(),
+		sandboxContract(ru.sb)})
 	if err != nil {
 		return "", fmt.Errorf("encode execution contract: %w", err)
 	}
@@ -570,11 +576,11 @@ type attemptResult struct {
 }
 
 // attempt runs one agent in a fresh worktree and passes the result through the gates.
-func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, maxLines int, prev attemptResult) (attemptResult, error) {
+func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, maxLines int, prev attemptResult) (res attemptResult, err error) {
 	o, r := ru.outcome, ru.repo
 	name := fmt.Sprintf("%s-a%d", t.ID, n)
 	runDir := r.RunDir(o.ID, name)
-	res := attemptResult{Attempt: Attempt{N: n, Profile: profile, RunDir: rel(r.Root, runDir), StartedAt: time.Now().UTC()}}
+	res = attemptResult{Attempt: Attempt{N: n, Profile: profile, RunDir: rel(r.Root, runDir), StartedAt: time.Now().UTC()}}
 
 	base := ru.state.Head
 	res.Base = base
@@ -730,15 +736,27 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 			return res, err
 		}
 	}
-	timeout := time.Duration(ru.cfg.Commands.TimeoutMinutes) * time.Minute
+	var v *verification
 	if passed {
-		passed = check(checkoutGate(gateCommand(ctx, "build", verified, ru.cfg.Commands.Build, timeout, ru.cfg.PassEnv), verified, commit))
+		var verr error
+		if v, verr = newVerification(ctx, ru.sb, r.Root, verified, commit, ru.cfg); verr != nil {
+			passed = check(sandboxFailure(verr))
+		} else {
+			defer func() {
+				if cerr := v.Close(); cerr != nil && err == nil {
+					err = cerr
+				}
+			}()
+		}
 	}
 	if passed {
-		passed = check(checkoutGate(gateCommand(ctx, "test", verified, ru.cfg.Commands.Test, timeout, ru.cfg.PassEnv), verified, commit))
+		passed = check(v.checked(ctx, "build", ru.cfg.Commands.Build))
+	}
+	if passed {
+		passed = check(v.checked(ctx, "test", ru.cfg.Commands.Test))
 	}
 	if passed && ru.generated != nil {
-		passed = check(ru.acceptanceGate(ctx, verified, commit))
+		passed = check(ru.acceptanceGate(ctx, v))
 	}
 	if passed && (question != "" || invalid) {
 		if question != "" {
@@ -1052,7 +1070,7 @@ func (ru *runner) completeTaskReviews(ctx context.Context, t Task, a *Attempt, m
 }
 
 // finalCheck runs the gates once more on the integrated branch: accepted means proven there.
-func (ru *runner) finalCheck(ctx context.Context) (bool, string, error) {
+func (ru *runner) finalCheck(ctx context.Context) (_ bool, _ string, err error) {
 	o, r := ru.outcome, ru.repo
 	for i := range ru.state.Tasks {
 		task := &ru.state.Tasks[i]
@@ -1097,7 +1115,6 @@ func (ru *runner) finalCheck(ctx context.Context) (bool, string, error) {
 		return false, "", err
 	}
 	ru.logf("  final check on %s", IntegrationBranch(o.ID))
-	timeout := time.Duration(ru.cfg.Commands.TimeoutMinutes) * time.Minute
 	gates := []GateResult{}
 	if ru.seal != nil {
 		if ru.generated != nil {
@@ -1116,14 +1133,27 @@ func (ru *runner) finalCheck(ctx context.Context) (bool, string, error) {
 		}
 		gates = append(gates, gateDrift(changedPaths(changes), ru.memory, o.Feature))
 	}
+	var v *verification
 	if gates[len(gates)-1].Passed {
-		gates = append(gates, checkoutGate(gateCommand(ctx, "build", wt, ru.cfg.Commands.Build, timeout, ru.cfg.PassEnv), wt, head))
+		var verr error
+		if v, verr = newVerification(ctx, ru.sb, r.Root, wt, head, ru.cfg); verr != nil {
+			gates = append(gates, sandboxFailure(verr))
+		} else {
+			defer func() {
+				if cerr := v.Close(); cerr != nil && err == nil {
+					err = cerr
+				}
+			}()
+		}
 	}
 	if gates[len(gates)-1].Passed {
-		gates = append(gates, checkoutGate(gateCommand(ctx, "test", wt, ru.cfg.Commands.Test, timeout, ru.cfg.PassEnv), wt, head))
+		gates = append(gates, v.checked(ctx, "build", ru.cfg.Commands.Build))
+	}
+	if gates[len(gates)-1].Passed {
+		gates = append(gates, v.checked(ctx, "test", ru.cfg.Commands.Test))
 	}
 	if gates[len(gates)-1].Passed && ru.generated != nil {
-		gates = append(gates, ru.acceptanceGate(ctx, wt, head))
+		gates = append(gates, ru.acceptanceGate(ctx, v))
 	}
 	keep = gates[len(gates)-1].Uncertain
 	evidence := map[string]string{"commit": head, "contract": ru.state.Contract}
@@ -1408,6 +1438,8 @@ func gateStatus(g GateResult) string {
 		return "FAIL: " + firstLine(g.Output)
 	case g.Skipped:
 		return "skipped"
+	case g.Sandboxed:
+		return "ok (sandbox)"
 	}
 	return "ok"
 }
@@ -1638,19 +1670,18 @@ func (ru *runner) sealedGate(base, commit string) GateResult {
 
 // acceptanceGate runs the new and unchanged criteria through the configured manifest
 // command, in addition to the normal project suite. plan.yaml is sealed, but is not a test.
-func (ru *runner) acceptanceGate(ctx context.Context, wt, commit string) GateResult {
+func (ru *runner) acceptanceGate(ctx context.Context, v *verification) GateResult {
 	var files []string
 	for _, f := range ru.generated.Manifest.Files {
 		if f.Path != ru.outcome.Acceptance[0]+"plan.yaml" {
 			files = append(files, f.Path)
 		}
 	}
-	p := planner{cfg: ru.cfg}
-	g, err := p.acceptanceCommand(ctx, "acceptance", wt, files)
+	g, err := v.acceptance(ctx, "acceptance", ru.cfg.Commands.Acceptance, files)
 	if err != nil {
 		return GateResult{Name: "acceptance", Output: err.Error()}
 	}
-	if err := verifyCheckout(wt, commit); err != nil {
+	if err := v.damaged(); err != nil {
 		g.Passed, g.Output = false, g.Output+"\n"+err.Error()
 	}
 	return g

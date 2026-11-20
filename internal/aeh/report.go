@@ -204,6 +204,9 @@ func gateSummary(root, runDir string) string {
 		} else if !g.Passed {
 			status = "FAIL"
 		}
+		if g.Sandboxed {
+			status += " (sandbox)"
+		}
 		parts[i] = g.Name + " " + status
 	}
 	return strings.Join(parts, ", ")
@@ -324,6 +327,9 @@ func writeAdoptReport(a *adoptSession, st AdoptStatusSnapshot) error {
 	}
 	if v := st.Verification; v != nil {
 		fmt.Fprintf(&b, "\n## Verification\n\nBase SHA: %s; date: %s; config SHA-256: %s; passed: %t.\n\n", v.Base, v.Date, v.ConfigSHA, v.Passed)
+		if v.Sandbox != "" {
+			fmt.Fprintf(&b, "Commands ran in the sandbox (image %s).\n\n", v.Sandbox)
+		}
 		for _, c := range v.Commands {
 			fmt.Fprintf(&b, "- %s: exit %d; %.3fs; passed: %t; command: %s; integrity: %s\n", c.Name, c.Exit, c.Seconds, c.Passed,
 				discoveryDiagnostic(c.Command), discoveryDiagnostic(c.Integrity))
