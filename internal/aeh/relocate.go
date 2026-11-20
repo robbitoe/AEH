@@ -124,6 +124,12 @@ func relocationPreconditions(root, base string, pairs []Relocation) error {
 	return nil
 }
 
+// containsRelocationFrom is a plain substring check on purpose. It decides which sealed tests
+// retire and which new tests are refused, so a miss is the dangerous error: a sealed test that
+// still loads the source (cat <src/x, cc -Isrc/) would stay sealed and break after the move. A
+// false match is safe: the test retires only after passing on the base and gets replacement
+// coverage, or a new test is refused visibly. Declaring directories with a trailing slash
+// (src/) keeps false matches such as srcset rare.
 func containsRelocationFrom(b []byte, pairs []Relocation) bool {
 	for _, pair := range pairs {
 		if bytes.Contains(b, []byte(pair.From)) {
@@ -291,6 +297,11 @@ func (p *planner) mappedPlanCommit(commit string, plan PlanFile) (string, error)
 		"commit-tree", tree, "-p", commit, "-m", "aeh: mapped base checks for "+p.state.ID)
 	if err != nil {
 		return "", fmt.Errorf("commit mapped plan: %w", err)
+	}
+	// The state file names the mapped commit but does not keep it reachable; a ref does, so
+	// a git gc between an interruption and the resume cannot remove it.
+	if _, err := git(root, "update-ref", "refs/aeh/mapped/"+p.state.ID, mapped); err != nil {
+		return "", fmt.Errorf("retain mapped plan: %w", err)
 	}
 	return mapped, nil
 }

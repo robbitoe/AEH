@@ -81,6 +81,23 @@ func TestRelocationMapping(t *testing.T) {
 			t.Errorf("accepted source literal %q", input)
 		}
 	}
+	// Detection is a plain substring: no shell syntax or attached option can hide a source.
+	// srcset is a false match by design (safe); the trailing slash in src/ avoids it.
+	for _, pairs := range [][]Relocation{{{From: "src", To: "lib"}}, {{From: "src/", To: "lib/"}}} {
+		for _, input := range []string{"load src/a", "(src/x)", "cat <src/pay.txt", "x>src/out", "$src/x",
+			"f:src/x", "a;src/b", "cc -Isrc/ -E probe.c", "test/src/x", "mysrc/a"} {
+			if !containsRelocationFrom([]byte(input), pairs) {
+				t.Errorf("sealed test bytes %q not detected for %+v", input, pairs)
+			}
+			if _, err := mapRelocationTest([]byte(input), pairs); err == nil {
+				t.Errorf("accepted source literal %q for %+v", input, pairs)
+			}
+		}
+	}
+	if !containsRelocationFrom([]byte(`img.srcset = "a"`), []Relocation{{From: "src", To: "lib"}}) ||
+		containsRelocationFrom([]byte(`img.srcset = "a"`), []Relocation{{From: "src/", To: "lib/"}}) {
+		t.Error("srcset must match only a source declared without a trailing slash")
+	}
 	// Directly exercise the one-pass primitive even for a declaration validation refuses.
 	got, err := mapRelocationTest([]byte("lib/a"), []Relocation{{From: "old", To: "lib"}, {From: "before", To: "old"}})
 	if err != nil || string(got) != "old/a" {
@@ -230,6 +247,9 @@ echo 'VERDICT: APPROVE'`)
 	a := p.Attempts[len(p.Attempts)-1]
 	if a.Mapped == "" || a.Mapped == p.PlanCommit {
 		t.Fatal("base checks did not get a separate mapped commit")
+	}
+	if ref := mustGit(t, f.dir, "rev-parse", "refs/aeh/mapped/"+p.ID); ref != a.Mapped {
+		t.Fatalf("mapped commit is not retained by a ref: %q != %q", ref, a.Mapped)
 	}
 	unmapped, _ := gitBlob(f.dir, p.PlanCommit, "tests/acceptance/"+id+"/pay.sh")
 	mapped, _ := gitBlob(f.dir, a.Mapped, "tests/acceptance/"+id+"/pay.sh")
