@@ -181,9 +181,15 @@ func newIgnoreChecker(root, commit string, files []exportFile) (*ignoreChecker, 
 			}
 		}
 	}
-	// The ignore files are written to the host, so their paths must stay distinct there:
-	// on Windows or macOS A/.gitignore and a/.gitignore would be one file.
-	if err := checkHostPaths(rules); err != nil {
+	// The ignore files and their directories are written to the host, so every path must
+	// stay distinct there: on Windows or macOS A/ and a/ would be one directory, and the
+	// rules of one would be read through the other.
+	written := make([]string, 0, len(c.created))
+	for p := range c.created {
+		written = append(written, p)
+	}
+	sort.Strings(written)
+	if err := checkHostPaths(written); err != nil {
 		c.Close()
 		return nil, fmt.Errorf("ignore rules: %w", err)
 	}
@@ -210,7 +216,35 @@ func newIgnoreChecker(root, commit string, files []exportFile) (*ignoreChecker, 
 		c.Close()
 		return nil, fmt.Errorf("ignore rules: %w", err)
 	}
+	if err := c.checkExactNames(); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("ignore rules: %w", err)
+	}
 	return c, nil
+}
+
+// checkExactNames confirms that every path aeh wrote exists under exactly that name. A
+// host alias (another case, an NTFS short name such as LONGDI~1, a trailing dot) makes
+// two repository paths one host entry; listing the parent shows the real name only.
+func (c *ignoreChecker) checkExactNames() error {
+	for p := range c.created {
+		parent, base := path.Split(p)
+		entries, err := os.ReadDir(filepath.Join(c.dir, filepath.FromSlash(parent)))
+		if err != nil {
+			return err
+		}
+		found := false
+		for _, e := range entries {
+			if e.Name() == base {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("%s is the same file on this host as another path of the commit", p)
+		}
+	}
+	return nil
 }
 
 func (c *ignoreChecker) Close() { _ = os.RemoveAll(c.dir) }

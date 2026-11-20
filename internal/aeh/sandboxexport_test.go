@@ -383,3 +383,52 @@ func TestIgnoreCheckerRefusesHostAliases(t *testing.T) {
 	}
 	t.Logf("aliases checked: %v", aliases)
 }
+
+func TestIgnoreCheckerRefusesDirectoryAliases(t *testing.T) {
+	if runtime.GOOS != "windows" && runtime.GOOS != "darwin" {
+		t.Skip("case-insensitive hosts only")
+	}
+	// A/.gitignore and a/sub/.gitignore are distinct on Linux but share a directory here.
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q")
+	mustGit(t, dir, "config", "core.ignorecase", "false")
+	empty := mustGit(t, dir, "hash-object", "-w", "--stdin")
+	mustGit(t, dir, "update-index", "--add", "--cacheinfo", "100644,"+empty+",A/.gitignore")
+	mustGit(t, dir, "update-index", "--add", "--cacheinfo", "100644,"+empty+",a/sub/.gitignore")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "directory alias")
+	commit := mustGit(t, dir, "rev-parse", "HEAD")
+	e, err := newCommitExport(dir, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newIgnoreChecker(dir, commit, e.Files); err == nil || !strings.Contains(err.Error(), "same file") {
+		t.Fatalf("directory alias accepted: %v", err)
+	}
+}
+
+func TestIgnoreCheckerRefusesShortNameDirectories(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("NTFS short names")
+	}
+	probe := t.TempDir()
+	if err := os.Mkdir(filepath.Join(probe, "LONGDIRECTORYNAME"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(probe, "LONGDI~1")); err != nil {
+		t.Skip("8.3 short names are disabled on this volume")
+	}
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q")
+	empty := mustGit(t, dir, "hash-object", "-w", "--stdin")
+	mustGit(t, dir, "update-index", "--add", "--cacheinfo", "100644,"+empty+",LONGDIRECTORYNAME/.gitignore") // sorts, so is written, before LONGDI~1
+	mustGit(t, dir, "update-index", "--add", "--cacheinfo", "100644,"+empty+",LONGDI~1/sub/.gitignore")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "short name alias")
+	commit := mustGit(t, dir, "rev-parse", "HEAD")
+	e, err := newCommitExport(dir, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newIgnoreChecker(dir, commit, e.Files); err == nil || !strings.Contains(err.Error(), "same file") {
+		t.Fatalf("short-name directory alias accepted: %v", err)
+	}
+}
