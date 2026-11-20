@@ -75,10 +75,10 @@ The template already defines four agent profiles: `medio` (Codex) and `fuerte` (
 - Codex profiles need `--skip-git-repo-check`, because discovery runs in a directory that is not a Git repository. AEH refuses to start discovery if a Codex profile lacks it.
 - Agents only receive OS and tool-discovery variables. List anything else they need in `pass_env`, for example `CLAUDE_CODE_OAUTH_TOKEN` for long unattended runs.
 
-Commit the configuration:
+Commit the configuration and the acceptance runner. Plans and runs work in worktrees made from commits, so anything they need must be committed:
 
 ```sh
-git add aeh .gitignore
+git add aeh .gitignore scripts/acceptance.js
 git commit -m "Set up AEH"
 ```
 
@@ -123,7 +123,7 @@ aeh plan home               # writes, checks, reviews and seals the acceptance t
 aeh run home-v0_1_0
 ```
 
-The run creates a fresh worktree per attempt and asks an implementer to make the change. It then runs the gates in a fixed order: sealed-test hashes, scope, drift, build, test. Reviewers from another provider review the change. A failed attempt is retried with the failure as feedback, then escalated to the next profile. When the ladder is exhausted, the run pauses with a question.
+The run creates a fresh worktree per attempt and asks an implementer to make the change. It then runs the gates in a fixed order: sealed-test hashes, scope, drift, build, test and, for planned features, the sealed acceptance tests. Reviewers from another provider review the change. A failed attempt is retried with the failure as feedback, then escalated to the next profile. When the ladder is exhausted, the run pauses with a question.
 
 When it finishes, the work is on the branch `aeh/home-v0_1_0`. AEH never touches your other branches. Review it and merge it yourself:
 
@@ -152,10 +152,10 @@ To drop unfinished work: `aeh abandon <ID>`. The branch and the evidence are kep
 Not everything needs a spec. For a small fix:
 
 ```sh
-aeh do "fix the broken link in the footer" --paths site/
+aeh do "fix the broken link in the footer" --paths site/ --feature home --change patch --note "Fix the footer link"
 ```
 
-It runs the same gates and the reviewers its route requires, without sealed tests.
+It runs the same gates and the reviewers its route requires, without sealed tests. A change to paths a feature owns must name that feature (the drift gate checks it), and it is recorded in the feature's history.
 
 ## 8. Changing a feature later
 
@@ -185,5 +185,5 @@ Changed criteria get new tests and their old sealed tests are retired. Removed c
 ## Safety notes
 
 - Agents and build/test commands run with your user's permissions, limited only by each CLI's own sandbox. Use AEH on repositories and commands you trust.
-- AEH never stores secrets. It uses the sessions your CLIs already have.
+- AEH does not manage credentials: it uses the sessions your CLIs already have. Prompts and agent output are kept under `.aeh/runs/` on your machine; anything sensitive that reaches them stays there.
 - Your idea, your answers and the relevant spec go to the agent providers inside prompts.

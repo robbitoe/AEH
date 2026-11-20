@@ -8,9 +8,12 @@ func TestCodexRepoCheckError(t *testing.T) {
 		want bool
 	}{
 		{[]string{"codex", "exec", "--sandbox", "read-only", "-"}, true},
-		{[]string{`C:\tools\Codex.CMD`, "exec", "-"}, true},
+		{[]string{`C:\tools\Codex.CMD`, "exec", "-"}, true}, // Windows path, on every platform
 		{[]string{"/usr/bin/codex.exe", "exec", "-"}, true},
+		{[]string{"codex", "e", "-"}, true}, // e is the alias of exec
 		{[]string{"codex", "exec", "--skip-git-repo-check", "-"}, false},
+		{[]string{"codex", "exec", "--yolo", "-"}, false},
+		{[]string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-"}, false},
 		{[]string{"codex", "login"}, false},
 		{[]string{"claude", "-p", "exec"}, false},
 		{[]string{"codex"}, false},

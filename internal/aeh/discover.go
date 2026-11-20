@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -1184,11 +1185,23 @@ func codexRepoCheckError(name string, p Profile) error {
 	if len(p.Command) < 2 {
 		return nil
 	}
-	base := strings.ToLower(filepath.Base(p.Command[0]))
+	base := strings.ToLower(path.Base(strings.ReplaceAll(p.Command[0], `\`, "/")))
 	for _, ext := range []string{".cmd", ".exe", ".bat", ".ps1"} {
 		base = strings.TrimSuffix(base, ext)
 	}
-	if base != "codex" || !slices.Contains(p.Command[1:], "exec") || slices.Contains(p.Command[1:], "--skip-git-repo-check") {
+	if base != "codex" {
+		return nil
+	}
+	runsExec := false
+	for _, a := range p.Command[1:] {
+		switch a {
+		case "exec", "e": // e is Codex's alias for exec
+			runsExec = true
+		case "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "--yolo":
+			return nil // each of these skips the repository check
+		}
+	}
+	if !runsExec {
 		return nil
 	}
 	return fmt.Errorf("config: profile %q runs codex exec without --skip-git-repo-check; discovery runs in a directory that is not a Git repository and Codex refuses it there, so add the flag to the profile's command", name)
