@@ -85,7 +85,9 @@ func simpleCommands(line string) [][]shellWord {
 				return stop() // unclosed quote
 			}
 			body := line[i+1 : i+1+j]
-			if c == '"' && strings.ContainsAny(body, "`$") {
+			// Inside double quotes a backslash may escape the closing quote, and $ or `
+			// substitute: not followed, so stop.
+			if c == '"' && strings.ContainsAny(body, "`$\\") {
 				return stop()
 			}
 			cur.WriteString(body)
@@ -99,6 +101,10 @@ func simpleCommands(line string) [][]shellWord {
 			inWord, quoted = true, true
 		case c == '`' || (c == '$' && i+1 < len(line) && line[i+1] == '('):
 			return stop() // substitution
+		case c == '#' && !inWord:
+			return stop() // a comment: the rest of the line is not a command
+		case c == '<' && i+1 < len(line) && line[i+1] == '<':
+			return stop() // a here-document: its body is not commands
 		case c == ';' || c == '|' || c == '&' || c == '(' || c == ')' || c == '\n':
 			endCmd()
 		case c == ' ' || c == '\t':

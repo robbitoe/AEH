@@ -444,15 +444,19 @@ func TestCheckLogConfig(t *testing.T) {
 
 func TestCommandProgramsHonorsQuotes(t *testing.T) {
 	cases := map[string]string{
-		`python -c "print(42)"`:                "python",
-		`node -e 'a(); b | c && d'`:            "node",
-		`sh -c "x; y" && make test`:            "make sh",
-		`echo a\;b; true`:                      "echo true",
-		`CI=1 "my tool" --flag`:                "",
-		`npm test $(echo x); later`:            "npm",
-		`go test ./... "unclosed && rm -rf x`:  "go",
-		"dotnet build\ndotnet test --no-build": "dotnet",
-		`./run.sh "a b" | tee out.log`:         "tee",
+		`python -c "print(42)"`:                                    "python",
+		`node -e 'a(); b | c && d'`:                                "node",
+		`sh -c "x; y" && make test`:                                "make sh",
+		`echo a\;b; true`:                                          "echo true",
+		`CI=1 "my tool" --flag`:                                    "",
+		`npm test $(echo x); later`:                                "npm",
+		`go test ./... "unclosed && rm -rf x`:                      "go",
+		"dotnet build\ndotnet test --no-build":                     "dotnet",
+		`node -e "console.log(\"hello; aeh_missing_xyz; world\")"`: "node",
+		`printf ok # comment; aeh_missing_xyz`:                     "printf",
+		"cat <<EOF > f\naeh_missing_xyz\nEOF\nmake":                "cat",
+		`echo a#b; true`:                                           "echo true",
+		`./run.sh "a b" | tee out.log`:                             "tee",
 	}
 	for line, want := range cases {
 		if got := strings.Join(commandPrograms(line), " "); got != want {
