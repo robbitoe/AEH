@@ -81,30 +81,22 @@ func TestRelocationMapping(t *testing.T) {
 			t.Errorf("accepted source literal %q", input)
 		}
 	}
-	// A source declared without a trailing slash matches only at path boundaries.
-	bare := []Relocation{{From: "src", To: "lib"}}
-	for _, input := range []string{`img.srcset = "a"`, "mysrc/a", "src2/a", "srcs"} {
-		if _, err := mapRelocationTest([]byte(input), bare); err != nil {
-			t.Errorf("rejected %q as a source literal: %v", input, err)
-		}
-	}
-	// Detection errs toward matching: every non-name neighbor counts, shell syntax included.
-	shell := []string{"load src/a", `require("src")`, "src", "(src/x)", "cat <src/pay.txt", "x>src/out", "a|src/b",
-		"$src/x", "${src}/x", "f:src/x", "a;src/b", "a&&src/b", "[src/x]", "{src/x}", "a,src/b", "test/src/x"}
-	for _, pairs := range [][]Relocation{bare, {{From: "src/", To: "lib/"}}} {
-		for _, input := range shell {
-			if input == `require("src")` || input == "src" || input == "${src}/x" {
-				if strings.HasSuffix(pairs[0].From, "/") {
-					continue // a slash-declared source needs the slash
-				}
+	// Detection is a plain substring: no shell syntax or attached option can hide a source.
+	// srcset is a false match by design (safe); the trailing slash in src/ avoids it.
+	for _, pairs := range [][]Relocation{{{From: "src", To: "lib"}}, {{From: "src/", To: "lib/"}}} {
+		for _, input := range []string{"load src/a", "(src/x)", "cat <src/pay.txt", "x>src/out", "$src/x",
+			"f:src/x", "a;src/b", "cc -Isrc/ -E probe.c", "test/src/x", "mysrc/a"} {
+			if !containsRelocationFrom([]byte(input), pairs) {
+				t.Errorf("sealed test bytes %q not detected for %+v", input, pairs)
 			}
 			if _, err := mapRelocationTest([]byte(input), pairs); err == nil {
 				t.Errorf("accepted source literal %q for %+v", input, pairs)
 			}
-			if !containsRelocationFrom([]byte(input), pairs) {
-				t.Errorf("sealed test bytes %q not detected for %+v", input, pairs)
-			}
 		}
+	}
+	if !containsRelocationFrom([]byte(`img.srcset = "a"`), []Relocation{{From: "src", To: "lib"}}) ||
+		containsRelocationFrom([]byte(`img.srcset = "a"`), []Relocation{{From: "src/", To: "lib/"}}) {
+		t.Error("srcset must match only a source declared without a trailing slash")
 	}
 	// Directly exercise the one-pass primitive even for a declaration validation refuses.
 	got, err := mapRelocationTest([]byte("lib/a"), []Relocation{{From: "old", To: "lib"}, {From: "before", To: "old"}})

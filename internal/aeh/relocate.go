@@ -124,40 +124,19 @@ func relocationPreconditions(root, base string, pairs []Relocation) error {
 	return nil
 }
 
-// containsRelocationFrom decides which sealed tests retire and which new tests are refused, so
-// it errs toward matching: a source counts unless a path-name character touches it on either
-// side. Any other neighbor (quotes, spaces, shell redirections like <src/x, $, :, /) is a match,
-// while a source declared without a trailing slash (src) still never matches inside srcset or
-// mysrc. The mapping keeps its narrower boundaries: a reference it misses fails visibly.
+// containsRelocationFrom is a plain substring check on purpose. It decides which sealed tests
+// retire and which new tests are refused, so a miss is the dangerous error: a sealed test that
+// still loads the source (cat <src/x, cc -Isrc/) would stay sealed and break after the move. A
+// false match is safe: the test retires only after passing on the base and gets replacement
+// coverage, or a new test is refused visibly. Declaring directories with a trailing slash
+// (src/) keeps false matches such as srcset rare.
 func containsRelocationFrom(b []byte, pairs []Relocation) bool {
 	for _, pair := range pairs {
-		from := []byte(strings.TrimSuffix(pair.From, "/"))
-		for i := 0; ; {
-			j := bytes.Index(b[i:], from)
-			if j < 0 {
-				break
-			}
-			at, end := i+j, i+j+len(from)
-			left, right := true, true
-			if at > 0 {
-				r, _ := utf8.DecodeLastRune(b[:at])
-				left = !relocationNameRune(r)
-			}
-			if end < len(b) {
-				r, _ := utf8.DecodeRune(b[end:])
-				right = !relocationNameRune(r)
-			}
-			if left && right {
-				return true
-			}
-			i = at + 1
+		if bytes.Contains(b, []byte(pair.From)) {
+			return true
 		}
 	}
 	return false
-}
-
-func relocationNameRune(r rune) bool {
-	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '-' || r == '.'
 }
 
 // relocateCriteria adds unchanged coverage whose sealed base bytes name a source. Sharing a
