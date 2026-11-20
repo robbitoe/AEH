@@ -1133,6 +1133,10 @@ type AdoptVerifyCommand struct {
 	Integrity string  `json:"integrity"`
 	Output    string  `json:"output,omitempty"`
 	Uncertain bool    `json:"uncertain,omitempty"`
+	// Class and Reason say how a sandboxed command ended (process, infrastructure,
+	// resource, terminated) and why, when it did not exit by itself.
+	Class  string `json:"class,omitempty"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // AdoptVerification is local evidence, never an approval or a suggested configuration run.
@@ -1196,6 +1200,7 @@ func AdoptVerify(ctx context.Context, r Repo, base string, out io.Writer) (_ Ado
 		if strings.TrimSpace(step.text) != "" && sv != nil {
 			g := sv.raw(ctx, step.name, step.text)
 			c.Seconds, c.Output, c.Passed, c.Uncertain, c.Exit = g.Seconds, discoveryDiagnostic(g.Output), g.Passed, g.Uncertain, -1
+			c.Class, c.Reason = g.Class, discoveryDiagnostic(g.Reason)
 			if g.Class == ClassProcess {
 				c.Exit = g.ExitCode
 			}

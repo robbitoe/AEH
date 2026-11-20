@@ -333,6 +333,9 @@ func writeAdoptReport(a *adoptSession, st AdoptStatusSnapshot) error {
 		for _, c := range v.Commands {
 			fmt.Fprintf(&b, "- %s: exit %d; %.3fs; passed: %t; command: %s; integrity: %s\n", c.Name, c.Exit, c.Seconds, c.Passed,
 				discoveryDiagnostic(c.Command), discoveryDiagnostic(c.Integrity))
+			if c.Class != "" && c.Class != ClassProcess {
+				fmt.Fprintf(&b, "  ended as %s: %s\n", c.Class, discoveryDiagnostic(c.Reason))
+			}
 		}
 	}
 	b.WriteString("\n## Uncovered groups at the accepted inventory base\n\n")

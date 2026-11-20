@@ -542,14 +542,6 @@ func finishPublishedCharacterization(r Repo, cfg Config, memDir string, spec Spe
 		}
 		p := &planner{repo: r, cfg: cfg, pcfg: cfg.plan(), spec: spec, memDir: memDir, log: log, kind: PlanCharacterize, state: &st}
 		if st.Phase == PlanPublished {
-			// Recording finalizes evidence: only under the isolation it was produced in.
-			sb, err := openFlowSandbox(r, cfg, "plan-"+st.ID)
-			if err != nil {
-				return st, true, err
-			}
-			if err := checkPlanSandbox(st.ID, st.Sandbox, sb); err != nil {
-				return st, true, err
-			}
 			if err := p.recordPlan(); err != nil {
 				return st, true, err
 			}
@@ -1886,6 +1878,18 @@ func (p *planner) logMemory() error {
 // idempotent by outcome and commit, so a crash after the memory commit only repeats it.
 func (p *planner) recordPlan() error {
 	st := p.state
+	// Recording finalizes evidence, on every path (planning, recovery, abandonment):
+	// only under the isolation the plan's checks ran under.
+	sb := p.sb
+	if sb == nil {
+		var err error
+		if sb, err = openFlowSandbox(p.repo, p.cfg, "plan-"+st.ID); err != nil {
+			return err
+		}
+	}
+	if err := checkPlanSandbox(st.ID, st.Sandbox, sb); err != nil {
+		return err
+	}
 	what, again := "characterization", "aeh adopt seal"
 	if st.NoImplementation {
 		what, again = "revision", "aeh plan"

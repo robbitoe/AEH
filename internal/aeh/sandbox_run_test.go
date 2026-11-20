@@ -157,3 +157,13 @@ func TestDockerSandboxedAdoptVerify(t *testing.T) {
 		t.Fatalf("tampering verify: %+v %v", v, err)
 	}
 }
+
+func TestRecordPlanRequiresThePlansSandbox(t *testing.T) {
+	// Every recording path (planning, characterization recovery, aeh abandon) goes
+	// through recordPlan, which refuses evidence pinned to another isolation before it
+	// reads or writes anything.
+	p := &planner{repo: Repo{Root: t.TempDir()}, state: &PlanState{ID: "pay-v0_1_0", Sandbox: `{"Policy":1}`}}
+	if err := p.recordPlan(); err == nil || !strings.Contains(err.Error(), "another sandbox") {
+		t.Fatalf("sandboxed evidence recorded on the host: %v", err)
+	}
+}
