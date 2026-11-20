@@ -435,7 +435,6 @@ type sandboxVolume struct {
 type sandboxLaunch struct {
 	Kind    string
 	Argv    []string
-	Stdin   string
 	Volumes []sandboxVolume
 	Env     []string // NAME=value, beyond HOME, TMPDIR and the empty proxy variables
 	Workdir string
@@ -465,7 +464,8 @@ type containerState struct {
 		Tmpfs          map[string]string `json:"Tmpfs"`
 		SecurityOpt    []string          `json:"SecurityOpt"`
 		LogConfig      struct {
-			Type string `json:"Type"`
+			Type   string            `json:"Type"`
+			Config map[string]string `json:"Config"`
 		} `json:"LogConfig"`
 	} `json:"HostConfig"`
 	Mounts []struct {
@@ -499,8 +499,9 @@ func (s *sandbox) inspect(id string) (containerState, error) {
 const (
 	sandboxUser = "10001:10001"
 	sandboxHome = "/home/aeh"
-	// sandboxLogSize caps the output Docker keeps per launch; reports use the tail.
-	sandboxLogSize = "64m"
+	// sandboxLogKeep is a log size no launch reaches: Docker never rotates the output away,
+	// and a daemon default rotation is overridden. Disk use during a step is out of model.
+	sandboxLogKeep = "1024g"
 )
 
 // launchEnv is the environment a container must end up with: the image's, then
@@ -550,8 +551,10 @@ func (s *sandbox) checkCreated(c containerState, l sandboxLaunch, vols []sandbox
 	if !slicesContainsPrefix(c.HostConfig.SecurityOpt, "no-new-privileges") {
 		problems = append(problems, "no-new-privileges missing")
 	}
-	if c.HostConfig.LogConfig.Type != "json-file" {
-		problems = append(problems, "log driver "+c.HostConfig.LogConfig.Type+" (the output is read with docker logs)")
+	// The output is read with docker logs after the process ends, so it must be kept
+	// whole: a rotating log would silently drop its beginning.
+	if lc := c.HostConfig.LogConfig; lc.Type != "json-file" || len(lc.Config) != 1 || lc.Config["max-size"] != sandboxLogKeep {
+		problems = append(problems, fmt.Sprintf("log configuration %s %v (the whole output must be kept)", lc.Type, lc.Config))
 	}
 	got := map[string]string{}
 	for _, kv := range c.Config.Env {
@@ -713,7 +716,7 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 		"--memory", s.cfg.Memory, "--memory-swap", s.cfg.Memory, "--cpus", s.cfg.CPUs, "--read-only",
 		"--tmpfs", "/tmp:mode=1777", "--tmpfs", sandboxHome+":uid=10001,gid=10001,mode=0700",
 		"--user", sandboxUser, "--workdir", l.Workdir, "--env-file", envFile, "--entrypoint", l.Argv[0],
-		"--log-driver", "json-file", "--log-opt", "max-size="+sandboxLogSize, "--log-opt", "max-file=1")
+		"--log-driver", "json-file", "--log-opt", "max-size="+sandboxLogKeep)
 	if l.Pids {
 		args = append(args, "--pids-limit", "512")
 	}

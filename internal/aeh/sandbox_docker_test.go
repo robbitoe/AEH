@@ -3,6 +3,7 @@ package aeh
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -188,4 +189,50 @@ func TestDockerOutputFailureProvesNothing(t *testing.T) {
 		t.Fatalf("%+v %v %q", res, err, out.String())
 	}
 	assertNoLeftovers(t, s)
+}
+
+func TestDockerLongOutputIsKeptWhole(t *testing.T) {
+	s, _ := dockerSandbox(t, SandboxConfig{})
+	// About 80 MB of output, above any common rotation size, ending with a marker; the
+	// head marker proves nothing was rotated away.
+	for _, exit := range []string{"0", "4"} {
+		var head, out bytes.Buffer
+		w := &markerWriter{head: &head, max: 64}
+		res, err := s.run(context.Background(), sandboxLaunch{Kind: "gate", Workdir: "/tmp", Timeout: 5 * time.Minute, Output: io.MultiWriter(w, &tailOnly{buf: &out}),
+			Argv: []string{"sh", "-c", "echo HEAD-MARKER; yes 0123456789012345678901234567890123456789 | head -c 80000000; echo; echo TAIL-MARKER; exit " + exit}}, nil)
+		if err != nil || res.Class != ClassProcess || fmt.Sprint(res.ExitCode) != exit {
+			t.Fatalf("exit %s: %+v %v", exit, res, err)
+		}
+		if !strings.HasPrefix(head.String(), "HEAD-MARKER") || !strings.Contains(out.String(), "TAIL-MARKER") {
+			t.Fatalf("exit %s: output not whole: head %q", exit, head.String())
+		}
+	}
+	assertNoLeftovers(t, s)
+}
+
+// markerWriter keeps the first max bytes written.
+type markerWriter struct {
+	head *bytes.Buffer
+	max  int
+}
+
+func (m *markerWriter) Write(p []byte) (int, error) {
+	if left := m.max - m.head.Len(); left > 0 {
+		m.head.Write(p[:min(left, len(p))])
+	}
+	return len(p), nil
+}
+
+// tailOnly keeps the last 4 KiB written.
+type tailOnly struct{ buf *bytes.Buffer }
+
+func (t *tailOnly) Write(p []byte) (int, error) {
+	t.buf.Write(p)
+	if t.buf.Len() > 4096 {
+		b := t.buf.Bytes()[t.buf.Len()-4096:]
+		nb := append([]byte(nil), b...)
+		t.buf.Reset()
+		t.buf.Write(nb)
+	}
+	return len(p), nil
 }
