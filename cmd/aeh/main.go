@@ -79,6 +79,9 @@ Memory (local, private: .aeh/memory/ of the main checkout, never published by ae
   aeh memory lint                   check memory and its privacy settings
   aeh memory record <ID>            retry a pending memory record of an accepted outcome
 
+Sandbox (optional: gate commands in containers)
+  aeh sandbox check                 check the engine, the image and the container limits
+
 Tracking
   aeh status                        progress of every outcome
   aeh version                       print the version
@@ -209,6 +212,15 @@ func dispatch(ctx context.Context, args []string) (int, error) {
 
 	case "status":
 		return 0, printStatus(repo)
+
+	case "sandbox":
+		if len(args) != 2 || args[1] != "check" {
+			return 2, errors.New("usage: aeh sandbox check")
+		}
+		if err := aeh.SandboxCheck(ctx, repo, os.Stdout); err != nil {
+			return 1, err
+		}
+		return 0, nil
 
 	case "notify":
 		if len(args) != 2 || args[1] != "test" {

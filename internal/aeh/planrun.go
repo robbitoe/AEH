@@ -1609,12 +1609,16 @@ func (p *planner) redGreen(ctx context.Context, wt, commit string, plan PlanFile
 			return checks, "", "", false, err
 		}
 		g.Output = redactDiagnostic(g.Output)
-		passed := g.Passed == kinds[f] && !g.Uncertain
+		passed := g.Passed == kinds[f] && g.provesResult()
 		checks = append(checks, PlanCheckEntry{Name: kind + " " + dir + f, Passed: passed, Detail: tail(g.Output, 500)})
 		if uncertain, damaged := settle(g); uncertain {
 			return checks, kind, g.Output, true, nil
 		} else if damaged != "" {
 			return checks, kind, damaged, false, nil
+		}
+		if !g.provesResult() {
+			// Only a process that exited by itself proves a red; an OOM kill does not.
+			return checks, kind, fmt.Sprintf("%s%s did not run to completion (%s): %s", dir, f, g.Class, g.Reason), false, nil
 		}
 		if kinds[f] && !g.Passed {
 			return checks, "green", fmt.Sprintf("recovery %s%s must pass on the base:\n%s", dir, f, g.Output), false, nil
