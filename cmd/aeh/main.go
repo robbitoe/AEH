@@ -16,9 +16,10 @@ import (
 	"github.com/robbitoe/aeh/internal/aeh"
 )
 
-const version = "0.1.0"
+// version is set at release time with -ldflags "-X main.version=<tag>".
+var version = "1.0.0-dev"
 
-const usage = `aeh — Autonomous Engineering Harness ` + version + `
+var usage = `aeh — Autonomous Engineering Harness ` + version + `
 
 Setup
   aeh init                          create aeh/config.yaml and an example outcome
