@@ -119,8 +119,13 @@ func TestProcessTreeCancellation(t *testing.T) {
 					connections = append(connections, conn)
 				}
 				wantErr := context.DeadlineExceeded
+				// With a deadline, the command ends when the parent timeout expires; on a
+				// fast host the helpers connect at once, so wait for that timeout plus a
+				// margin, never a period that races it.
+				wait := parentTimeout + 10*time.Second
 				if cause == "cancel" {
 					wantErr = context.Canceled
+					wait = 10 * time.Second
 					cancel()
 				}
 				select {
@@ -128,7 +133,7 @@ func TestProcessTreeCancellation(t *testing.T) {
 					if !errors.Is(err, wantErr) {
 						t.Fatalf("run error = %v, want %v", err, wantErr)
 					}
-				case <-time.After(10 * time.Second):
+				case <-time.After(wait):
 					t.Fatal("command did not return after cancellation")
 				}
 				deadline := time.Now().Add(2 * time.Second)
