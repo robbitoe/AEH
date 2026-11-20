@@ -81,6 +81,18 @@ func TestRelocationMapping(t *testing.T) {
 			t.Errorf("accepted source literal %q", input)
 		}
 	}
+	// A source declared without a trailing slash matches only at path boundaries.
+	bare := []Relocation{{From: "src", To: "lib"}}
+	for _, input := range []string{`img.srcset = "a"`, "mysrc/a", "src2/a", "srcs"} {
+		if _, err := mapRelocationTest([]byte(input), bare); err != nil {
+			t.Errorf("rejected %q as a source literal: %v", input, err)
+		}
+	}
+	for _, input := range []string{"load src/a", `require("src")`, "src", "(src/x)"} {
+		if _, err := mapRelocationTest([]byte(input), bare); err == nil {
+			t.Errorf("accepted bare source literal %q", input)
+		}
+	}
 	// Directly exercise the one-pass primitive even for a declaration validation refuses.
 	got, err := mapRelocationTest([]byte("lib/a"), []Relocation{{From: "old", To: "lib"}, {From: "before", To: "old"}})
 	if err != nil || string(got) != "old/a" {
@@ -230,6 +242,9 @@ echo 'VERDICT: APPROVE'`)
 	a := p.Attempts[len(p.Attempts)-1]
 	if a.Mapped == "" || a.Mapped == p.PlanCommit {
 		t.Fatal("base checks did not get a separate mapped commit")
+	}
+	if ref := mustGit(t, f.dir, "rev-parse", "refs/aeh/mapped/"+p.ID); ref != a.Mapped {
+		t.Fatalf("mapped commit is not retained by a ref: %q != %q", ref, a.Mapped)
 	}
 	unmapped, _ := gitBlob(f.dir, p.PlanCommit, "tests/acceptance/"+id+"/pay.sh")
 	mapped, _ := gitBlob(f.dir, a.Mapped, "tests/acceptance/"+id+"/pay.sh")

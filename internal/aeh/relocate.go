@@ -124,10 +124,21 @@ func relocationPreconditions(root, base string, pairs []Relocation) error {
 	return nil
 }
 
+// containsRelocationFrom matches a source at the same path boundaries the mapping uses, so a
+// source declared without a trailing slash (src) does not match inside a word (srcset).
 func containsRelocationFrom(b []byte, pairs []Relocation) bool {
 	for _, pair := range pairs {
-		if bytes.Contains(b, []byte(pair.From)) {
-			return true
+		from := []byte(strings.TrimSuffix(pair.From, "/"))
+		for i := 0; ; {
+			j := bytes.Index(b[i:], from)
+			if j < 0 {
+				break
+			}
+			at := i + j
+			if relocationLeftBoundary(b, at) && relocationRightBoundary(b, at+len(from), string(from)) {
+				return true
+			}
+			i = at + 1
 		}
 	}
 	return false
@@ -291,6 +302,11 @@ func (p *planner) mappedPlanCommit(commit string, plan PlanFile) (string, error)
 		"commit-tree", tree, "-p", commit, "-m", "aeh: mapped base checks for "+p.state.ID)
 	if err != nil {
 		return "", fmt.Errorf("commit mapped plan: %w", err)
+	}
+	// The state file names the mapped commit but does not keep it reachable; a ref does, so
+	// a git gc between an interruption and the resume cannot remove it.
+	if _, err := git(root, "update-ref", "refs/aeh/mapped/"+p.state.ID, mapped); err != nil {
+		return "", fmt.Errorf("retain mapped plan: %w", err)
 	}
 	return mapped, nil
 }

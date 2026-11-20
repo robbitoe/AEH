@@ -299,8 +299,9 @@ func memoryCommand(repo aeh.Repo, args []string) (int, error) {
 		}
 		if s.Queued != nil {
 			if len(s.Queued.Blockers) == 0 {
-				// It replaced an earlier queued approval; the next aeh command activates it.
-				fmt.Printf("approved %s %s, queued without blockers; the next aeh command activates it (version in force until then: %s)\n", s.Feature, s.Version, s.Queued.CurrentVersion)
+				// It replaced an earlier queued approval; aeh memory status (or the next run, plan or
+				// record) activates it.
+				fmt.Printf("approved %s %s, queued without blockers; run aeh memory status to activate it (version in force until then: %s)\n", s.Feature, s.Version, s.Queued.CurrentVersion)
 			} else {
 				fmt.Printf("approved %s %s, queued; version in force remains %s\n", s.Feature, s.Version, s.Queued.CurrentVersion)
 			}
