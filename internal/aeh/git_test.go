@@ -208,3 +208,17 @@ func TestCandidateFileStatus(t *testing.T) {
 		t.Fatalf("file status = %q, %v; want %q", got, err, want)
 	}
 }
+
+func TestFileStatusLineQuotes(t *testing.T) {
+	for _, tc := range []struct{ path, want string }{
+		{"src/a b.go", "A src/a b.go"},
+		{"src/\xff.go", `A "src/\xff.go"`},
+		{"src/a\nb", `A "src/a\nb"`},
+		{`q"uote`, `A "q\"uote"`},
+		{"src/ñ.go", "A src/ñ.go"},
+	} {
+		if got := fileStatusLine("A", tc.path); got != tc.want {
+			t.Errorf("fileStatusLine(%q) = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}

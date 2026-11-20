@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // gitSafety keeps agent-writable Git state from changing what the harness sees or runs:
@@ -152,7 +153,6 @@ func candidateDiff(wt, base, commit string) (string, error) {
 
 // candidateFileStatus lists each changed path with its Git status letter (A added, M
 // modified, D deleted, T type changed), one per line, so reviewers see new files at a glance.
-// Paths with control characters or quotes are shown quoted.
 func candidateFileStatus(wt, base, commit string) (string, error) {
 	out, err := git(wt, "diff", "--name-status", "-z", "--no-renames", "--ignore-submodules=none", base, commit)
 	if err != nil {
@@ -161,13 +161,18 @@ func candidateFileStatus(wt, base, commit string) (string, error) {
 	fields := strings.Split(strings.TrimSuffix(out, "\x00"), "\x00")
 	var lines []string
 	for i := 0; i+1 < len(fields); i += 2 {
-		path := fields[i+1]
-		if strings.ContainsFunc(path, func(r rune) bool { return r < 0x20 || r == 0x7f || r == '"' }) {
-			path = strconv.Quote(path)
-		}
-		lines = append(lines, fields[i]+" "+path)
+		lines = append(lines, fileStatusLine(fields[i], fields[i+1]))
 	}
 	return strings.Join(lines, "\n"), nil
+}
+
+// fileStatusLine quotes a path that is not valid UTF-8 or holds control characters or quotes,
+// so the prompt stays valid text and still shows the exact bytes.
+func fileStatusLine(status, path string) string {
+	if !utf8.ValidString(path) || strings.ContainsFunc(path, func(r rune) bool { return r < 0x20 || r == 0x7f || r == '"' }) {
+		path = strconv.Quote(path)
+	}
+	return status + " " + path
 }
 
 func verifyCheckout(wt, commit string) error {
