@@ -88,9 +88,22 @@ func TestRelocationMapping(t *testing.T) {
 			t.Errorf("rejected %q as a source literal: %v", input, err)
 		}
 	}
-	for _, input := range []string{"load src/a", `require("src")`, "src", "(src/x)"} {
-		if _, err := mapRelocationTest([]byte(input), bare); err == nil {
-			t.Errorf("accepted bare source literal %q", input)
+	// Detection errs toward matching: every non-name neighbor counts, shell syntax included.
+	shell := []string{"load src/a", `require("src")`, "src", "(src/x)", "cat <src/pay.txt", "x>src/out", "a|src/b",
+		"$src/x", "${src}/x", "f:src/x", "a;src/b", "a&&src/b", "[src/x]", "{src/x}", "a,src/b", "test/src/x"}
+	for _, pairs := range [][]Relocation{bare, {{From: "src/", To: "lib/"}}} {
+		for _, input := range shell {
+			if input == `require("src")` || input == "src" || input == "${src}/x" {
+				if strings.HasSuffix(pairs[0].From, "/") {
+					continue // a slash-declared source needs the slash
+				}
+			}
+			if _, err := mapRelocationTest([]byte(input), pairs); err == nil {
+				t.Errorf("accepted source literal %q for %+v", input, pairs)
+			}
+			if !containsRelocationFrom([]byte(input), pairs) {
+				t.Errorf("sealed test bytes %q not detected for %+v", input, pairs)
+			}
 		}
 	}
 	// Directly exercise the one-pass primitive even for a declaration validation refuses.
