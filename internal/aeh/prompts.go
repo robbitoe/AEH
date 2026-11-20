@@ -26,6 +26,7 @@ type promptData struct {
 	FailedGate  string
 	Feedback    string
 	Diff        string
+	Files       string // changed paths with their status letter (outcome reviews only)
 	MappedDiff  string
 	Relocations bool
 	MemorySpec  string

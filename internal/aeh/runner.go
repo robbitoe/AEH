@@ -680,6 +680,10 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 	if err != nil {
 		return res, err
 	}
+	files, err := candidateFileStatus(r.Root, base, commit)
+	if err != nil {
+		return res, err
+	}
 	if err := os.WriteFile(filepath.Join(runDir, "diff.patch"), []byte(diff), 0o600); err != nil {
 		return res, err
 	}
@@ -750,7 +754,7 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 			if approvedOn(res.Reviews, role, commit) {
 				continue
 			}
-			g, verdict, err := ru.review(ctx, t, role, profile, commit, verified, diff, runDir)
+			g, verdict, err := ru.review(ctx, t, role, profile, commit, verified, diff, files, runDir)
 			if err != nil {
 				return res, err
 			}
@@ -810,7 +814,7 @@ func checkoutGate(g GateResult, wt, commit string) GateResult {
 }
 
 // review binds a role's independent verdict to a candidate and verifies its checkout.
-func (ru *runner) review(ctx context.Context, t Task, role, author, commit, wt, diff, runDir string) (GateResult, ReviewVerdict, error) {
+func (ru *runner) review(ctx context.Context, t Task, role, author, commit, wt, diff, files, runDir string) (GateResult, ReviewVerdict, error) {
 	g := GateResult{Name: "review"}
 	v := ReviewVerdict{Role: role, SHA: commit, Verdict: "INVALID", PromptSource: ru.reviewSources[role]}
 	profile, err := ru.cfg.reviewerFor(role, author)
@@ -829,7 +833,7 @@ func (ru *runner) review(ctx context.Context, t Task, role, author, commit, wt, 
 		return g, v, fmt.Errorf("review profile: %w", err)
 	}
 	start := time.Now()
-	prompt, err := renderPrompt("review-"+role+".md", ru.reviewPrompts[role], promptData{Outcome: ru.outcome, Task: t, Diff: diff, Answers: ru.state.Answers})
+	prompt, err := renderPrompt("review-"+role+".md", ru.reviewPrompts[role], promptData{Outcome: ru.outcome, Task: t, Diff: diff, Files: files, Answers: ru.state.Answers})
 	if err != nil {
 		return g, v, err
 	}
@@ -966,6 +970,10 @@ func (ru *runner) completeTaskReviews(ctx context.Context, t Task, a *Attempt, m
 	if err != nil {
 		return false, "", err
 	}
+	files, err := candidateFileStatus(r.Root, a.Base, a.Commit)
+	if err != nil {
+		return false, "", err
+	}
 	wtRoot := filepath.Dir(r.WorktreePath(ru.outcome.ID + "-reviews"))
 	if err := os.MkdirAll(wtRoot, 0o700); err != nil {
 		return false, "", err
@@ -989,7 +997,7 @@ func (ru *runner) completeTaskReviews(ctx context.Context, t Task, a *Attempt, m
 	}
 	gates := readGateResults(r.Root, a.RunDir)
 	for i, role := range missing {
-		g, verdict, err := ru.review(ctx, t, role, a.Profile, a.Commit, wt, diff, runDir)
+		g, verdict, err := ru.review(ctx, t, role, a.Profile, a.Commit, wt, diff, files, runDir)
 		if err != nil {
 			g.Output = err.Error()
 		}

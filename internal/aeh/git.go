@@ -150,6 +150,26 @@ func candidateDiff(wt, base, commit string) (string, error) {
 	return git(wt, "diff", "--no-color", "--no-renames", "--ignore-submodules=none", "--no-ext-diff", "--no-textconv", base, commit)
 }
 
+// candidateFileStatus lists each changed path with its Git status letter (A added, M
+// modified, D deleted, T type changed), one per line, so reviewers see new files at a glance.
+// Paths with control characters or quotes are shown quoted.
+func candidateFileStatus(wt, base, commit string) (string, error) {
+	out, err := git(wt, "diff", "--name-status", "-z", "--no-renames", "--ignore-submodules=none", base, commit)
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Split(strings.TrimSuffix(out, "\x00"), "\x00")
+	var lines []string
+	for i := 0; i+1 < len(fields); i += 2 {
+		path := fields[i+1]
+		if strings.ContainsFunc(path, func(r rune) bool { return r < 0x20 || r == 0x7f || r == '"' }) {
+			path = strconv.Quote(path)
+		}
+		lines = append(lines, fields[i]+" "+path)
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
 func verifyCheckout(wt, commit string) error {
 	head, err := headCommit(wt)
 	if err != nil {

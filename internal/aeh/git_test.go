@@ -186,3 +186,25 @@ func TestCandidateDiffHasNoColor(t *testing.T) {
 		t.Fatalf("review diff must be plain text:\n%q", diff)
 	}
 }
+
+func TestCandidateFileStatus(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q")
+	write(t, dir, "old.txt", "a\n")
+	write(t, dir, "gone.txt", "a\n")
+	mustGit(t, dir, "add", ".")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base")
+	base := mustGit(t, dir, "rev-parse", "HEAD")
+	write(t, dir, "old.txt", "b\n")
+	write(t, dir, "new dir/new.txt", "c\n")
+	if err := os.Remove(filepath.Join(dir, "gone.txt")); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "change")
+	got, err := candidateFileStatus(dir, base, mustGit(t, dir, "rev-parse", "HEAD"))
+	want := "D gone.txt\nA new dir/new.txt\nM old.txt"
+	if err != nil || got != want {
+		t.Fatalf("file status = %q, %v; want %q", got, err, want)
+	}
+}
