@@ -340,3 +340,46 @@ func TestVerifyNeedsACompletedCopy(t *testing.T) {
 		t.Fatalf("a completed, unchanged copy: verified %v integrity %v err %v", verified, integrity, err)
 	}
 }
+
+func TestIgnoreCheckerRefusesHostAliases(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q")
+	if err := os.MkdirAll(filepath.Join(dir, "longdirectoryname"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "longdirectoryname", ".gitignore"), []byte("gen/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "rules")
+	commit := mustGit(t, dir, "rev-parse", "HEAD")
+	e, err := newCommitExport(dir, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := mustIgnore(t, dir, commit, e)
+	got, err := c.ignored([]string{"longdirectoryname/gen/x.go", "other/gen/x.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got["longdirectoryname/gen/x.go"] || got["other/gen/x.go"] {
+		t.Fatalf("exact paths: %v", got)
+	}
+	aliases := []string{"LONGDIRECTORYNAME/gen/x.go"}
+	if _, err := os.Stat(filepath.Join(c.dir, "LONGDI~1")); err == nil {
+		aliases = append(aliases, "LONGDI~1/gen/x.go") // NTFS short name
+	}
+	if runtime.GOOS == "windows" {
+		aliases = append(aliases, "longdirectoryname./gen/x.go")
+	}
+	got, err = c.ignored(aliases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range aliases {
+		if got[a] {
+			t.Errorf("%s was ignored through a host alias", a)
+		}
+	}
+	t.Logf("aliases checked: %v", aliases)
+}

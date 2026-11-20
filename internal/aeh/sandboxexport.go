@@ -153,10 +153,11 @@ func (e *commitExport) source() tarSource {
 // excludes, templates or attributes take part.
 type ignoreChecker struct {
 	dir string
-	// ruleDirs maps each directory holding a .gitignore, as the host identifies it, to
-	// its exact name. On a case-insensitive host, Git would read sub/.gitignore for a
-	// volume path under SUB/, which Linux would not.
-	ruleDirs map[string]string
+	// created holds the exact paths aeh wrote: each .gitignore and its directories. Any
+	// other path the host resolves inside the private repository is an alias (another
+	// case, an NTFS short name such as LONGDI~1, a trailing dot): Git would read rules
+	// through it that Linux would not.
+	created map[string]bool
 }
 
 func newIgnoreChecker(root, commit string, files []exportFile) (*ignoreChecker, error) {
@@ -170,12 +171,13 @@ func newIgnoreChecker(root, commit string, files []exportFile) (*ignoreChecker, 
 		return nil, fmt.Errorf("ignore rules: %w", err)
 	}
 	var rules []string
-	c.ruleDirs = map[string]string{}
+	c.created = map[string]bool{}
 	for _, f := range files {
 		if path.Base(f.Path) == ".gitignore" {
 			rules = append(rules, f.Path)
-			if d := path.Dir(f.Path); d != "." {
-				c.ruleDirs[foldHost(d)] = d
+			c.created[f.Path] = true
+			for d := path.Dir(f.Path); d != "."; d = path.Dir(d) {
+				c.created[d] = true
 			}
 		}
 	}
@@ -220,7 +222,7 @@ func (c *ignoreChecker) ignored(paths []string) (map[string]bool, error) {
 	// cannot be evaluated faithfully on this host: it counts as not ignored (the safe side).
 	var query []string
 	for _, p := range paths {
-		if !c.caseAlias(p) {
+		if !c.hostAlias(p) {
 			query = append(query, p)
 		}
 	}
@@ -355,21 +357,20 @@ func checkHostPaths(paths []string) error {
 	return nil
 }
 
-// foldHost is a path as a case-insensitive host compares it; unchanged elsewhere.
-func foldHost(p string) string {
-	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
-		return strings.ToLower(p)
-	}
-	return p
-}
-
-// caseAlias reports a path with an ancestor directory that the host would resolve to a
-// rules directory of a different case.
-func (c *ignoreChecker) caseAlias(p string) bool {
-	for d := path.Dir(p); d != "."; d = path.Dir(d) {
-		if exact, ok := c.ruleDirs[foldHost(d)]; ok && exact != d {
+// hostAlias reports a path that the host resolves, through a prefix aeh did not create
+// with that exact name, to something in the private repository. Such a path cannot be
+// evaluated faithfully here and counts as not ignored (the safe side).
+func (c *ignoreChecker) hostAlias(p string) bool {
+	parts := strings.Split(p, "/")
+	for i := range parts {
+		q := strings.Join(parts[:i+1], "/")
+		if c.created[q] {
+			continue
+		}
+		if _, err := os.Lstat(filepath.Join(c.dir, filepath.FromSlash(q))); err == nil {
 			return true
 		}
+		return false // nothing there: no rule can be read below it
 	}
 	return false
 }
