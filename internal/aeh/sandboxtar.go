@@ -126,11 +126,14 @@ func (c *cappedReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// treeEntry is one regular file read back from a volume.
+// treeEntry is one regular file, or one directory (Dir), read back from a volume.
+// Mode holds the permission bits as the tar header reports them.
 type treeEntry struct {
 	Executable bool
 	Size       int64
 	SHA256     string
+	Mode       int64
+	Dir        bool
 }
 
 // readTree parses a tar of a volume read back with docker cp. Names lose the leading
@@ -172,6 +175,7 @@ func readTree(r io.Reader, base string, limit int64) (map[string]treeEntry, erro
 		}
 		switch h.Typeflag {
 		case tar.TypeDir:
+			out[rel] = treeEntry{Dir: true, Mode: h.Mode & 0o7777}
 			continue
 		case tar.TypeReg:
 		default:
@@ -181,6 +185,6 @@ func readTree(r io.Reader, base string, limit int64) (map[string]treeEntry, erro
 		if _, err := io.Copy(sum, tr); err != nil {
 			return nil, fmt.Errorf("read back %s: %w", rel, err)
 		}
-		out[rel] = treeEntry{Executable: h.Mode&0o111 != 0, Size: h.Size, SHA256: hex.EncodeToString(sum.Sum(nil))}
+		out[rel] = treeEntry{Executable: h.Mode&0o111 != 0, Size: h.Size, SHA256: hex.EncodeToString(sum.Sum(nil)), Mode: h.Mode & 0o7777}
 	}
 }

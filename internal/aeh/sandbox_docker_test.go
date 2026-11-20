@@ -86,7 +86,7 @@ mkdir out && echo built > out/artifact && chmod 755 out/artifact`
 			t.Errorf("output has %s:\n%s", bad, text)
 		}
 	}
-	if len(back) != 5 || !back["out/artifact"].Executable || !back["tool"].Executable || back["plain"].Executable {
+	if len(back) != 7 || !back["out/artifact"].Executable || !back["tool"].Executable || back["plain"].Executable {
 		t.Fatalf("read back %+v", back)
 	}
 	assertNoLeftovers(t, s)

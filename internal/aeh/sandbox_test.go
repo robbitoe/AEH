@@ -83,7 +83,7 @@ func TestVolumeTarRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(back) != 3 || !back["run.sh"].Executable || back["src/a.txt"].Executable || back["src/a.txt"].Size != 3 {
+	if len(back) != 5 || !back["src/deep"].Dir || back["src/deep"].Mode != 0o755 || !back["run.sh"].Executable || back["src/a.txt"].Executable || back["src/a.txt"].Size != 3 {
 		t.Fatalf("read back %+v", back)
 	}
 	for _, bad := range []string{"../x", "/abs", "a//b", "a/./b", `a\b`} {

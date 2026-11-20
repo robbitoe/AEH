@@ -110,6 +110,7 @@ func (q *gateSequence) command(ctx context.Context, name, command string, timeou
 	}
 	out := &tailBuffer{n: 64 << 10}
 	var integrity error
+	verified := false
 	start := time.Now()
 	res, err := q.s.run(ctx, sandboxLaunch{Kind: "gate", Argv: []string{"sh", "-c", command}, Volumes: vols,
 		Env: q.s.gateEnv(), Workdir: sandboxWork, Timeout: timeout, Output: out},
@@ -118,9 +119,10 @@ func (q *gateSequence) command(ctx context.Context, name, command string, timeou
 				back, err := readTree(r, "work", readBackLimit)
 				if err != nil {
 					integrity = err
-					return nil
+				} else {
+					integrity = checkExport(q.export, back, q.rules)
 				}
-				integrity = checkExport(q.export, back, q.rules)
+				verified = integrity == nil
 				return nil
 			})
 		})
@@ -129,10 +131,17 @@ func (q *gateSequence) command(ctx context.Context, name, command string, timeou
 		res = LaunchResult{Class: ClassInfrastructure, ExitCode: -1, Reason: err.Error()}
 	}
 	g := gateFromLaunch(name, res, out.String(), seconds)
-	if integrity != nil {
+	switch {
+	case integrity != nil:
 		q.broken = fmt.Sprintf("the work volume was changed by %s: %v", name, integrity)
 		g.Passed = false
-		g.Output = tail(integrity.Error()+"\n"+g.Output, maxGateOutput)
+		// The diagnostic keeps its own share of the output, so a long command log never
+		// pushes the changed paths out.
+		g.Output = tail(integrity.Error(), maxGateOutput/2) + "\n" + tail(g.Output, maxGateOutput/2)
+	case !verified:
+		// The command may have run (timeout, lost state, unreadable output) but its effect
+		// on the volume is unknown: nothing may run on it again.
+		q.broken = fmt.Sprintf("the work volume could not be verified after %s", name)
 	}
 	return g
 }

@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -164,6 +165,18 @@ func newIgnoreChecker(root, commit string, files []exportFile) (*ignoreChecker, 
 		c.Close()
 		return nil, fmt.Errorf("ignore rules: %w", err)
 	}
+	var rules []string
+	for _, f := range files {
+		if path.Base(f.Path) == ".gitignore" {
+			rules = append(rules, f.Path)
+		}
+	}
+	// The ignore files are written to the host, so their paths must stay distinct there:
+	// on Windows or macOS A/.gitignore and a/.gitignore would be one file.
+	if err := checkHostPaths(rules); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("ignore rules: %w", err)
+	}
 	for _, f := range files {
 		if path.Base(f.Path) != ".gitignore" {
 			continue
@@ -198,8 +211,10 @@ func (c *ignoreChecker) ignored(paths []string) (map[string]bool, error) {
 	if len(paths) == 0 {
 		return out, nil
 	}
+	// Matching is case-sensitive, as in the Linux volume; git init would otherwise turn
+	// core.ignorecase on for a case-insensitive host file system.
 	args := append(append([]string{}, gitSafety...), "-c", "core.excludesFile="+filepath.Join(c.dir, ".git", "empty-excludes"),
-		"check-ignore", "--no-index", "--stdin", "-z")
+		"-c", "core.ignorecase=false", "check-ignore", "--no-index", "--stdin", "-z")
 	cmd := exec.Command("git", args...)
 	cmd.Dir = c.dir
 	cmd.Env = append(commandEnv(nil), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
@@ -225,21 +240,38 @@ func (c *ignoreChecker) ignored(paths []string) (map[string]bool, error) {
 func checkExport(e *commitExport, back map[string]treeEntry, rules *ignoreChecker) error {
 	var problems []string
 	tracked := map[string]bool{}
+	dirs := map[string]bool{}
 	for _, f := range e.Files {
 		tracked[f.Path] = true
+		for d := path.Dir(f.Path); d != "."; d = path.Dir(d) {
+			dirs[d] = true
+		}
+		want := int64(0o644)
+		if f.Executable {
+			want = 0o755
+		}
 		got, ok := back[f.Path]
 		switch {
-		case !ok:
+		case !ok || got.Dir:
 			problems = append(problems, "removed or replaced: "+f.Path)
 		case got.SHA256 != e.sums[f.Path] || got.Size != f.Size:
 			problems = append(problems, "modified: "+f.Path)
-		case got.Executable != f.Executable:
-			problems = append(problems, "mode changed: "+f.Path)
+		case got.Mode != want:
+			problems = append(problems, fmt.Sprintf("mode changed: %s (%04o, exported %04o)", f.Path, got.Mode, want))
+		}
+	}
+	// Directories holding tracked files keep the exported mode, so no later command
+	// loses access to tracked content.
+	for d := range dirs {
+		if got, ok := back[d]; !ok || !got.Dir {
+			problems = append(problems, "removed or replaced: "+d+"/")
+		} else if got.Mode != 0o755 {
+			problems = append(problems, fmt.Sprintf("mode changed: %s/ (%04o, exported 0755)", d, got.Mode))
 		}
 	}
 	var extra []string
-	for p := range back {
-		if !tracked[p] {
+	for p, entry := range back {
+		if !tracked[p] && !entry.Dir {
 			extra = append(extra, p)
 		}
 	}
@@ -259,6 +291,49 @@ func checkExport(e *commitExport, back map[string]treeEntry, rules *ignoreChecke
 			problems = append(problems[:50], fmt.Sprintf("... and %d more", len(problems)-50))
 		}
 		return fmt.Errorf("verification changed the checkout:\n%s", strings.Join(problems, "\n"))
+	}
+	return nil
+}
+
+// windowsReserved are device names Windows maps regardless of extension.
+var windowsReserved = map[string]bool{"con": true, "prn": true, "aux": true, "nul": true,
+	"com1": true, "com2": true, "com3": true, "com4": true, "com5": true, "com6": true, "com7": true, "com8": true, "com9": true,
+	"lpt1": true, "lpt2": true, "lpt3": true, "lpt4": true, "lpt5": true, "lpt6": true, "lpt7": true, "lpt8": true, "lpt9": true}
+
+// hostPathKey is how the host file system identifies a repository path, or an error when
+// the host cannot represent it faithfully.
+func hostPathKey(p string) (string, error) {
+	switch runtime.GOOS {
+	case "windows":
+		for _, part := range strings.Split(p, "/") {
+			base := strings.ToLower(part)
+			if i := strings.IndexByte(base, '.'); i >= 0 {
+				base = base[:i]
+			}
+			if strings.HasSuffix(part, ".") || strings.HasSuffix(part, " ") || windowsReserved[base] ||
+				strings.ContainsFunc(part, func(r rune) bool { return r < 32 || strings.ContainsRune(`<>:"|?*`, r) }) {
+				return "", fmt.Errorf("%s cannot be represented on Windows", p)
+			}
+		}
+		return strings.ToLower(p), nil
+	case "darwin":
+		return strings.ToLower(p), nil
+	}
+	return p, nil
+}
+
+// checkHostPaths refuses paths the host would merge or alter.
+func checkHostPaths(paths []string) error {
+	seen := map[string]string{}
+	for _, p := range paths {
+		key, err := hostPathKey(p)
+		if err != nil {
+			return err
+		}
+		if other, ok := seen[key]; ok {
+			return fmt.Errorf("%s and %s are the same file on this host", other, p)
+		}
+		seen[key] = p
 	}
 	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -28,7 +29,7 @@ func exportRepo(t *testing.T) (string, string) {
 		}
 	}
 	write(".gitattributes", "*.txt eol=crlf\n*.sub export-subst\n*.f filter=evil\n")
-	write(".gitignore", "out/\n*.log\n")
+	write(".gitignore", "out/\n*.log\n!keep.log\n")
 	write("sub/.gitignore", "gen/\n")
 	write("a.txt", "one\ntwo\n")
 	write("raw.bin", "\x00\xff\r\n")
@@ -130,10 +131,17 @@ func TestCheckExportFindsChanges(t *testing.T) {
 		t.Fatalf("ignored build output rejected: %v", err)
 	}
 	cases := map[string]func(map[string]treeEntry){
-		"modified: a.txt":                               func(m map[string]treeEntry) { v := m["a.txt"]; v.SHA256 = "y"; m["a.txt"] = v },
-		"removed or replaced: x.f":                      func(m map[string]treeEntry) { delete(m, "x.f") },
-		"mode changed: plain.sh":                        func(m map[string]treeEntry) { v := m["plain.sh"]; v.Executable = true; m["plain.sh"] = v },
-		"not ignored by the commit's .gitignore: gen/x": func(m map[string]treeEntry) { m["gen/x"] = treeEntry{} },
+		"modified: a.txt":                                         func(m map[string]treeEntry) { v := m["a.txt"]; v.SHA256 = "y"; m["a.txt"] = v },
+		"removed or replaced: x.f":                                func(m map[string]treeEntry) { delete(m, "x.f") },
+		"mode changed: plain.sh":                                  func(m map[string]treeEntry) { v := m["plain.sh"]; v.Mode = 0o755; m["plain.sh"] = v },
+		"not ignored by the commit's .gitignore: gen/x":           func(m map[string]treeEntry) { m["gen/x"] = treeEntry{} },
+		"mode changed: tool.sh (0655":                             func(m map[string]treeEntry) { v := m["tool.sh"]; v.Mode = 0o655; m["tool.sh"] = v },
+		"mode changed: x.f (0000":                                 func(m map[string]treeEntry) { v := m["x.f"]; v.Mode = 0; m["x.f"] = v },
+		"mode changed: sub/ (0700":                                func(m map[string]treeEntry) { v := m["sub"]; v.Mode = 0o700; m["sub"] = v },
+		"removed or replaced: sub/":                               func(m map[string]treeEntry) { delete(m, "sub") },
+		"removed or replaced: a.txt":                              func(m map[string]treeEntry) { m["a.txt"] = treeEntry{Dir: true, Mode: 0o755} },
+		"not ignored by the commit's .gitignore: OUT/injected.go": func(m map[string]treeEntry) { m["OUT/injected.go"] = treeEntry{} },
+		"not ignored by the commit's .gitignore: keep.log":        func(m map[string]treeEntry) { m["keep.log"] = treeEntry{} },
 	}
 	for want, mutate := range cases {
 		m := clone()
@@ -222,6 +230,78 @@ func TestDockerGateSequenceCanaries(t *testing.T) {
 		if err := seq.Close(); err != nil {
 			t.Fatal(err)
 		}
+	}
+	assertNoLeftovers(t, s)
+}
+
+func TestHostPathKeys(t *testing.T) {
+	if err := checkHostPaths([]string{"a/.gitignore", "b/.gitignore"}); err != nil {
+		t.Fatal(err)
+	}
+	clash := checkHostPaths([]string{"A/.gitignore", "a/.gitignore"})
+	if folded := runtime.GOOS == "windows" || runtime.GOOS == "darwin"; folded != (clash != nil) {
+		t.Fatalf("case collision on %s: %v", runtime.GOOS, clash)
+	}
+	if runtime.GOOS == "windows" {
+		for _, bad := range []string{"dir./.gitignore", "dir /.gitignore", "con/.gitignore", "aux.txt/.gitignore", "a:b/.gitignore"} {
+			if err := checkHostPaths([]string{bad}); err == nil {
+				t.Errorf("%s accepted", bad)
+			}
+		}
+	}
+}
+
+func TestIgnoreCheckerRefusesCollidingRules(t *testing.T) {
+	if runtime.GOOS != "windows" && runtime.GOOS != "darwin" {
+		t.Skip("case-insensitive hosts only")
+	}
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q")
+	mustGit(t, dir, "config", "core.ignorecase", "false")
+	empty := mustGit(t, dir, "hash-object", "-w", "--stdin")
+	mustGit(t, dir, "update-index", "--add", "--cacheinfo", "100644,"+empty+",A/.gitignore")
+	mustGit(t, dir, "update-index", "--add", "--cacheinfo", "100644,"+empty+",a/.gitignore")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "colliding rules")
+	commit := mustGit(t, dir, "rev-parse", "HEAD")
+	e, err := newCommitExport(dir, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newIgnoreChecker(dir, commit, e.Files); err == nil || !strings.Contains(err.Error(), "same file") {
+		t.Fatalf("colliding ignore files accepted: %v", err)
+	}
+}
+
+func TestDockerGateSequenceUnverifiedAndLongOutput(t *testing.T) {
+	s, _ := dockerSandbox(t, SandboxConfig{})
+	dir, commit := exportRepo(t)
+	ctx := context.Background()
+	seq, err := s.newGateSequence(ctx, dir, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The command changes a tracked file, then times out: nothing was read back, so the
+	// volume must not be used again.
+	g := seq.command(ctx, "build", "echo forged > a.txt; sleep 60", 3*time.Second, nil)
+	if g.Passed || !g.Uncertain || seq.Broken() == "" {
+		t.Fatalf("timeout: %+v broken %q", g, seq.Broken())
+	}
+	if next := seq.command(ctx, "test", "true", time.Minute, nil); next.Passed {
+		t.Fatalf("ran on an unverified volume: %+v", next)
+	}
+	if err := seq.Close(); err != nil {
+		t.Fatal(err)
+	}
+	seq, err = s.newGateSequence(ctx, dir, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g = seq.command(ctx, "build", "yes 'a long build log line' | head -c 300000; echo forged > a.txt", time.Minute, nil)
+	if g.Passed || !strings.Contains(g.Output, "modified: a.txt") || !strings.Contains(g.Output, "long build log") {
+		t.Fatalf("integrity diagnostic lost in long output:\n%s", tail(g.Output, 800))
+	}
+	if err := seq.Close(); err != nil {
+		t.Fatal(err)
 	}
 	assertNoLeftovers(t, s)
 }
