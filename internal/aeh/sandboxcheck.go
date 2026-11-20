@@ -13,21 +13,22 @@ import (
 )
 
 // commandPrograms lists the first word of every simple command in a shell line, so the
-// preflight can check that the image has them. It is a heuristic: words with quotes,
-// variables or paths are left to the shell.
+// preflight can check that the image has them. Separators inside quotes or after a
+// backslash do not split commands. It is a heuristic: only plain words count, and a line
+// it cannot follow (an unclosed quote, a $( or backquote substitution) yields nothing
+// from that point on, so the check never refuses a valid command.
 func commandPrograms(lines ...string) []string {
-	split := regexp.MustCompile(`&&|\|\||[;|()\n]`)
 	plain := regexp.MustCompile(`^[A-Za-z0-9._+-]+$`)
 	assign := regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 	seen := map[string]bool{}
 	for _, line := range lines {
-		for _, part := range split.Split(line, -1) {
-			for _, word := range strings.Fields(part) {
-				if assign.MatchString(word) {
+		for _, words := range simpleCommands(line) {
+			for _, word := range words {
+				if assign.MatchString(word.text) && !word.quoted {
 					continue
 				}
-				if plain.MatchString(word) {
-					seen[word] = true
+				if plain.MatchString(word.text) && !word.quoted {
+					seen[word.text] = true
 				}
 				break
 			}
@@ -39,6 +40,76 @@ func commandPrograms(lines ...string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+type shellWord struct {
+	text   string
+	quoted bool // any part of the word was quoted or escaped
+}
+
+// simpleCommands splits a shell line into the words of each simple command, honoring
+// single and double quotes and backslashes. It stops at the first construct it does not
+// follow (command substitution, an unclosed quote), returning the commands before it.
+func simpleCommands(line string) [][]shellWord {
+	var cmds [][]shellWord
+	var words []shellWord
+	var cur strings.Builder
+	inWord, quoted := false, false
+	endWord := func() {
+		if inWord {
+			words = append(words, shellWord{cur.String(), quoted})
+		}
+		cur.Reset()
+		inWord, quoted = false, false
+	}
+	endCmd := func() {
+		endWord()
+		if len(words) > 0 {
+			cmds = append(cmds, words)
+		}
+		words = nil
+	}
+	// stop keeps the complete words of the current command and drops the partial one.
+	stop := func() [][]shellWord {
+		if len(words) > 0 {
+			cmds = append(cmds, words)
+		}
+		return cmds
+	}
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		switch {
+		case c == '\'' || c == '"':
+			j := strings.IndexByte(line[i+1:], c)
+			if j < 0 {
+				return stop() // unclosed quote
+			}
+			body := line[i+1 : i+1+j]
+			if c == '"' && strings.ContainsAny(body, "`$") {
+				return stop()
+			}
+			cur.WriteString(body)
+			inWord, quoted = true, true
+			i += j + 1
+		case c == '\\':
+			if i+1 < len(line) {
+				cur.WriteByte(line[i+1])
+				i++
+			}
+			inWord, quoted = true, true
+		case c == '`' || (c == '$' && i+1 < len(line) && line[i+1] == '('):
+			return stop() // substitution
+		case c == ';' || c == '|' || c == '&' || c == '(' || c == ')' || c == '\n':
+			endCmd()
+		case c == ' ' || c == '\t':
+			endWord()
+		default:
+			cur.WriteByte(c)
+			inWord = true
+		}
+	}
+	endCmd()
+	return cmds
 }
 
 var gitWord = regexp.MustCompile(`(^|[^A-Za-z0-9_.-])git([^A-Za-z0-9_.-]|$)`)

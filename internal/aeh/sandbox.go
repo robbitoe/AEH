@@ -551,11 +551,8 @@ func (s *sandbox) checkCreated(c containerState, l sandboxLaunch, vols []sandbox
 	if !slicesContainsPrefix(c.HostConfig.SecurityOpt, "no-new-privileges") {
 		problems = append(problems, "no-new-privileges missing")
 	}
-	// The output is read with docker logs after the process ends, so it must be kept
-	// whole: no reachable rotation size and no non-blocking mode (which drops output).
-	// Other options a daemon adds (max-file, compress, labels) are harmless.
-	if lc := c.HostConfig.LogConfig; lc.Type != "json-file" || lc.Config["max-size"] != sandboxLogKeep || lc.Config["mode"] != "blocking" {
-		problems = append(problems, fmt.Sprintf("log configuration %s %v (the whole output must be kept)", lc.Type, lc.Config))
+	if p := checkLogConfig(c.HostConfig.LogConfig.Type, c.HostConfig.LogConfig.Config); p != "" {
+		problems = append(problems, p)
 	}
 	got := map[string]string{}
 	for _, kv := range c.Config.Env {
@@ -717,7 +714,7 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 		"--memory", s.cfg.Memory, "--memory-swap", s.cfg.Memory, "--cpus", s.cfg.CPUs, "--read-only",
 		"--tmpfs", "/tmp:mode=1777", "--tmpfs", sandboxHome+":uid=10001,gid=10001,mode=0700",
 		"--user", sandboxUser, "--workdir", l.Workdir, "--env-file", envFile, "--entrypoint", l.Argv[0],
-		"--log-driver", "json-file", "--log-opt", "max-size="+sandboxLogKeep, "--log-opt", "mode=blocking")
+		"--log-driver", "json-file", "--log-opt", "max-size="+sandboxLogKeep)
 	if l.Pids {
 		args = append(args, "--pids-limit", "512")
 	}
@@ -948,4 +945,22 @@ func lockSandboxFlow(r Repo, flow string) (func(), error) {
 		return nil, fmt.Errorf("sandbox lock: %w", err)
 	}
 	return func() { _ = os.Remove(lock) }, nil
+}
+
+// checkLogConfig accepts the effective log configuration only if the whole output is
+// kept: the output is read with docker logs after the process ends. The size must be
+// the unreachable one aeh sets, and the mode blocking (Docker's default). aeh does not
+// force the mode: Docker refuses mode=blocking together with a daemon's inherited
+// max-buffer-size. A daemon defaulting to non-blocking mode, which drops output when its
+// buffer fills, is refused with what to change. Other merged options are harmless.
+func checkLogConfig(typ string, cfg map[string]string) string {
+	switch {
+	case typ != "json-file":
+		return "log driver " + typ + " (aeh needs json-file to read the whole output)"
+	case cfg["max-size"] != sandboxLogKeep:
+		return "log max-size " + cfg["max-size"] + " (the whole output must be kept)"
+	case cfg["mode"] != "" && cfg["mode"] != "blocking":
+		return "log mode " + cfg["mode"] + " can drop output; remove the non-blocking log-opts default from the Docker daemon configuration (daemon.json)"
+	}
+	return ""
 }

@@ -209,7 +209,7 @@ func TestCheckCreated(t *testing.T) {
 		var c containerState
 		c.Image, c.Config.User, c.Config.WorkingDir, c.Config.Entrypoint = "sha256:img", "10001:10001", "/work", []string{"sh"}
 		c.HostConfig.NetworkMode, c.HostConfig.ReadonlyRootfs = "none", true
-		c.HostConfig.LogConfig.Type, c.HostConfig.LogConfig.Config = "json-file", map[string]string{"max-size": sandboxLogKeep, "mode": "blocking"}
+		c.HostConfig.LogConfig.Type, c.HostConfig.LogConfig.Config = "json-file", map[string]string{"max-size": sandboxLogKeep}
 		c.HostConfig.CapDrop, c.HostConfig.SecurityOpt = []string{"ALL"}, []string{"no-new-privileges"}
 		c.HostConfig.Tmpfs = map[string]string{"/tmp": "mode=1777", sandboxHome: "uid=10001"}
 		for k, v := range want {
@@ -417,4 +417,46 @@ func TestSandboxFlowLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	again()
+}
+
+func TestCheckLogConfig(t *testing.T) {
+	keep := map[string]string{"max-size": sandboxLogKeep}
+	if p := checkLogConfig("json-file", keep); p != "" {
+		t.Fatal(p)
+	}
+	ok := map[string]string{"max-size": sandboxLogKeep, "max-file": "3", "compress": "true", "mode": "blocking"}
+	if p := checkLogConfig("json-file", ok); p != "" {
+		t.Fatal(p)
+	}
+	// Docker's merge of a daemon default {"mode":"non-blocking","max-buffer-size":"4m"}:
+	// refused with what to change, never accepted.
+	daemon := map[string]string{"max-size": sandboxLogKeep, "mode": "non-blocking", "max-buffer-size": "4m"}
+	if p := checkLogConfig("json-file", daemon); !strings.Contains(p, "daemon.json") {
+		t.Fatalf("non-blocking daemon default: %q", p)
+	}
+	if p := checkLogConfig("json-file", map[string]string{"max-size": "10m"}); p == "" {
+		t.Fatal("rotation accepted")
+	}
+	if p := checkLogConfig("local", keep); p == "" {
+		t.Fatal("local driver accepted")
+	}
+}
+
+func TestCommandProgramsHonorsQuotes(t *testing.T) {
+	cases := map[string]string{
+		`python -c "print(42)"`:                "python",
+		`node -e 'a(); b | c && d'`:            "node",
+		`sh -c "x; y" && make test`:            "make sh",
+		`echo a\;b; true`:                      "echo true",
+		`CI=1 "my tool" --flag`:                "",
+		`npm test $(echo x); later`:            "npm",
+		`go test ./... "unclosed && rm -rf x`:  "go",
+		"dotnet build\ndotnet test --no-build": "dotnet",
+		`./run.sh "a b" | tee out.log`:         "tee",
+	}
+	for line, want := range cases {
+		if got := strings.Join(commandPrograms(line), " "); got != want {
+			t.Errorf("%q: got %q, want %q", line, got, want)
+		}
+	}
 }
