@@ -93,6 +93,8 @@ func simpleCommands(line string) [][]shellWord {
 			cur.WriteString(body)
 			inWord, quoted = true, true
 			i += j + 1
+		case c == '\\' && i+1 < len(line) && line[i+1] == '\n':
+			i++ // a line continuation joins lines; it is not part of any word
 		case c == '\\':
 			if i+1 < len(line) {
 				cur.WriteByte(line[i+1])
@@ -102,7 +104,12 @@ func simpleCommands(line string) [][]shellWord {
 		case c == '`' || (c == '$' && i+1 < len(line) && line[i+1] == '('):
 			return stop() // substitution
 		case c == '#' && !inWord:
-			return stop() // a comment: the rest of the line is not a command
+			// A comment runs to the end of its line; the next line is new commands.
+			if j := strings.IndexByte(line[i:], '\n'); j >= 0 {
+				i += j - 1
+			} else {
+				i = len(line)
+			}
 		case c == '<' && i+1 < len(line) && line[i+1] == '<':
 			return stop() // a here-document: its body is not commands
 		case c == ';' || c == '|' || c == '&' || c == '(' || c == ')' || c == '\n':
@@ -124,7 +131,7 @@ var gitWord = regexp.MustCompile(`(^|[^A-Za-z0-9_.-])git([^A-Za-z0-9_.-]|$)`)
 // writable work view, read-only runner view, file modes and network interfaces.
 const preflightScript = `fail() { echo "PREFLIGHT-FAIL: $*"; exit 1; }
 [ "$(id -u)" = 10001 ] || fail "the container runs as user $(id -u), expected 10001"
-for p in "$@"; do command -v "$p" >/dev/null 2>&1 || fail "program not found in the image: $p"; done
+for p in "$@"; do command -v "$p" >/dev/null 2>&1 || echo "MISSING-PROGRAM: $p"; done
 touch /aeh-probe 2>/dev/null && fail "the root filesystem is writable"
 [ "$(cat /run/aeh/probe.txt)" = runner ] || fail "cannot read the runner view"
 echo x > /run/aeh/x 2>/dev/null && fail "the runner view is writable"
@@ -196,7 +203,14 @@ func SandboxCheck(ctx context.Context, r Repo, w io.Writer) error {
 	if e, ok := back["out.txt"]; !ok || e.Size != int64(len("written\n")) {
 		return errors.New("preflight: the work view was not read back with the file the container wrote")
 	}
-	fmt.Fprintf(w, "preflight user 10001, read-only root, no network, exact file modes, programs: %s\n", strings.Join(programs, " "))
+	fmt.Fprintf(w, "preflight user 10001, read-only root, no network, exact file modes\n")
+	// Program detection is a heuristic over shell text, so a missing program is a warning:
+	// it must never refuse a command that works.
+	for _, line := range strings.Split(text, "\n") {
+		if p, ok := strings.CutPrefix(strings.TrimSpace(line), "MISSING-PROGRAM: "); ok {
+			fmt.Fprintf(w, "warning   %s was not found in the image; if a command runs it, add it to the image\n", p)
+		}
+	}
 	for _, c := range [][2]string{{"build", cfg.Commands.Build}, {"test", cfg.Commands.Test}, {"acceptance", cfg.Commands.Acceptance}} {
 		if name := c[0]; gitWord.MatchString(c[1]) {
 			fmt.Fprintf(w, "warning   commands.%s calls git; sandboxed gates see no Git repository\n", name)

@@ -455,6 +455,7 @@ func TestCommandProgramsHonorsQuotes(t *testing.T) {
 		`node -e "console.log(\"hello; aeh_missing_xyz; world\")"`: "node",
 		`printf ok # comment; aeh_missing_xyz`:                     "printf",
 		"cat <<EOF > f\naeh_missing_xyz\nEOF\nmake":                "cat",
+		"printf ok \\\n# comment; aeh_missing_xyz\nmake":           "make printf",
 		`echo a#b; true`:                                           "echo true",
 		`./run.sh "a b" | tee out.log`:                             "tee",
 	}
