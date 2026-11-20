@@ -153,6 +153,10 @@ func (e *commitExport) source() tarSource {
 // excludes, templates or attributes take part.
 type ignoreChecker struct {
 	dir string
+	// ruleDirs maps each directory holding a .gitignore, as the host identifies it, to
+	// its exact name. On a case-insensitive host, Git would read sub/.gitignore for a
+	// volume path under SUB/, which Linux would not.
+	ruleDirs map[string]string
 }
 
 func newIgnoreChecker(root, commit string, files []exportFile) (*ignoreChecker, error) {
@@ -166,9 +170,13 @@ func newIgnoreChecker(root, commit string, files []exportFile) (*ignoreChecker, 
 		return nil, fmt.Errorf("ignore rules: %w", err)
 	}
 	var rules []string
+	c.ruleDirs = map[string]string{}
 	for _, f := range files {
 		if path.Base(f.Path) == ".gitignore" {
 			rules = append(rules, f.Path)
+			if d := path.Dir(f.Path); d != "." {
+				c.ruleDirs[foldHost(d)] = d
+			}
 		}
 	}
 	// The ignore files are written to the host, so their paths must stay distinct there:
@@ -208,6 +216,15 @@ func (c *ignoreChecker) Close() { _ = os.RemoveAll(c.dir) }
 // ignored returns the subset of paths the commit's ignore rules ignore.
 func (c *ignoreChecker) ignored(paths []string) (map[string]bool, error) {
 	out := map[string]bool{}
+	// A path under a directory that matches a rules directory only when case is folded
+	// cannot be evaluated faithfully on this host: it counts as not ignored (the safe side).
+	var query []string
+	for _, p := range paths {
+		if !c.caseAlias(p) {
+			query = append(query, p)
+		}
+	}
+	paths = query
 	if len(paths) == 0 {
 		return out, nil
 	}
@@ -240,7 +257,7 @@ func (c *ignoreChecker) ignored(paths []string) (map[string]bool, error) {
 func checkExport(e *commitExport, back map[string]treeEntry, rules *ignoreChecker) error {
 	var problems []string
 	tracked := map[string]bool{}
-	dirs := map[string]bool{}
+	dirs := map[string]bool{".": true} // the work root too
 	for _, f := range e.Files {
 		tracked[f.Path] = true
 		for d := path.Dir(f.Path); d != "."; d = path.Dir(d) {
@@ -336,4 +353,23 @@ func checkHostPaths(paths []string) error {
 		seen[key] = p
 	}
 	return nil
+}
+
+// foldHost is a path as a case-insensitive host compares it; unchanged elsewhere.
+func foldHost(p string) string {
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		return strings.ToLower(p)
+	}
+	return p
+}
+
+// caseAlias reports a path with an ancestor directory that the host would resolve to a
+// rules directory of a different case.
+func (c *ignoreChecker) caseAlias(p string) bool {
+	for d := path.Dir(p); d != "."; d = path.Dir(d) {
+		if exact, ok := c.ruleDirs[foldHost(d)]; ok && exact != d {
+			return true
+		}
+	}
+	return false
 }

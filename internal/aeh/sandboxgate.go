@@ -52,6 +52,25 @@ type gateSequence struct {
 	export *commitExport
 	rules  *ignoreChecker
 	broken string // set when integrity failed: the volume is no longer trusted
+	// readBack copies the volume out of a stopped container (sandbox.readBack; tests
+	// replace it to fail a copy after a complete-looking archive).
+	readBack func(ctx context.Context, container, target string, fn func(io.Reader) error) error
+}
+
+// verify reads the work volume back and compares it with the export. It is verified
+// only when the copy itself completed and nothing changed.
+func (q *gateSequence) verify(ctx context.Context, container string) (verified bool, integrity, err error) {
+	err = q.readBack(ctx, container, sandboxWork, func(r io.Reader) error {
+		back, rerr := readTree(r, "work", readBackLimit)
+		if rerr != nil {
+			integrity = rerr
+		} else {
+			integrity = checkExport(q.export, back, q.rules)
+		}
+		return nil
+	})
+	// A parse can succeed on a truncated archive that ends at a header boundary.
+	return err == nil && integrity == nil, integrity, err
 }
 
 func (s *sandbox) newGateSequence(ctx context.Context, root, commit string) (*gateSequence, error) {
@@ -71,7 +90,7 @@ func (s *sandbox) newGateSequence(ctx context.Context, root, commit string) (*ga
 		}
 		return nil, err
 	}
-	return &gateSequence{s: s, vol: vol, export: e, rules: rules}, nil
+	return &gateSequence{s: s, vol: vol, export: e, rules: rules, readBack: s.readBack}, nil
 }
 
 // Broken returns why the work volume is no longer trusted, or "" while it is intact.
@@ -115,16 +134,9 @@ func (q *gateSequence) command(ctx context.Context, name, command string, timeou
 	res, err := q.s.run(ctx, sandboxLaunch{Kind: "gate", Argv: []string{"sh", "-c", command}, Volumes: vols,
 		Env: q.s.gateEnv(), Workdir: sandboxWork, Timeout: timeout, Output: out},
 		func(container string) error {
-			return q.s.readBack(ctx, container, sandboxWork, func(r io.Reader) error {
-				back, err := readTree(r, "work", readBackLimit)
-				if err != nil {
-					integrity = err
-				} else {
-					integrity = checkExport(q.export, back, q.rules)
-				}
-				verified = integrity == nil
-				return nil
-			})
+			var err error
+			verified, integrity, err = q.verify(ctx, container)
+			return err
 		})
 	seconds := time.Since(start).Seconds()
 	if err != nil {

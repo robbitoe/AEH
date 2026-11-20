@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -131,17 +133,19 @@ func TestCheckExportFindsChanges(t *testing.T) {
 		t.Fatalf("ignored build output rejected: %v", err)
 	}
 	cases := map[string]func(map[string]treeEntry){
-		"modified: a.txt":                                         func(m map[string]treeEntry) { v := m["a.txt"]; v.SHA256 = "y"; m["a.txt"] = v },
-		"removed or replaced: x.f":                                func(m map[string]treeEntry) { delete(m, "x.f") },
-		"mode changed: plain.sh":                                  func(m map[string]treeEntry) { v := m["plain.sh"]; v.Mode = 0o755; m["plain.sh"] = v },
-		"not ignored by the commit's .gitignore: gen/x":           func(m map[string]treeEntry) { m["gen/x"] = treeEntry{} },
-		"mode changed: tool.sh (0655":                             func(m map[string]treeEntry) { v := m["tool.sh"]; v.Mode = 0o655; m["tool.sh"] = v },
-		"mode changed: x.f (0000":                                 func(m map[string]treeEntry) { v := m["x.f"]; v.Mode = 0; m["x.f"] = v },
-		"mode changed: sub/ (0700":                                func(m map[string]treeEntry) { v := m["sub"]; v.Mode = 0o700; m["sub"] = v },
-		"removed or replaced: sub/":                               func(m map[string]treeEntry) { delete(m, "sub") },
-		"removed or replaced: a.txt":                              func(m map[string]treeEntry) { m["a.txt"] = treeEntry{Dir: true, Mode: 0o755} },
-		"not ignored by the commit's .gitignore: OUT/injected.go": func(m map[string]treeEntry) { m["OUT/injected.go"] = treeEntry{} },
-		"not ignored by the commit's .gitignore: keep.log":        func(m map[string]treeEntry) { m["keep.log"] = treeEntry{} },
+		"modified: a.txt":                                             func(m map[string]treeEntry) { v := m["a.txt"]; v.SHA256 = "y"; m["a.txt"] = v },
+		"removed or replaced: x.f":                                    func(m map[string]treeEntry) { delete(m, "x.f") },
+		"mode changed: plain.sh":                                      func(m map[string]treeEntry) { v := m["plain.sh"]; v.Mode = 0o755; m["plain.sh"] = v },
+		"not ignored by the commit's .gitignore: gen/x":               func(m map[string]treeEntry) { m["gen/x"] = treeEntry{} },
+		"mode changed: tool.sh (0655":                                 func(m map[string]treeEntry) { v := m["tool.sh"]; v.Mode = 0o655; m["tool.sh"] = v },
+		"mode changed: x.f (0000":                                     func(m map[string]treeEntry) { v := m["x.f"]; v.Mode = 0; m["x.f"] = v },
+		"mode changed: sub/ (0700":                                    func(m map[string]treeEntry) { v := m["sub"]; v.Mode = 0o700; m["sub"] = v },
+		"removed or replaced: sub/":                                   func(m map[string]treeEntry) { delete(m, "sub") },
+		"removed or replaced: a.txt":                                  func(m map[string]treeEntry) { m["a.txt"] = treeEntry{Dir: true, Mode: 0o755} },
+		"not ignored by the commit's .gitignore: OUT/injected.go":     func(m map[string]treeEntry) { m["OUT/injected.go"] = treeEntry{} },
+		"not ignored by the commit's .gitignore: keep.log":            func(m map[string]treeEntry) { m["keep.log"] = treeEntry{} },
+		"not ignored by the commit's .gitignore: SUB/gen/injected.go": func(m map[string]treeEntry) { m["SUB/gen/injected.go"] = treeEntry{} },
+		"mode changed: ./ (0555":                                      func(m map[string]treeEntry) { v := m["."]; v.Mode = 0o555; m["."] = v },
 	}
 	for want, mutate := range cases {
 		m := clone()
@@ -214,6 +218,8 @@ func TestDockerGateSequenceCanaries(t *testing.T) {
 		"made executable":      {"chmod +x plain.sh", "mode changed: plain.sh"},
 		"new tracked-looking":  {"echo x > new.go", "not ignored by the commit's .gitignore: new.go"},
 		"file to directory":    {"rm a.txt && mkdir a.txt", "removed or replaced: a.txt"},
+		"work root read-only":  {"chmod 555 .", "mode changed: ./"},
+		"directory mode":       {"chmod 700 sub", "mode changed: sub/"},
 	}
 	for name, c := range cases {
 		seq, err := s.newGateSequence(ctx, dir, commit)
@@ -304,4 +310,33 @@ func TestDockerGateSequenceUnverifiedAndLongOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertNoLeftovers(t, s)
+}
+
+func TestVerifyNeedsACompletedCopy(t *testing.T) {
+	dir, commit := exportRepo(t)
+	e, err := newCommitExport(dir, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var archive bytes.Buffer
+	if err := writeVolumeTar(&archive, "work", e.source()); err != nil {
+		t.Fatal(err)
+	}
+	q := &gateSequence{export: e, rules: mustIgnore(t, dir, commit, e)}
+	// The copy delivers a complete, unchanged archive and then fails.
+	q.readBack = func(_ context.Context, _, _ string, fn func(io.Reader) error) error {
+		if err := fn(bytes.NewReader(archive.Bytes())); err != nil {
+			return err
+		}
+		return errors.New("docker cp: connection reset")
+	}
+	if verified, integrity, err := q.verify(context.Background(), "c"); verified || integrity != nil || err == nil {
+		t.Fatalf("verified %v integrity %v err %v", verified, integrity, err)
+	}
+	q.readBack = func(_ context.Context, _, _ string, fn func(io.Reader) error) error {
+		return fn(bytes.NewReader(archive.Bytes()))
+	}
+	if verified, integrity, err := q.verify(context.Background(), "c"); !verified || integrity != nil || err != nil {
+		t.Fatalf("a completed, unchanged copy: verified %v integrity %v err %v", verified, integrity, err)
+	}
 }

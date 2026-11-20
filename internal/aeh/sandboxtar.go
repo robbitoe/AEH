@@ -168,6 +168,8 @@ func readTree(r io.Reader, base string, limit int64) (map[string]treeEntry, erro
 			if h.Typeflag != tar.TypeDir {
 				return nil, fmt.Errorf("read back: %s is not a directory", base)
 			}
+			// The root itself is recorded as "." so its mode can be checked too.
+			out["."] = treeEntry{Dir: true, Mode: h.Mode & 0o7777}
 			continue
 		}
 		if !ok || checkTreePath(rel) != nil {
