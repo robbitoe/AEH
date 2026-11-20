@@ -34,6 +34,7 @@ Sends a test event to `notify.webhook` in `aeh/config.yaml`.
 - Ladder: `discovery.ladder` (default: `ladder`), two tries per profile per round, with the failure as feedback. Exit `3` when every try failed; run it again to retry.
 - Technology stack: a project that starts from scratch (no committed file besides `aeh/` and housekeeping such as `.gitignore`, README and LICENSE) gets a blocking question with `topic: stack` before any book; aeh refuses a book until the owner answered it. In an existing project the agent receives the detected stack (manifests, file types, configured commands) and keeps it unless the idea or the owner's answers ask for another.
 - A draft book gets an advisory review by an independent QA reviewer before it is imported. Its findings become optional questions; the review never blocks.
+- Codex profiles: the round runs in a directory that is not a Git repository, so a ladder profile running `codex exec` without `--skip-git-repo-check` is refused before any agent starts. A book reviewer without the flag gives an `invalid` review that names the fix; correct the profile and run `aeh discover review <slug>`.
 
 ### `aeh discover show`
 
@@ -213,7 +214,7 @@ Progress of every outcome, plan and discovery session.
 
 ### `aeh version`
 
-Prints the version.
+Prints the version. Release builds print their tag (for example `v1.0.0`); builds from source print the version in the source, with a `-dev` suffix between releases.
 
 ### `aeh help`
 

@@ -591,6 +591,11 @@ func DiscoverRun(ctx context.Context, r Repo, slug string, log io.Writer) (_ Dis
 	if len(d.dcfg.Ladder) == 0 {
 		return *st, errors.New("config: discovery needs a ladder (discovery.ladder or ladder)")
 	}
+	for _, name := range d.dcfg.Ladder {
+		if err := codexRepoCheckError(name, d.cfg.Profiles[name]); err != nil {
+			return *st, err
+		}
+	}
 	for i := range st.Attempts {
 		if st.Attempts[i].Result == "running" {
 			st.Attempts[i].Result, st.Attempts[i].Feedback = "interrupted", "the previous aeh discover run stopped during this attempt"
@@ -1170,4 +1175,21 @@ func (d *discoverySession) history() string {
 		}
 	}
 	return b.String()
+}
+
+// codexRepoCheckError reports a Codex profile that would refuse discovery's output
+// directory: it is not a Git repository, and `codex exec` stops there unless it gets
+// --skip-git-repo-check. Checking before launch saves a whole agent round.
+func codexRepoCheckError(name string, p Profile) error {
+	if len(p.Command) < 2 {
+		return nil
+	}
+	base := strings.ToLower(filepath.Base(p.Command[0]))
+	for _, ext := range []string{".cmd", ".exe", ".bat", ".ps1"} {
+		base = strings.TrimSuffix(base, ext)
+	}
+	if base != "codex" || !slices.Contains(p.Command[1:], "exec") || slices.Contains(p.Command[1:], "--skip-git-repo-check") {
+		return nil
+	}
+	return fmt.Errorf("config: profile %q runs codex exec without --skip-git-repo-check; discovery runs in a directory that is not a Git repository and Codex refuses it there, so add the flag to the profile's command", name)
 }

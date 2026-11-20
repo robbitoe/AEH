@@ -8,17 +8,19 @@ The runner decides; models only propose.
 
 ## What works today
 
-The build stage. AEH turns an approved feature spec into a plan, sealed acceptance tests and verified code on its own branch. You approve the spec; AEH generates, checks, independently reviews and seals the tests. Manual outcomes remain supported with owner-approved tests. AEH runs agent CLIs (Codex, Claude Code, a local model) in separate git worktrees and accepts a change only when deterministic gates and independent reviews pass.
+The whole cycle: discovery from an idea (or adoption of an existing system), owner approval of versioned specs, and the build stage. AEH turns an approved feature spec into a plan, sealed acceptance tests and verified code on its own branch. You approve the spec; AEH generates, checks, independently reviews and seals the tests. Manual outcomes remain supported with owner-approved tests. AEH runs agent CLIs (Codex, Claude Code, a local model) in separate git worktrees and accepts a change only when deterministic gates and independent reviews pass.
 
 > Worktrees separate Git changes. Agent CLIs and build/test commands run with your user's permissions, subject to any sandbox configured on the CLI itself. Use trusted repositories, profiles, and commands until AEH has a process sandbox.
 
 ## Install
 
+Download the archive for your system from the [releases page](https://github.com/robbitoe/aeh/releases) and put `aeh` on your `PATH`, or build it with Go 1.24+:
+
 ```sh
 go install github.com/robbitoe/aeh/cmd/aeh@latest
 ```
 
-Requires Go 1.24+, git, and the agent CLIs your profiles use.
+AEH also needs git and the agent CLIs your profiles use. New to AEH? Start with the [getting started guide](docs/getting-started.md).
 
 ### Agent profiles
 
@@ -454,16 +456,15 @@ The execution contract includes which paths every feature owns and the declared 
 
 ## Roadmap
 
-The engine above is the build stage of the [vision](docs/vision.md). Next, in order:
+The stages of the [vision](docs/vision.md), in order:
 
-1. **Memory.** A private wiki in `.aeh/memory/` with versioned specs, kept in sync with the code by a deterministic drift gate.
-2. **Triage and reviewers (implemented).** Trivial, change and new routes, with QA, security and DBA reviewers chosen by route and rules.
-3. **Specs to code (implemented).** An approved feature produces one task and independently reviewed, runner-sealed acceptance tests with `aeh plan`.
-4. **Discovery and adoption inventory/areas (implemented).** From a vague idea to a validated spec book with HTML mockups, advisory independent review, owner promotion to features, and acceptance of vision/data; adoption of an existing system area by area, up to sealed characterization tests.
-5. **Live review.** Specs keep evolving while approved features are built.
-6. **Sandbox.** Agents in a container with no network by default.
-
-Live spec/test revision remains future work. Manual outcomes, tasks and acceptance tests can also be written by hand or with your agent CLI.
+1. **Build (implemented).** Gates, ladder, independent reviews and evidence for each outcome.
+2. **Memory (implemented).** A private wiki in `.aeh/memory/` with versioned specs, kept in sync with the code by a deterministic drift gate.
+3. **Triage and reviewers (implemented).** Trivial, change and new routes, with QA, security and DBA reviewers chosen by route and rules.
+4. **Specs to code (implemented).** An approved feature produces one task and independently reviewed, runner-sealed acceptance tests with `aeh plan`.
+5. **Discovery and adoption (implemented).** From a vague idea to a validated spec book with HTML mockups; adoption of an existing system area by area, up to sealed characterization tests.
+6. **Live review (implemented).** Specs keep evolving while features are built: immutable versions, changed and removed criteria, clarifications, queued approvals and path moves.
+7. **Sandbox (in progress).** Gates and agents in containers with no network by default.
 
 ## Development
 
@@ -471,10 +472,10 @@ Go standard library only, plus `gopkg.in/yaml.v3`. One file per responsibility i
 
 ```sh
 go vet ./...
-go test -timeout 30m ./...
+go test -timeout 60m ./...
 ```
 
-End-to-end tests build real repositories, worktrees and agent processes, and run in parallel; the full suite takes about 10 minutes on Windows (process creation dominates), so the extended timeout is required. For a fast inner loop, `go test -short ./...` skips the end-to-end tests (about 3 minutes); run the full suite before every merge.
+End-to-end tests build real repositories, worktrees and agent processes, and run in parallel; the full suite takes about 40 minutes on Windows (process creation dominates), so the extended timeout is required. For a fast inner loop, `go test -short ./...` skips the end-to-end tests (about 3 minutes); run the full suite before every merge.
 
 Agent instruction files (`AGENTS.md`, `CLAUDE.md`, `.claude/`, `.codex/`), agent coordination notes (`.agents/`) and local state (`.aeh/`) are git-ignored: they stay on your machine. Design decisions are recorded in [docs/adr](docs/adr).
 
