@@ -267,6 +267,17 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer, gen 
 	if ru.triagePrompt, err = loadPrompt(r, "triage.md"); err != nil {
 		return st, fmt.Errorf("load triage prompt: %w", err)
 	}
+	// The sandbox opens before triage, so a configured sandbox that cannot be used stops
+	// the run before any agent is launched. A planned run uses only the isolation its
+	// plan's checks ran under.
+	if ru.sb, err = openFlowSandbox(r, cfg, "run-"+o.ID); err != nil {
+		return st, err
+	}
+	if gen != nil {
+		if err := checkPlanSandbox(gen.Plan.ID, gen.Plan.Sandbox, ru.sb); err != nil {
+			return st, err
+		}
+	}
 	// Pure triage can block a known new route without requiring any agent setup.
 	// When a model is needed, validate its CLI and the reviewer policy first.
 	if st.InitialRoute == "" && o.Route == "" && cfg.Triage.Profile != "" {
@@ -298,9 +309,6 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer, gen 
 		}
 	}
 	if err := preflight(cfg, o, st.EffectiveRoute, st.Roles...); err != nil {
-		return st, err
-	}
-	if ru.sb, err = openFlowSandbox(r, cfg, "run-"+o.ID); err != nil {
 		return st, err
 	}
 	branch := IntegrationBranch(o.ID)

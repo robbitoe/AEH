@@ -62,7 +62,7 @@ From then on, `aeh run`, `aeh do`, `aeh plan`, `aeh adopt seal` and `aeh adopt v
 
 Each gate in `gates.json` records `"sandboxed": true`, its class (`process`, `infrastructure`, `resource` for an out-of-memory kill, `terminated` for a timeout or cancellation) and its exit code. Logs and reports show `ok (sandbox)`. Only a process that exited by itself proves a red or a green: a test killed for memory never counts as a failing test when a plan checks that new tests fail.
 
-Runs and plans pin the sandbox in their contract: the policy version, the Docker engine ID, the image ID, the limits and `gate_env`. Changing any of them, or turning the sandbox on or off, means a new outcome ID or a new plan; a blocked run with a different sandbox is not resumed.
+Runs and plans pin the sandbox in their contract: the policy version, the Docker engine ID, the image ID, the limits and `gate_env`. Changing any of them, or turning the sandbox on or off, means a new outcome ID or a new plan: a blocked run with a different sandbox is not resumed, and a planned run starts only under the sandbox its plan's checks ran under. Plan checks record whether they ran sandboxed and how their process ended.
 
 ## A .NET example
 

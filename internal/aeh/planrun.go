@@ -71,6 +71,9 @@ type PlanState struct {
 	LadderFrom       int              `json:"ladder_from"` // attempts before this index belong to earlier ladder rounds
 	UpdatedAt        time.Time        `json:"updated_at"`
 	Checks           []PlanCheckEntry `json:"checks,omitempty"` // of the published attempt
+	// Sandbox is the isolation the plan's checks ran under (sandboxSnapshot), pinned at
+	// reservation; empty for the host. Its run and its recovery must use the same.
+	Sandbox string `json:"sandbox,omitempty"`
 }
 
 // PlanAttempt is one run of the test author and the checks on its candidate.
@@ -89,9 +92,16 @@ type PlanAttempt struct {
 
 // PlanCheckEntry is one deterministic check's result, for the report.
 type PlanCheckEntry struct {
-	Name   string `json:"name"`
-	Passed bool   `json:"passed"`
-	Detail string `json:"detail,omitempty"`
+	Name      string `json:"name"`
+	Passed    bool   `json:"passed"`
+	Detail    string `json:"detail,omitempty"`
+	Sandboxed bool   `json:"sandboxed,omitempty"` // the command ran in a sandbox container
+	Class     string `json:"class,omitempty"`     // how its process ended (LaunchResult)
+}
+
+// planCheck records a command check with its sandbox evidence.
+func planCheck(name string, g GateResult, passed bool, detail string) PlanCheckEntry {
+	return PlanCheckEntry{Name: name, Passed: passed, Detail: detail, Sandboxed: g.Sandboxed, Class: g.Class}
 }
 
 const planStateVersion = 1
@@ -532,6 +542,14 @@ func finishPublishedCharacterization(r Repo, cfg Config, memDir string, spec Spe
 		}
 		p := &planner{repo: r, cfg: cfg, pcfg: cfg.plan(), spec: spec, memDir: memDir, log: log, kind: PlanCharacterize, state: &st}
 		if st.Phase == PlanPublished {
+			// Recording finalizes evidence: only under the isolation it was produced in.
+			sb, err := openFlowSandbox(r, cfg, "plan-"+st.ID)
+			if err != nil {
+				return st, true, err
+			}
+			if err := checkPlanSandbox(st.ID, st.Sandbox, sb); err != nil {
+				return st, true, err
+			}
 			if err := p.recordPlan(); err != nil {
 				return st, true, err
 			}
@@ -639,6 +657,9 @@ func (p *planner) reserve(id, observed, memoryCommit string) (PlanState, error) 
 		// anything below the feature's paths raises them (conservatively, with triage's glob
 		// semantics). The candidate's real files may raise them further.
 		st.Route, st.Roles = applyRules(st.Route, st.Roles, rulesForArea(p.cfg.Triage.Rules, p.spec.OwnedPaths()))
+	}
+	if st.Sandbox, err = sandboxSnapshot(p.sb); err != nil {
+		return st, err
 	}
 	if st.Inputs, err = p.inputsDigestFor(&st); err != nil {
 		return st, err
@@ -966,8 +987,8 @@ func (p *planner) baseline(ctx context.Context) (_ bool, _ string, err error) {
 		g.Output = redactDiagnostic(g.Output)
 		results = append(results, g)
 		if strings.HasPrefix(g.Name, "relocated-proof ") {
-			st.RelocatedProof = append(st.RelocatedProof, PlanCheckEntry{Name: g.Name, Passed: g.Passed && !g.Uncertain,
-				Detail: "retired relocated test on base " + st.Base + "\n" + tail(g.Output, 500)})
+			st.RelocatedProof = append(st.RelocatedProof, planCheck(g.Name, g, g.Passed && !g.Uncertain,
+				"retired relocated test on base "+st.Base+"\n"+tail(g.Output, 500)))
 		}
 		p.logf("    %-6s %s", g.Name, gateStatus(g))
 		if g.Uncertain {
@@ -1562,7 +1583,7 @@ func (p *planner) redGreen(ctx context.Context, v *verification, plan PlanFile) 
 	}
 	g := v.raw(ctx, "build", p.cfg.Commands.Build)
 	g.Output = redactDiagnostic(g.Output) // before it becomes feedback, state or a question
-	checks = append(checks, PlanCheckEntry{Name: "build", Passed: g.Passed && !g.Uncertain})
+	checks = append(checks, planCheck("build", g, g.Passed && !g.Uncertain, ""))
 	if uncertain, damaged := settle(g); uncertain {
 		return checks, "build", g.Output, true, nil
 	} else if damaged != "" {
@@ -1576,7 +1597,7 @@ func (p *planner) redGreen(ctx context.Context, v *verification, plan PlanFile) 
 		// test suite must pass on it, not only on the base (a retired file may be referenced).
 		g := v.raw(ctx, "test", p.cfg.Commands.Test)
 		g.Output = redactDiagnostic(g.Output)
-		checks = append(checks, PlanCheckEntry{Name: "test", Passed: g.Passed && !g.Uncertain})
+		checks = append(checks, planCheck("test", g, g.Passed && !g.Uncertain, ""))
 		if uncertain, damaged := settle(g); uncertain {
 			return checks, "test", g.Output, true, nil
 		} else if damaged != "" {
@@ -1616,7 +1637,7 @@ func (p *planner) redGreen(ctx context.Context, v *verification, plan PlanFile) 
 		}
 		g.Output = redactDiagnostic(g.Output)
 		passed := g.Passed == kinds[f] && g.provesResult()
-		checks = append(checks, PlanCheckEntry{Name: kind + " " + dir + f, Passed: passed, Detail: tail(g.Output, 500)})
+		checks = append(checks, planCheck(kind+" "+dir+f, g, passed, tail(g.Output, 500)))
 		if uncertain, damaged := settle(g); uncertain {
 			return checks, kind, g.Output, true, nil
 		} else if damaged != "" {
@@ -1652,7 +1673,7 @@ func (p *planner) redGreen(ctx context.Context, v *verification, plan PlanFile) 
 			return checks, "", "", false, err
 		}
 		g.Output = redactDiagnostic(g.Output)
-		checks = append(checks, PlanCheckEntry{Name: "previous acceptance suite still passes", Passed: g.Passed && !g.Uncertain})
+		checks = append(checks, planCheck("previous acceptance suite still passes", g, g.Passed && !g.Uncertain, ""))
 		if uncertain, damaged := settle(g); uncertain {
 			return checks, "previous", g.Output, true, nil
 		} else if damaged != "" {
@@ -1680,7 +1701,7 @@ func (p *planner) green(ctx context.Context, v *verification, files []string, ch
 		// Output of the owner's commands on adopted code may carry secrets: it is redacted
 		// before it becomes feedback for the next author, state or a question on the terminal.
 		output := redactDiagnostic(g.Output)
-		checks = append(checks, PlanCheckEntry{Name: what, Passed: g.Passed && !g.Uncertain, Detail: tail(output, 500)})
+		checks = append(checks, planCheck(what, g, g.Passed && !g.Uncertain, tail(output, 500)))
 		if uncertain, damaged := settle(g); uncertain {
 			return step, output, true, nil
 		} else if damaged != "" {

@@ -2,6 +2,7 @@ package aeh
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -128,4 +129,40 @@ func (v *verification) acceptance(ctx context.Context, name, template string, fi
 	defer os.Remove(full)
 	command := strings.Replace(template, "{{manifest}}", rel, 1)
 	return gateCommand(ctx, name, v.wt, command, v.timeout, v.passEnv), nil
+}
+
+// sandboxSnapshot is the canonical text of a flow's isolation (sandboxContract): empty for
+// the host. A plan pins it; its run and any recovery that records its evidence must see
+// the same, so evidence is never reused under another isolation.
+func sandboxSnapshot(sb *sandbox) (string, error) {
+	c := sandboxContract(sb)
+	if c == nil {
+		return "", nil
+	}
+	b, err := json.Marshal(c)
+	if err != nil {
+		return "", fmt.Errorf("sandbox snapshot: %w", err)
+	}
+	return string(b), nil
+}
+
+// checkPlanSandbox refuses to use a plan's evidence under an isolation other than the
+// one its checks ran under.
+func checkPlanSandbox(id, pinned string, sb *sandbox) error {
+	now, err := sandboxSnapshot(sb)
+	if err != nil {
+		return err
+	}
+	if now != pinned {
+		return fmt.Errorf("%s was verified under another sandbox configuration (%s) than the current one (%s); restore it, or abandon %s and plan again",
+			id, describeSnapshot(pinned), describeSnapshot(now), id)
+	}
+	return nil
+}
+
+func describeSnapshot(s string) string {
+	if s == "" {
+		return "none: the host"
+	}
+	return s
 }

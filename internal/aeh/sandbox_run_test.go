@@ -1,6 +1,8 @@
 package aeh
 
 import (
+	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,5 +87,73 @@ func TestDockerSandboxedPlanPublishes(t *testing.T) {
 	gates := readGateResults(f.dir, rel(f.dir, f.repo.RunDir(st.ID, "plan-baseline")))
 	if len(gates) < 2 || !gates[0].Sandboxed || !gates[1].Sandboxed {
 		t.Fatalf("baseline did not run in the sandbox: %+v", gates)
+	}
+}
+
+func TestDockerPlannedRunNeedsThePlansSandbox(t *testing.T) {
+	image := testImageID(t)
+	// Planned on the host, then the sandbox is turned on: the run must not reuse the
+	// host-produced red/green evidence under the sandbox policy.
+	f, st := generatedFixture(t, `mkdir -p src && echo paid > src/pay.txt`)
+	if st.Sandbox != "" {
+		t.Fatalf("host plan pinned a sandbox: %+v", st)
+	}
+	path := filepath.Join(f.dir, "aeh", "config.yaml")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, f.dir, "aeh/config.yaml", strings.Replace(string(b), `build: "git --version"`, `build: "true"`, 1)+"sandbox:\n  image: \""+image+"\"\n")
+	f.commitAll("sandbox on")
+	_, err = RunOutcome(context.Background(), f.repo, st.ID, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "verified under another sandbox") {
+		t.Fatalf("run reused host plan evidence: %v", err)
+	}
+}
+
+func TestCheckPlanSandbox(t *testing.T) {
+	if err := checkPlanSandbox("p", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	sb := &sandbox{cfg: SandboxConfig{Memory: "4g", CPUs: "2"}, engine: sandboxEngine{ID: "e"}, image: sandboxImage{ID: "sha256:i"}}
+	pinned, err := sandboxSnapshot(sb)
+	if err != nil || pinned == "" {
+		t.Fatalf("%q %v", pinned, err)
+	}
+	if err := checkPlanSandbox("p", pinned, sb); err != nil {
+		t.Fatal(err)
+	}
+	for name, now := range map[string]*sandbox{
+		"host":   nil,
+		"image":  {cfg: sb.cfg, engine: sb.engine, image: sandboxImage{ID: "sha256:other"}},
+		"engine": {cfg: sb.cfg, engine: sandboxEngine{ID: "other"}, image: sb.image},
+		"limits": {cfg: SandboxConfig{Memory: "8g", CPUs: "2"}, engine: sb.engine, image: sb.image},
+	} {
+		if err := checkPlanSandbox("p", pinned, now); err == nil {
+			t.Errorf("%s change accepted", name)
+		}
+	}
+	if err := checkPlanSandbox("p", "", sb); err == nil {
+		t.Error("a host plan accepted under a sandbox")
+	}
+}
+
+func TestDockerSandboxedAdoptVerify(t *testing.T) {
+	image := testImageID(t)
+	endToEnd(t)
+	f := newAdoptFixture(t, inventoryOK)
+	f.adoptConfig("sandbox:\n  image: \"" + image + "\"\n")
+	f.commitCode("sandbox on")
+	f.inventory("")
+	v, err := AdoptVerify(context.Background(), f.repo, "", nil)
+	if err != nil || !v.Passed || v.Sandbox != image || len(v.Commands) != 2 {
+		t.Fatalf("sandboxed verify: %+v %v", v, err)
+	}
+	// A build that changes tracked code fails integrity, and test never runs.
+	write(t, f.dir, "tests/build.sh", "set -eu\necho forged > src/billing/fee.txt\n")
+	f.commitCode("tampering build")
+	v, err = AdoptVerify(context.Background(), f.repo, "", nil)
+	if err != nil || v.Passed || len(v.Commands) != 1 || !strings.Contains(v.Commands[0].Integrity, "modified: src/billing/fee.txt") {
+		t.Fatalf("tampering verify: %+v %v", v, err)
 	}
 }
