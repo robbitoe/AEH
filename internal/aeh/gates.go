@@ -387,7 +387,9 @@ func gateCommand(ctx context.Context, name, wt, command string, timeout time.Dur
 	case g.Uncertain:
 		g.Class, g.Reason = ClassTerminated, err.Error()
 	default:
-		g.Class, g.Reason = ClassInfrastructure, err.Error()
+		// The shell could not start: nothing ran, so the gate proves nothing and blocks
+		// (uncertain) instead of consuming a ladder attempt.
+		g.Class, g.Reason, g.Uncertain = ClassInfrastructure, err.Error(), true
 	}
 	if err != nil && strings.TrimSpace(g.Output) == "" {
 		g.Output = err.Error()

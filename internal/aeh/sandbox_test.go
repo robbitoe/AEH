@@ -4,7 +4,11 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
+	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -125,6 +129,9 @@ func TestClassifyContainer(t *testing.T) {
 	st := func(status string, code int, oom bool, started, errText string) containerState {
 		var c containerState
 		c.State.Status, c.State.ExitCode, c.State.OOMKilled, c.State.StartedAt, c.State.Error = status, code, oom, started, errText
+		if status != "created" && status != "running" {
+			c.State.FinishedAt = "2026-11-20T10:00:05Z"
+		}
 		return c
 	}
 	ran := "2026-11-20T10:00:00Z"
@@ -256,4 +263,102 @@ func TestCommandPrograms(t *testing.T) {
 	if !gitWord.MatchString("git describe") || !gitWord.MatchString("make && git rev-parse HEAD") || gitWord.MatchString("npm run digit") || gitWord.MatchString("gitleaks") {
 		t.Fatal("git detection")
 	}
+}
+
+func TestClassifyRequiresCompletionTime(t *testing.T) {
+	var c containerState
+	c.State.Status, c.State.StartedAt, c.State.FinishedAt = "exited", "2026-11-20T10:00:00Z", "0001-01-01T00:00:00Z"
+	if r := classify(c); r.Class != ClassInfrastructure {
+		t.Fatalf("no completion time proved a result: %+v", r)
+	}
+}
+
+func TestCheckLocalEndpoint(t *testing.T) {
+	for _, ok := range []string{"unix:///var/run/docker.sock", "npipe:////./pipe/dockerDesktopLinuxEngine", `npipe://\\.\pipe\docker_engine`} {
+		if err := checkLocalEndpoint(ok); err != nil {
+			t.Errorf("%s: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"tcp://127.0.0.1:2375", "ssh://host", "npipe:////remote/pipe/docker_engine", `npipe://\\server\pipe\docker`,
+		"npipe:////./pipe/", "npipe:////./pipe/a/b", "unix://relative.sock", ""} {
+		if err := checkLocalEndpoint(bad); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}
+
+func TestAttachMismatch(t *testing.T) {
+	exit := func(code int) error {
+		cmd := exec.Command("sh", "-c", fmt.Sprintf("exit %d", code))
+		return cmd.Run()
+	}
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("needs sh")
+	}
+	proc := func(code int) LaunchResult { return LaunchResult{Class: ClassProcess, ExitCode: code} }
+	cases := []struct {
+		err  error
+		res  LaunchResult
+		fail bool
+	}{
+		{nil, proc(0), false},
+		{exit(3), proc(3), false},
+		{exit(137), LaunchResult{Class: ClassResource, ExitCode: 137}, false},
+		{nil, proc(3), true},                              // client says success, container failed
+		{exit(1), proc(0), true},                          // client failed, container succeeded
+		{errors.New("write: broken pipe"), proc(0), true}, // output writer or attach error
+		{errors.New("attach"), proc(2), true},
+	}
+	for i, c := range cases {
+		if got := attachMismatch(c.err, c.res) != ""; got != c.fail {
+			t.Errorf("case %d: mismatch %v, want %v", i, got, c.fail)
+		}
+	}
+}
+
+func TestReadTreeBoundsMetadata(t *testing.T) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	tw.WriteHeader(&tar.Header{Name: "work/", Typeflag: tar.TypeDir, Mode: 0o755})
+	for i := 0; i < 200; i++ {
+		tw.WriteHeader(&tar.Header{Name: fmt.Sprintf("work/empty-%d", i), Typeflag: tar.TypeReg, Mode: 0o644})
+	}
+	tw.Close()
+	if _, err := readTree(bytes.NewReader(buf.Bytes()), "work", 16*1024); err == nil {
+		t.Fatal("empty files escaped the raw stream limit")
+	}
+	if _, err := readTree(bytes.NewReader(buf.Bytes()), "work", 0); err != nil {
+		t.Fatal(err)
+	}
+	buf.Reset()
+	tw = tar.NewWriter(&buf)
+	tw.WriteHeader(&tar.Header{Name: "work/" + strings.Repeat("a/", 2100) + "x", Typeflag: tar.TypeReg, Mode: 0o644})
+	tw.Close()
+	if _, err := readTree(bytes.NewReader(buf.Bytes()), "work", 0); err == nil || !strings.Contains(err.Error(), "longer") {
+		t.Fatalf("long path: %v", err)
+	}
+}
+
+func TestHostShellStartFailureIsUncertain(t *testing.T) {
+	g := gateCommand(context.Background(), "build", filepath.Join(t.TempDir(), "missing"), "true", time.Minute, nil)
+	if g.Passed || !g.Uncertain || g.Class != ClassInfrastructure || g.provesResult() {
+		t.Fatalf("%+v", g)
+	}
+}
+
+func TestSandboxFlowLock(t *testing.T) {
+	r := Repo{Root: t.TempDir()}
+	unlock, err := lockSandboxFlow(r, "check")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockSandboxFlow(r, "check"); err == nil {
+		t.Fatal("a second check got the lock")
+	}
+	unlock()
+	again, err := lockSandboxFlow(r, "check")
+	if err != nil {
+		t.Fatal(err)
+	}
+	again()
 }

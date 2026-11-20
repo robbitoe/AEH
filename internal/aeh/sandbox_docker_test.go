@@ -129,6 +129,10 @@ func TestDockerRecoveryByLabels(t *testing.T) {
 	if _, err := s.d.admin(append(append([]string{"create", "--pull=never", "--network", "none"}, s.labels(in.ID, "gate", "consumer")...), s.image.ID, "true")...); err != nil {
 		t.Fatal(err)
 	}
+	envFile, err := s.writeEnvFile(in.ID, []string{"A=1"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	again, err := openSandbox(r, s.cfg, "test")
 	if err != nil {
 		t.Fatal(err)
@@ -136,6 +140,9 @@ func TestDockerRecoveryByLabels(t *testing.T) {
 	assertNoLeftovers(t, again)
 	if _, err := os.Stat(filepath.Join(s.intentDir(), in.ID+".json")); !os.IsNotExist(err) {
 		t.Fatalf("intent kept after confirmed recovery: %v", err)
+	}
+	if _, err := os.Stat(envFile); !os.IsNotExist(err) {
+		t.Fatalf("env file of the recovered launch kept: %v", err)
 	}
 }
 

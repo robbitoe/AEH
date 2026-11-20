@@ -195,25 +195,38 @@ type sandboxEngine struct {
 const minDockerMajor = 24
 
 // localEngine checks that the Docker client points at a local Linux engine.
-func localEngine(d dockerCLI) (sandboxEngine, error) {
-	var e sandboxEngine
-	host := ""
-	for _, kv := range d.env {
-		if v, ok := strings.CutPrefix(kv, "DOCKER_HOST="); ok {
-			host = v
+// localEndpoint resolves the endpoint the user's Docker client would use (DOCKER_HOST,
+// DOCKER_CONTEXT or the current context) and accepts only a local one: a Unix socket, or
+// a Windows named pipe on this machine (npipe:////./pipe/...). A pipe on another server
+// (npipe:////server/pipe/...) is remote.
+func localEndpoint(user dockerCLI) (string, error) {
+	host, err := user.admin("context", "inspect", "--format", "{{.Endpoints.docker.Host}}")
+	if err != nil {
+		return "", fmt.Errorf("sandbox: find the Docker endpoint: %w", err)
+	}
+	if err := checkLocalEndpoint(host); err != nil {
+		return "", err
+	}
+	return host, nil
+}
+
+func checkLocalEndpoint(host string) error {
+	if p, ok := strings.CutPrefix(host, "unix://"); ok && strings.HasPrefix(p, "/") {
+		return nil
+	}
+	if p, ok := strings.CutPrefix(host, "npipe://"); ok {
+		p = strings.ReplaceAll(p, `\`, "/")
+		if rest, ok := strings.CutPrefix(p, "//./pipe/"); ok && rest != "" && !strings.Contains(rest, "/") {
+			return nil
 		}
 	}
-	if host == "" {
-		out, err := d.admin("context", "inspect", "--format", "{{.Endpoints.docker.Host}}")
-		if err != nil {
-			return e, fmt.Errorf("sandbox: find the Docker endpoint: %w", err)
-		}
-		host = out
-	}
-	if !strings.HasPrefix(host, "unix://") && !strings.HasPrefix(host, "npipe://") {
-		return e, fmt.Errorf("sandbox: Docker endpoint %q is not local; only unix:// and npipe:// endpoints are supported", host)
-	}
-	e.Endpoint = host
+	return fmt.Errorf("sandbox: Docker endpoint %q is not local; only a Unix socket or a named pipe on this machine (npipe:////./pipe/...) is supported", host)
+}
+
+// localEngine checks the engine behind an already validated endpoint, through the same
+// client that every later command uses.
+func localEngine(d dockerCLI, endpoint string) (sandboxEngine, error) {
+	e := sandboxEngine{Endpoint: endpoint}
 	out, err := d.admin("info", "--format", "{{json .ID}} {{json .OSType}} {{json .ServerVersion}}")
 	if err != nil {
 		return e, fmt.Errorf("sandbox: Docker engine unreachable (is Docker running?): %w", err)
@@ -281,11 +294,15 @@ func openSandbox(r Repo, cfg SandboxConfig, flow string) (*sandbox, error) {
 	}
 	s := &sandbox{cfg: cfg.withDefaults(), d: newDockerCLI(), project: projectLabel(r.Root),
 		dir: filepath.Join(r.Root, ".aeh", "sandbox"), flow: flowKeyUnsafe.ReplaceAllString(flow, "_")}
-	var err error
-	if s.engine, err = localEngine(s.d); err != nil {
+	endpoint, err := localEndpoint(s.d)
+	if err != nil {
 		return nil, err
 	}
-	if s.d, err = isolatedDockerCLI(s.dir, s.engine.Endpoint); err != nil {
+	// From here on every command, info included, goes to the validated endpoint only.
+	if s.d, err = isolatedDockerCLI(s.dir, endpoint); err != nil {
+		return nil, err
+	}
+	if s.engine, err = localEngine(s.d, endpoint); err != nil {
 		return nil, err
 	}
 	if s.image, err = resolveImage(s.d, s.cfg.Image); err != nil {
@@ -369,6 +386,10 @@ func (s *sandbox) release(id string) error {
 	}
 	if err != nil || strings.TrimSpace(left) != "" {
 		return fmt.Errorf("sandbox cleanup %s: removal not confirmed; Docker objects labeled aeh.launch=%s remain: %v", id, id, err)
+	}
+	// Launch-local files go with the Docker objects; the intent is the last to go.
+	if err := os.Remove(filepath.Join(s.dir, "env", id+".env")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("sandbox cleanup %s: %w", id, err)
 	}
 	if err := os.Remove(filepath.Join(s.intentDir(), id+".json")); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("sandbox cleanup %s: %w", id, err)
@@ -744,8 +765,10 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 		return LaunchResult{Class: ClassTerminated, ExitCode: -1, Reason: "lost the container state: " + err.Error()}, nil
 	}
 	res = classify(st)
-	if res.Class == ClassInfrastructure && startErr != nil {
-		res.Reason += ": " + startErr.Error()
+	if err := attachMismatch(startErr, res); err != "" {
+		// The client failed to attach or to write the output, or its status disagrees
+		// with the container's: the evidence is incomplete, so nothing is proven.
+		return LaunchResult{Class: ClassInfrastructure, ExitCode: -1, Reason: err}, nil
 	}
 	if after != nil && (res.Class == ClassProcess || res.Class == ClassResource) {
 		if err := after(cid); err != nil {
@@ -755,12 +778,40 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 	return res, nil
 }
 
+// attachMismatch compares the result of docker start -a with the inspected state.
+// docker start -a exits with the container's own exit code; any other error (attach,
+// stream copy, output writer) or a different code means the output is not trustworthy.
+func attachMismatch(startErr error, res LaunchResult) string {
+	if res.Class != ClassProcess && res.Class != ClassResource {
+		if startErr != nil {
+			return res.Reason + ": " + startErr.Error()
+		}
+		return ""
+	}
+	var exit *exec.ExitError
+	switch {
+	case startErr == nil && res.ExitCode == 0:
+		return ""
+	case startErr == nil:
+		return fmt.Sprintf("docker start reported success but the container exited %d", res.ExitCode)
+	case !errors.As(startErr, &exit):
+		return "attaching to the container failed: " + startErr.Error()
+	case exit.ExitCode() != res.ExitCode:
+		return fmt.Sprintf("docker start exited %d but the container exited %d", exit.ExitCode(), res.ExitCode)
+	}
+	return ""
+}
+
+// unset reports a Docker timestamp that was never set.
+func unset(ts string) bool { return ts == "" || strings.HasPrefix(ts, "0001-01-01") }
+
 // classify reads the final state of a container that was started.
 func classify(st containerState) LaunchResult {
-	never := st.State.StartedAt == "" || strings.HasPrefix(st.State.StartedAt, "0001-01-01")
 	switch {
-	case never:
+	case unset(st.State.StartedAt):
 		return LaunchResult{Class: ClassInfrastructure, ExitCode: -1, Reason: "the container never started" + stateError(st)}
+	case unset(st.State.FinishedAt):
+		return LaunchResult{Class: ClassInfrastructure, ExitCode: -1, Reason: "the container has no completion time" + stateError(st)}
 	case st.State.OOMKilled:
 		return LaunchResult{Class: ClassResource, ExitCode: st.State.ExitCode, Reason: "killed for exceeding the memory limit (OOM)"}
 	case st.State.Status != "exited" || st.State.Error != "":
@@ -839,3 +890,21 @@ func (s *sandbox) newSequence(ctx context.Context, kind, target string, tree tar
 
 // Close removes the sequence's volume and confirms it.
 func (q *sequenceVolume) Close() error { return q.s.release(q.id) }
+
+// lockSandboxFlow serializes a sandbox flow that no outcome or adoption lock covers.
+// Runs, plans and adoption open their flows under their own locks. A crashed holder
+// leaves the lock behind, and the error says how to clear it.
+func lockSandboxFlow(r Repo, flow string) (func(), error) {
+	dir := filepath.Join(r.Root, ".aeh", "sandbox", "locks")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("sandbox lock: %w", err)
+	}
+	lock := filepath.Join(dir, flowKeyUnsafe.ReplaceAllString(flow, "_"))
+	if err := os.Mkdir(lock, 0o700); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("another aeh sandbox %s is running; if it crashed, verify it stopped before removing %s", flow, lock)
+		}
+		return nil, fmt.Errorf("sandbox lock: %w", err)
+	}
+	return func() { _ = os.Remove(lock) }, nil
+}

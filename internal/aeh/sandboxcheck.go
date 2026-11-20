@@ -73,6 +73,13 @@ func SandboxCheck(ctx context.Context, r Repo, w io.Writer) error {
 	if cfg.Sandbox == nil {
 		return errors.New("no sandbox section in aeh/config.yaml; gates and agents run on the host")
 	}
+	// Opening a flow recovers its interrupted launches, so two checks must not overlap:
+	// one would remove the other's live containers.
+	unlock, err := lockSandboxFlow(r, "check")
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	s, err := openSandbox(r, *cfg.Sandbox, "check")
 	if err != nil {
 		return err

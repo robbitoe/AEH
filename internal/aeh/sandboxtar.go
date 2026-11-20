@@ -103,6 +103,29 @@ func writeVolumeTar(w io.Writer, base string, src tarSource) error {
 	return tw.Close()
 }
 
+const (
+	maxTreeEntries = 200000
+	maxTreePath    = 4096
+)
+
+// cappedReader fails once more than left bytes were read.
+type cappedReader struct {
+	r    io.Reader
+	left int64
+}
+
+func (c *cappedReader) Read(p []byte) (int, error) {
+	if c.left <= 0 {
+		return 0, fmt.Errorf("more than the read-back limit")
+	}
+	if int64(len(p)) > c.left {
+		p = p[:c.left]
+	}
+	n, err := c.r.Read(p)
+	c.left -= int64(n)
+	return n, err
+}
+
 // treeEntry is one regular file read back from a volume.
 type treeEntry struct {
 	Executable bool
@@ -114,9 +137,14 @@ type treeEntry struct {
 // base/ component. Directories are allowed; links, devices, FIFOs and any other entry
 // type fail with the path. limit caps the total bytes read.
 func readTree(r io.Reader, base string, limit int64) (map[string]treeEntry, error) {
+	if limit > 0 {
+		// The limit bounds the raw stream (headers, metadata and padding included), so a
+		// container cannot make the runner read or allocate without bound.
+		r = &cappedReader{r: r, left: limit}
+	}
 	tr := tar.NewReader(r)
 	out := map[string]treeEntry{}
-	var total int64
+	entries := 0
 	for {
 		h, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -124,6 +152,12 @@ func readTree(r io.Reader, base string, limit int64) (map[string]treeEntry, erro
 		}
 		if err != nil {
 			return nil, fmt.Errorf("read back: %w", err)
+		}
+		if entries++; entries > maxTreeEntries {
+			return nil, fmt.Errorf("read back: more than %d entries", maxTreeEntries)
+		}
+		if len(h.Name) > maxTreePath {
+			return nil, fmt.Errorf("read back: a path is longer than %d bytes", maxTreePath)
 		}
 		name := strings.TrimSuffix(path.Clean(strings.TrimPrefix(h.Name, "./")), "/")
 		rel, ok := strings.CutPrefix(name, base+"/")
@@ -142,10 +176,6 @@ func readTree(r io.Reader, base string, limit int64) (map[string]treeEntry, erro
 		case tar.TypeReg:
 		default:
 			return nil, fmt.Errorf("read back: %s is not a regular file or directory (type %q)", rel, h.Typeflag)
-		}
-		total += h.Size
-		if limit > 0 && total > limit {
-			return nil, fmt.Errorf("read back: more than %d bytes", limit)
 		}
 		sum := sha256.New()
 		if _, err := io.Copy(sum, tr); err != nil {
