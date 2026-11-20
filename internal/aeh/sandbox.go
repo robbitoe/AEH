@@ -552,8 +552,9 @@ func (s *sandbox) checkCreated(c containerState, l sandboxLaunch, vols []sandbox
 		problems = append(problems, "no-new-privileges missing")
 	}
 	// The output is read with docker logs after the process ends, so it must be kept
-	// whole: a rotating log would silently drop its beginning.
-	if lc := c.HostConfig.LogConfig; lc.Type != "json-file" || len(lc.Config) != 1 || lc.Config["max-size"] != sandboxLogKeep {
+	// whole: no reachable rotation size and no non-blocking mode (which drops output).
+	// Other options a daemon adds (max-file, compress, labels) are harmless.
+	if lc := c.HostConfig.LogConfig; lc.Type != "json-file" || lc.Config["max-size"] != sandboxLogKeep || lc.Config["mode"] != "blocking" {
 		problems = append(problems, fmt.Sprintf("log configuration %s %v (the whole output must be kept)", lc.Type, lc.Config))
 	}
 	got := map[string]string{}
@@ -716,7 +717,7 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 		"--memory", s.cfg.Memory, "--memory-swap", s.cfg.Memory, "--cpus", s.cfg.CPUs, "--read-only",
 		"--tmpfs", "/tmp:mode=1777", "--tmpfs", sandboxHome+":uid=10001,gid=10001,mode=0700",
 		"--user", sandboxUser, "--workdir", l.Workdir, "--env-file", envFile, "--entrypoint", l.Argv[0],
-		"--log-driver", "json-file", "--log-opt", "max-size="+sandboxLogKeep)
+		"--log-driver", "json-file", "--log-opt", "max-size="+sandboxLogKeep, "--log-opt", "mode=blocking")
 	if l.Pids {
 		args = append(args, "--pids-limit", "512")
 	}

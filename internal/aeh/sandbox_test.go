@@ -209,7 +209,7 @@ func TestCheckCreated(t *testing.T) {
 		var c containerState
 		c.Image, c.Config.User, c.Config.WorkingDir, c.Config.Entrypoint = "sha256:img", "10001:10001", "/work", []string{"sh"}
 		c.HostConfig.NetworkMode, c.HostConfig.ReadonlyRootfs = "none", true
-		c.HostConfig.LogConfig.Type, c.HostConfig.LogConfig.Config = "json-file", map[string]string{"max-size": sandboxLogKeep}
+		c.HostConfig.LogConfig.Type, c.HostConfig.LogConfig.Config = "json-file", map[string]string{"max-size": sandboxLogKeep, "mode": "blocking"}
 		c.HostConfig.CapDrop, c.HostConfig.SecurityOpt = []string{"ALL"}, []string{"no-new-privileges"}
 		c.HostConfig.Tmpfs = map[string]string{"/tmp": "mode=1777", sandboxHome: "uid=10001"}
 		for k, v := range want {
@@ -255,6 +255,9 @@ func TestCheckCreated(t *testing.T) {
 			c.HostConfig.LogConfig.Config = map[string]string{"max-size": "64m", "max-file": "1"}
 		},
 		"log driver": func(c *containerState) { c.HostConfig.LogConfig.Type = "local" },
+		"non-blocking log": func(c *containerState) {
+			c.HostConfig.LogConfig.Config["mode"] = "non-blocking"
+		},
 	}
 	for name, m := range mutations {
 		c := good()
@@ -262,6 +265,14 @@ func TestCheckCreated(t *testing.T) {
 		if err := s.checkCreated(c, l, vols, want); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+	// Options a daemon merges in (Docker's documented max-size=10m, max-file=3 defaults
+	// with our max-size overriding) must not block every launch.
+	inherited := good()
+	inherited.HostConfig.LogConfig.Config["max-file"] = "3"
+	inherited.HostConfig.LogConfig.Config["compress"] = "true"
+	if err := s.checkCreated(inherited, l, vols, want); err != nil {
+		t.Fatalf("inherited daemon log options refused: %v", err)
 	}
 }
 
