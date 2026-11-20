@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -111,17 +110,24 @@ func TestReadTreeRefusesLinksAndLimits(t *testing.T) {
 		return buf.Bytes()
 	}
 	dir := &tar.Header{Name: "work/", Typeflag: tar.TypeDir, Mode: 0o755}
-	cases := map[string][]byte{
-		"symlink": tarOf(dir, &tar.Header{Name: "work/l", Typeflag: tar.TypeSymlink, Linkname: "/etc/passwd"}),
-		"hard":    tarOf(dir, &tar.Header{Name: "work/h", Typeflag: tar.TypeLink, Linkname: "work/x"}),
-		"fifo":    tarOf(dir, &tar.Header{Name: "work/f", Typeflag: tar.TypeFifo}),
-		"outside": tarOf(dir, &tar.Header{Name: "other/x", Typeflag: tar.TypeReg, Size: 1}),
-		"limit":   tarOf(dir, &tar.Header{Name: "work/big", Typeflag: tar.TypeReg, Size: 20}),
+	// Each case has room under the limit, so the rejection comes from the check named.
+	cases := map[string]struct {
+		tar  []byte
+		want string
+	}{
+		"symlink": {tarOf(dir, &tar.Header{Name: "work/l", Typeflag: tar.TypeSymlink, Linkname: "/etc/passwd"}), "not a regular file"},
+		"hard":    {tarOf(dir, &tar.Header{Name: "work/h", Typeflag: tar.TypeLink, Linkname: "work/x"}), "not a regular file"},
+		"fifo":    {tarOf(dir, &tar.Header{Name: "work/f", Typeflag: tar.TypeFifo}), "not a regular file"},
+		"outside": {tarOf(dir, &tar.Header{Name: "other/x", Typeflag: tar.TypeReg, Size: 1}), "unexpected entry"},
 	}
-	for name, b := range cases {
-		if _, err := readTree(bytes.NewReader(b), "work", 10); err == nil {
-			t.Errorf("%s accepted", name)
+	for name, c := range cases {
+		if _, err := readTree(bytes.NewReader(c.tar), "work", 1<<20); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: %v, want %q", name, err, c.want)
 		}
+	}
+	big := tarOf(dir, &tar.Header{Name: "work/big", Typeflag: tar.TypeReg, Size: 4096})
+	if _, err := readTree(bytes.NewReader(big), "work", 2048); err == nil || !strings.Contains(err.Error(), "limit") {
+		t.Errorf("content over the limit: %v", err)
 	}
 }
 
@@ -203,6 +209,7 @@ func TestCheckCreated(t *testing.T) {
 		var c containerState
 		c.Image, c.Config.User, c.Config.WorkingDir, c.Config.Entrypoint = "sha256:img", "10001:10001", "/work", []string{"sh"}
 		c.HostConfig.NetworkMode, c.HostConfig.ReadonlyRootfs = "none", true
+		c.HostConfig.LogConfig.Type = "json-file"
 		c.HostConfig.CapDrop, c.HostConfig.SecurityOpt = []string{"ALL"}, []string{"no-new-privileges"}
 		c.HostConfig.Tmpfs = map[string]string{"/tmp": "mode=1777", sandboxHome: "uid=10001"}
 		for k, v := range want {
@@ -287,32 +294,66 @@ func TestCheckLocalEndpoint(t *testing.T) {
 	}
 }
 
-func TestAttachMismatch(t *testing.T) {
-	exit := func(code int) error {
-		cmd := exec.Command("sh", "-c", fmt.Sprintf("exit %d", code))
-		return cmd.Run()
-	}
-	if _, err := exec.LookPath("sh"); err != nil {
-		t.Skip("needs sh")
-	}
+func TestWaitMismatch(t *testing.T) {
 	proc := func(code int) LaunchResult { return LaunchResult{Class: ClassProcess, ExitCode: code} }
 	cases := []struct {
-		err  error
-		res  LaunchResult
-		fail bool
+		waited string
+		err    error
+		res    LaunchResult
+		fail   bool
 	}{
-		{nil, proc(0), false},
-		{exit(3), proc(3), false},
-		{exit(137), LaunchResult{Class: ClassResource, ExitCode: 137}, false},
-		{nil, proc(3), true},                              // client says success, container failed
-		{exit(1), proc(0), true},                          // client failed, container succeeded
-		{errors.New("write: broken pipe"), proc(0), true}, // output writer or attach error
-		{errors.New("attach"), proc(2), true},
+		{"0", nil, proc(0), false},
+		{"3\n", nil, proc(3), false},
+		{"137", nil, LaunchResult{Class: ClassResource, ExitCode: 137}, false},
+		{"0", nil, proc(3), true},
+		{"", errors.New("daemon lost"), proc(0), true},
+		{"x", nil, proc(0), true},
+		{"", errors.New("x"), LaunchResult{Class: ClassInfrastructure}, false}, // already unproven
 	}
 	for i, c := range cases {
-		if got := attachMismatch(c.err, c.res) != ""; got != c.fail {
+		if got := waitMismatch(c.waited, c.err, c.res) != ""; got != c.fail {
 			t.Errorf("case %d: mismatch %v, want %v", i, got, c.fail)
 		}
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("disk full") }
+
+func TestErrWriterKeepsTheFirstError(t *testing.T) {
+	ew := &errWriter{w: failingWriter{}}
+	if n, err := ew.Write([]byte("abc")); n != 3 || err != nil {
+		t.Fatalf("write %d %v", n, err)
+	}
+	if ew.err == nil || ew.err.Error() != "disk full" {
+		t.Fatalf("error %v", ew.err)
+	}
+}
+
+func TestIsolatedDockerCLIUsesOnlyTheValidatedEndpoint(t *testing.T) {
+	t.Setenv("DOCKER_CONTEXT", "elsewhere")
+	t.Setenv("DOCKER_HOST", "tcp://remote:2375")
+	t.Setenv("DOCKER_CERT_PATH", "/certs")
+	d, err := isolatedDockerCLI(t.TempDir(), "npipe:////./pipe/docker_engine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hosts := 0
+	for _, kv := range d.env {
+		name, value, _ := strings.Cut(kv, "=")
+		switch strings.ToUpper(name) {
+		case "DOCKER_HOST":
+			hosts++
+			if value != "npipe:////./pipe/docker_engine" {
+				t.Errorf("DOCKER_HOST=%s", value)
+			}
+		case "DOCKER_CONTEXT", "DOCKER_CERT_PATH", "DOCKER_TLS_VERIFY":
+			t.Errorf("%s reaches the isolated client", name)
+		}
+	}
+	if hosts != 1 {
+		t.Fatalf("%d DOCKER_HOST entries", hosts)
 	}
 }
 

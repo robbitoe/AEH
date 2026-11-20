@@ -172,3 +172,20 @@ func TestDockerClientProxyNeverReachesContainers(t *testing.T) {
 		t.Fatalf("client proxy reached the container:\n%s", out.String())
 	}
 }
+
+func TestDockerOutputFailureProvesNothing(t *testing.T) {
+	s, _ := dockerSandbox(t, SandboxConfig{})
+	// A failing output writer together with a nonzero exit: the red is not evidence.
+	res, err := s.run(context.Background(), sandboxLaunch{Kind: "gate", Argv: []string{"sh", "-c", "echo out; echo err >&2; exit 3"},
+		Workdir: "/tmp", Timeout: time.Minute, Output: failingWriter{}}, nil)
+	if err != nil || res.Class != ClassInfrastructure || !strings.Contains(res.Reason, "output") {
+		t.Fatalf("%+v %v", res, err)
+	}
+	var out bytes.Buffer
+	res, err = s.run(context.Background(), sandboxLaunch{Kind: "gate", Argv: []string{"sh", "-c", "echo out; echo err >&2; exit 3"},
+		Workdir: "/tmp", Timeout: time.Minute, Output: &out}, nil)
+	if err != nil || res.Class != ClassProcess || res.ExitCode != 3 || !strings.Contains(out.String(), "out") || !strings.Contains(out.String(), "err") {
+		t.Fatalf("%+v %v %q", res, err, out.String())
+	}
+	assertNoLeftovers(t, s)
+}

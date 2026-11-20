@@ -15,7 +15,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -462,6 +464,9 @@ type containerState struct {
 		Binds          []string          `json:"Binds"`
 		Tmpfs          map[string]string `json:"Tmpfs"`
 		SecurityOpt    []string          `json:"SecurityOpt"`
+		LogConfig      struct {
+			Type string `json:"Type"`
+		} `json:"LogConfig"`
 	} `json:"HostConfig"`
 	Mounts []struct {
 		Type        string `json:"Type"`
@@ -494,6 +499,8 @@ func (s *sandbox) inspect(id string) (containerState, error) {
 const (
 	sandboxUser = "10001:10001"
 	sandboxHome = "/home/aeh"
+	// sandboxLogSize caps the output Docker keeps per launch; reports use the tail.
+	sandboxLogSize = "64m"
 )
 
 // launchEnv is the environment a container must end up with: the image's, then
@@ -542,6 +549,9 @@ func (s *sandbox) checkCreated(c containerState, l sandboxLaunch, vols []sandbox
 	}
 	if !slicesContainsPrefix(c.HostConfig.SecurityOpt, "no-new-privileges") {
 		problems = append(problems, "no-new-privileges missing")
+	}
+	if c.HostConfig.LogConfig.Type != "json-file" {
+		problems = append(problems, "log driver "+c.HostConfig.LogConfig.Type+" (the output is read with docker logs)")
 	}
 	got := map[string]string{}
 	for _, kv := range c.Config.Env {
@@ -702,10 +712,8 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 	args = append(args, "--network", "none", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
 		"--memory", s.cfg.Memory, "--memory-swap", s.cfg.Memory, "--cpus", s.cfg.CPUs, "--read-only",
 		"--tmpfs", "/tmp:mode=1777", "--tmpfs", sandboxHome+":uid=10001,gid=10001,mode=0700",
-		"--user", sandboxUser, "--workdir", l.Workdir, "--env-file", envFile, "--entrypoint", l.Argv[0])
-	if l.Stdin != "" {
-		args = append(args, "-i")
-	}
+		"--user", sandboxUser, "--workdir", l.Workdir, "--env-file", envFile, "--entrypoint", l.Argv[0],
+		"--log-driver", "json-file", "--log-opt", "max-size="+sandboxLogSize, "--log-opt", "max-file=1")
 	if l.Pids {
 		args = append(args, "--pids-limit", "512")
 	}
@@ -738,21 +746,15 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 		runCtx, cancel = context.WithTimeout(ctx, l.Timeout)
 		defer cancel()
 	}
-	startArgs := []string{"start", "-a"}
-	var stdin io.Reader
-	if l.Stdin != "" {
-		startArgs, stdin = append(startArgs, "-i"), strings.NewReader(l.Stdin)
+	// No attach: the status comes from docker wait and inspect, the output from docker
+	// logs afterwards. Each has its own error, so a failure to stream or store the output
+	// can never pass for the container's result.
+	if _, err := s.d.run(runCtx, nil, nil, "start", cid); err != nil && runCtx.Err() == nil {
+		return infra(err)
 	}
-	output := l.Output
-	if output == nil {
-		output = io.Discard
-	}
-	cmd := exec.CommandContext(runCtx, "docker", append(startArgs, cid)...)
-	cmd.Env, cmd.Stdin, cmd.Stdout, cmd.Stderr = s.d.env, stdin, output, output
-	cmd.WaitDelay = 5 * time.Second
-	startErr := cmd.Run()
+	waited, waitErr := s.d.run(runCtx, nil, nil, "wait", cid)
 	if runCtx.Err() != nil {
-		// The client stopped; the container may still run. Stop it before reading state.
+		// The container may still run. Stop it before anything else.
 		_, _ = s.d.admin("kill", cid)
 		reason := "cancelled"
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
@@ -765,10 +767,13 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 		return LaunchResult{Class: ClassTerminated, ExitCode: -1, Reason: "lost the container state: " + err.Error()}, nil
 	}
 	res = classify(st)
-	if err := attachMismatch(startErr, res); err != "" {
-		// The client failed to attach or to write the output, or its status disagrees
-		// with the container's: the evidence is incomplete, so nothing is proven.
-		return LaunchResult{Class: ClassInfrastructure, ExitCode: -1, Reason: err}, nil
+	if msg := waitMismatch(waited, waitErr, res); msg != "" {
+		return LaunchResult{Class: ClassInfrastructure, ExitCode: -1, Reason: msg}, nil
+	}
+	if l.Output != nil {
+		if err := s.logs(ctx, cid, l.Output); err != nil {
+			return LaunchResult{Class: ClassInfrastructure, ExitCode: -1, Reason: "could not read the container output: " + err.Error()}, nil
+		}
 	}
 	if after != nil && (res.Class == ClassProcess || res.Class == ClassResource) {
 		if err := after(cid); err != nil {
@@ -778,28 +783,60 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 	return res, nil
 }
 
-// attachMismatch compares the result of docker start -a with the inspected state.
-// docker start -a exits with the container's own exit code; any other error (attach,
-// stream copy, output writer) or a different code means the output is not trustworthy.
-func attachMismatch(startErr error, res LaunchResult) string {
+// waitMismatch compares docker wait's answer with the inspected state. A failed wait, or
+// an exit code that differs from the inspected one, leaves the result unproven.
+func waitMismatch(waited string, waitErr error, res LaunchResult) string {
 	if res.Class != ClassProcess && res.Class != ClassResource {
-		if startErr != nil {
-			return res.Reason + ": " + startErr.Error()
-		}
 		return ""
 	}
-	var exit *exec.ExitError
-	switch {
-	case startErr == nil && res.ExitCode == 0:
-		return ""
-	case startErr == nil:
-		return fmt.Sprintf("docker start reported success but the container exited %d", res.ExitCode)
-	case !errors.As(startErr, &exit):
-		return "attaching to the container failed: " + startErr.Error()
-	case exit.ExitCode() != res.ExitCode:
-		return fmt.Sprintf("docker start exited %d but the container exited %d", exit.ExitCode(), res.ExitCode)
+	if waitErr != nil {
+		return "docker wait failed: " + waitErr.Error()
+	}
+	if code, err := strconv.Atoi(strings.TrimSpace(waited)); err != nil || code != res.ExitCode {
+		return fmt.Sprintf("docker wait reported %q but the container exited %d", waited, res.ExitCode)
 	}
 	return ""
+}
+
+// errWriter records the first write error and keeps accepting bytes, so the copy from a
+// subprocess never hides it (os/exec drops copy errors when the process fails). It is
+// safe for the two copy goroutines of stdout and stderr; last keeps the final bytes for
+// error messages.
+type errWriter struct {
+	mu   sync.Mutex
+	w    io.Writer
+	err  error
+	last []byte
+}
+
+func (e *errWriter) Write(p []byte) (int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.err == nil {
+		if _, err := e.w.Write(p); err != nil {
+			e.err = err
+		}
+	}
+	e.last = append(e.last, p...)
+	if len(e.last) > 512 {
+		e.last = append(e.last[:0], e.last[len(e.last)-512:]...)
+	}
+	return len(p), nil
+}
+
+// logs copies a stopped container's stdout and stderr to w. Any error of the client or
+// of w is returned; the caller then treats the launch as unproven.
+func (s *sandbox) logs(ctx context.Context, cid string, w io.Writer) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	ew := &errWriter{w: w}
+	cmd := exec.CommandContext(ctx, "docker", "logs", cid)
+	cmd.Env, cmd.Stdout, cmd.Stderr = s.d.env, ew, ew
+	cmd.WaitDelay = 5 * time.Second
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("docker logs: %v: %s", err, redactSecrets(string(ew.last)))
+	}
+	return ew.err
 }
 
 // unset reports a Docker timestamp that was never set.
