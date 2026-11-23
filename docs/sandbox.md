@@ -3,7 +3,7 @@
 Without a sandbox, AEH runs your build, test and acceptance commands on your machine with your user's permissions. Those commands execute code an agent just wrote. With the optional sandbox, they run in a local Docker container instead:
 
 - no network (only loopback),
-- no credentials: `pass_env` is not forwarded, and proxy variables are empty,
+- no forwarded host credentials: `pass_env` is not forwarded and proxy variables are empty (secrets committed to the repository or built into the image are not removed),
 - no Git metadata and no host directory: the container sees an exact copy of the commit,
 - a read-only root filesystem, all capabilities dropped, user `10001:10001`, memory and CPU limits.
 
