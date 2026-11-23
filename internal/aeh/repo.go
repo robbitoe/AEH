@@ -46,8 +46,13 @@ func (r Repo) WorktreePath(name string) string {
 		base = os.TempDir()
 	}
 	// Clean the root first: the same directory spelled with other separators must map to
-	// the same key (callers that resolve the main checkout get a cleaned path).
+	// the same key (callers that resolve the main checkout get a cleaned path). Then use
+	// its real path, so a Windows 8.3 short name (C:\Users\RUNNER~1) or a symbolic link
+	// gives the same key as the long path Git reports.
 	root := filepath.Clean(r.Root)
+	if real, err := filepath.EvalSymlinks(root); err == nil {
+		root = real
+	}
 	sum := sha256.Sum256([]byte(root))
 	project := filepath.Base(root) + "-" + hex.EncodeToString(sum[:4])
 	return filepath.Join(base, "aeh", "worktrees", project, name)

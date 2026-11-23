@@ -21,14 +21,6 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Long temporary paths on Windows
-        # The runner's TEMP uses an 8.3 short name (RUNNER~1) while Git reports long
-        # paths, and tests compare both. runner.temp has no short names.
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
-          echo "TMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Git identity for test repositories
         run: |
           git config --global user.name ci
