@@ -26,8 +26,17 @@ type GateResult struct {
 	Warnings  []string `json:"warnings,omitempty"`
 	// Class says how a command gate's process ended (see LaunchResult). Only
 	// ClassProcess proves a red or a green; empty for gates that run no command.
-	Class  string `json:"class,omitempty"`
-	Reason string `json:"reason,omitempty"`
+	Class     string `json:"class,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+	Sandboxed bool   `json:"sandboxed,omitempty"` // the command ran in a sandbox container
+	ExitCode  int    `json:"exit_code,omitempty"` // sandboxed commands of class process
+}
+
+// sandboxFailure is the gate for a verification sequence the sandbox could not set up
+// (engine unreachable, image missing, a tree it cannot export). It blocks with the
+// reason and consumes no ladder step; a sandboxed project never falls back to the host.
+func sandboxFailure(err error) GateResult {
+	return GateResult{Name: "sandbox", Output: err.Error(), Uncertain: true, Class: ClassInfrastructure, Reason: err.Error(), Sandboxed: true}
 }
 
 // provesResult reports whether a command gate's pass or failure is evidence about the
@@ -43,7 +52,7 @@ func gateFromLaunch(name string, res LaunchResult, output string, seconds float6
 	g := GateResult{Name: name, Seconds: seconds, Output: tail(output, maxGateOutput), Class: res.Class, Reason: res.Reason}
 	switch res.Class {
 	case ClassProcess:
-		g.Passed = res.ExitCode == 0
+		g.Passed, g.ExitCode = res.ExitCode == 0, res.ExitCode
 	case ClassResource:
 		g.Output = strings.TrimSpace(res.Reason + "\n" + g.Output)
 	default:

@@ -1133,6 +1133,10 @@ type AdoptVerifyCommand struct {
 	Integrity string  `json:"integrity"`
 	Output    string  `json:"output,omitempty"`
 	Uncertain bool    `json:"uncertain,omitempty"`
+	// Class and Reason say how a sandboxed command ended (process, infrastructure,
+	// resource, terminated) and why, when it did not exit by itself.
+	Class  string `json:"class,omitempty"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // AdoptVerification is local evidence, never an approval or a suggested configuration run.
@@ -1142,6 +1146,7 @@ type AdoptVerification struct {
 	ConfigSHA string               `json:"config_sha256"`
 	Passed    bool                 `json:"passed"`
 	Commands  []AdoptVerifyCommand `json:"commands"`
+	Sandbox   string               `json:"sandbox_image,omitempty"` // image ID when the commands ran sandboxed
 }
 
 // AdoptVerify uses the gate shell/process-tree runner with the owner's current configuration.
@@ -1166,13 +1171,43 @@ func AdoptVerify(ctx context.Context, r Repo, base string, out io.Writer) (_ Ado
 		return AdoptVerification{}, err
 	}
 	defer w.close()
+	// Under the sandbox, the commands run on a full export of the base in a container;
+	// the inspection worktree stays for the host-side checks only.
+	sb, err := openFlowSandbox(a.repo, cfg, "adopt-verify")
+	if err != nil {
+		return AdoptVerification{}, err
+	}
+	var sv *verification
+	if sb != nil {
+		if sv, err = newVerification(ctx, sb, a.repo.Root, w.dir, base, cfg); err != nil {
+			return AdoptVerification{}, err
+		}
+		defer func() {
+			if cerr := sv.Close(); cerr != nil && err == nil {
+				err = cerr
+			}
+		}()
+	}
 	v := AdoptVerification{Base: base, Date: memoryNow().UTC().Format(time.RFC3339), ConfigSHA: observationDigest(string(b)), Passed: true}
+	if sb != nil {
+		v.Sandbox = sb.image.ID
+	}
 	for _, step := range []struct{ name, text string }{{"build", cfg.Commands.Build}, {"test", cfg.Commands.Test}} {
 		if err := checkNoSecrets("configured command", []byte(step.text)); err != nil {
 			return v, err
 		}
 		c := AdoptVerifyCommand{Name: step.name, Command: redactDiagnostic(step.text), Integrity: "unchanged", Passed: true}
-		if strings.TrimSpace(step.text) != "" {
+		if strings.TrimSpace(step.text) != "" && sv != nil {
+			g := sv.raw(ctx, step.name, step.text)
+			c.Seconds, c.Output, c.Passed, c.Uncertain, c.Exit = g.Seconds, discoveryDiagnostic(g.Output), g.Passed, g.Uncertain, -1
+			c.Class, c.Reason = g.Class, discoveryDiagnostic(g.Reason)
+			if g.Class == ClassProcess {
+				c.Exit = g.ExitCode
+			}
+			if broken := sv.damaged(); broken != nil {
+				c.Passed, c.Integrity = false, discoveryDiagnostic(broken.Error())
+			}
+		} else if strings.TrimSpace(step.text) != "" {
 			start := time.Now()
 			output, runErr := runShell(ctx, w.dir, step.text, time.Duration(cfg.Commands.TimeoutMinutes)*time.Minute, cfg.PassEnv)
 			c.Seconds, c.Output, c.Passed = time.Since(start).Seconds(), discoveryDiagnostic(tail(output, maxGateOutput)), runErr == nil
@@ -1188,8 +1223,10 @@ func AdoptVerify(ctx context.Context, r Repo, base string, out io.Writer) (_ Ado
 				}
 			}
 		}
-		if err := w.integrity(true); err != nil {
-			c.Passed, c.Integrity = false, discoveryDiagnostic(err.Error())
+		if sv == nil {
+			if err := w.integrity(true); err != nil {
+				c.Passed, c.Integrity = false, discoveryDiagnostic(err.Error())
+			}
 		}
 		v.Commands = append(v.Commands, c)
 		v.Passed = v.Passed && c.Passed

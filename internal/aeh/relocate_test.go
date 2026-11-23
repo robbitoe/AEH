@@ -362,7 +362,11 @@ echo 'PLAN: READY'`, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, step, msg, uncertain, err := engine.redGreen(context.Background(), wt, a.Mapped, plan)
+	v, err := newVerification(context.Background(), nil, f.dir, wt, a.Mapped, engine.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, step, msg, uncertain, err := engine.redGreen(context.Background(), v, plan)
 	if err != nil || uncertain || step != "build" || !strings.Contains(msg, "modified the checkout") {
 		t.Fatalf("settle trusted original SHA: %q %q %v %v", step, msg, uncertain, err)
 	}

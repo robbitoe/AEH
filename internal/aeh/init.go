@@ -70,6 +70,16 @@ reviewers:
 notify:
   webhook: ""          # POST {event, outcome, title, message} when an outcome blocks or is accepted
 
+# Optional sandbox: build, test and acceptance commands run in a local Docker container with
+# no network, no credentials and no Git metadata (see docs/sandbox.md in the AEH repository).
+# Commands must then be POSIX shell commands, and dependencies must be inside the image.
+# Check it with: aeh sandbox check
+# sandbox:
+#   image: "sha256:<image id>"   # a local image, pinned by ID or name@sha256:<digest>; aeh never pulls
+#   memory: 4g
+#   cpus: 2
+#   gate_env: {}                 # literal, non-secret variables for gate commands
+
 # How each agent is launched. provider is a free name used to keep reviewers independent
 # from authors; transport is "cli" (an "api" transport is planned, not available yet).
 # {{prompt}} is replaced with the prompt text, {{prompt_file}} with a file holding it;
