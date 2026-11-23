@@ -10,7 +10,7 @@ The runner decides; models only propose.
 
 The whole cycle: discovery from an idea (or adoption of an existing system), owner approval of versioned specs, and the build stage. AEH turns an approved feature spec into a plan, sealed acceptance tests and verified code on its own branch. You approve the spec; AEH generates, checks, independently reviews and seals the tests. Manual outcomes remain supported with owner-approved tests. AEH runs agent CLIs (Codex, Claude Code, a local model) in separate git worktrees and accepts a change only when deterministic gates and independent reviews pass.
 
-> Worktrees separate Git changes. Build, test and acceptance commands, which run code an agent just wrote, can run in a local Docker container with no network, no credentials and no Git metadata: see [Sandbox](docs/sandbox.md). Agent CLIs still run with your user's permissions, subject to any sandbox configured on the CLI itself, so use trusted repositories and profiles.
+> Worktrees separate Git changes. Build, test and acceptance commands, which run code an agent just wrote, can run in a local Docker container with no network, no forwarded host credentials and no Git metadata: see [Sandbox](docs/sandbox.md). Secrets committed to the repository or built into the image are not removed. Agent CLIs still run with your user's permissions, subject to any sandbox configured on the CLI itself, so use trusted repositories and profiles.
 
 ## Install
 
