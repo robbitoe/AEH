@@ -10,7 +10,7 @@ The runner decides; models only propose.
 
 The whole cycle: discovery from an idea (or adoption of an existing system), owner approval of versioned specs, and the build stage. AEH turns an approved feature spec into a plan, sealed acceptance tests and verified code on its own branch. You approve the spec; AEH generates, checks, independently reviews and seals the tests. Manual outcomes remain supported with owner-approved tests. AEH runs agent CLIs (Codex, Claude Code, a local model) in separate git worktrees and accepts a change only when deterministic gates and independent reviews pass.
 
-> Worktrees separate Git changes. Agent CLIs and build/test commands run with your user's permissions, subject to any sandbox configured on the CLI itself. Use trusted repositories, profiles, and commands until AEH has a process sandbox.
+> Worktrees separate Git changes. Build, test and acceptance commands, which run code an agent just wrote, can run in a local Docker container with no network, no credentials and no Git metadata: see [Sandbox](docs/sandbox.md). Agent CLIs still run with your user's permissions, subject to any sandbox configured on the CLI itself, so use trusted repositories and profiles.
 
 ## Install
 
@@ -464,7 +464,7 @@ The stages of the [vision](docs/vision.md), in order:
 4. **Specs to code (implemented).** An approved feature produces one task and independently reviewed, runner-sealed acceptance tests with `aeh plan`.
 5. **Discovery and adoption (implemented).** From a vague idea to a validated spec book with HTML mockups; adoption of an existing system area by area, up to sealed characterization tests.
 6. **Live review (implemented).** Specs keep evolving while features are built: immutable versions, changed and removed criteria, clarifications, queued approvals and path moves.
-7. **Sandbox (in progress).** Gates and agents in containers with no network by default.
+7. **Sandbox (gates implemented).** Build, test and acceptance commands in local containers with no network, with an integrity check after every command (`aeh sandbox check`, [docs/sandbox.md](docs/sandbox.md)). Next: agents in containers with a per-launch egress proxy.
 
 ## Development
 
