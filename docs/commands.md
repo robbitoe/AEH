@@ -206,6 +206,12 @@ Checks memory and its privacy settings: errors and warnings.
 
 `aeh memory record <ID>` retries a pending memory record of an accepted outcome.
 
+## Sandbox: gate commands in containers
+
+### `aeh sandbox check`
+
+`aeh sandbox check` verifies the optional `sandbox:` section of `aeh/config.yaml` without changing the project. It checks that the Docker client points at a local engine (`unix://` or `npipe://`, Linux containers, Docker 24 or later) and that the pinned image is present locally (aeh never pulls images). It then runs a throwaway preflight container with the same isolation as a gate: user `10001:10001`, a read-only root filesystem, no network besides loopback, empty proxy variables, an executable `100755` file that runs and a `100644` file that does not, a writable work view read back afterwards, and a read-only runner view. It also checks that the image has the first program of every configured command and warns when a command calls `git`, since sandboxed gates see no Git repository.
+
 ## Tracking
 
 ### `aeh status`

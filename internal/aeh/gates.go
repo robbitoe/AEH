@@ -24,6 +24,33 @@ type GateResult struct {
 	Uncertain bool     `json:"uncertain,omitempty"`
 	Skipped   bool     `json:"skipped,omitempty"`
 	Warnings  []string `json:"warnings,omitempty"`
+	// Class says how a command gate's process ended (see LaunchResult). Only
+	// ClassProcess proves a red or a green; empty for gates that run no command.
+	Class  string `json:"class,omitempty"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// provesResult reports whether a command gate's pass or failure is evidence about the
+// code: its process ran and exited by itself. Gates without a command always prove.
+func (g GateResult) provesResult() bool {
+	return !g.Uncertain && (g.Class == "" || g.Class == ClassProcess)
+}
+
+// gateFromLaunch turns a sandboxed command's result into a gate. Infrastructure failures
+// and terminations are uncertain: they block without consuming a ladder step. An OOM kill
+// is a failure with its reason, never evidence of a red.
+func gateFromLaunch(name string, res LaunchResult, output string, seconds float64) GateResult {
+	g := GateResult{Name: name, Seconds: seconds, Output: tail(output, maxGateOutput), Class: res.Class, Reason: res.Reason}
+	switch res.Class {
+	case ClassProcess:
+		g.Passed = res.ExitCode == 0
+	case ClassResource:
+		g.Output = strings.TrimSpace(res.Reason + "\n" + g.Output)
+	default:
+		g.Uncertain = true
+		g.Output = strings.TrimSpace("sandbox " + res.Class + ": " + res.Reason + "\n" + g.Output)
+	}
+	return g
 }
 
 const maxGateOutput = 6000
@@ -353,6 +380,17 @@ func gateCommand(ctx context.Context, name, wt, command string, timeout time.Dur
 		g.Output = fmt.Sprintf("timed out after %s\n%s", timeout, g.Output)
 	}
 	g.Uncertain = uncertainExit(err)
+	var exit *exec.ExitError
+	switch {
+	case err == nil || errors.As(err, &exit):
+		g.Class = ClassProcess
+	case g.Uncertain:
+		g.Class, g.Reason = ClassTerminated, err.Error()
+	default:
+		// The shell could not start: nothing ran, so the gate proves nothing and blocks
+		// (uncertain) instead of consuming a ladder attempt.
+		g.Class, g.Reason, g.Uncertain = ClassInfrastructure, err.Error(), true
+	}
 	if err != nil && strings.TrimSpace(g.Output) == "" {
 		g.Output = err.Error()
 	}

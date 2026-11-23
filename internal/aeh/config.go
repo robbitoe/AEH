@@ -54,6 +54,8 @@ type Config struct {
 		Webhook string `yaml:"webhook"`
 	} `yaml:"notify"`
 	Profiles map[string]Profile `yaml:"profiles"`
+	// Sandbox, when present, runs gate commands in containers (stage 6).
+	Sandbox *SandboxConfig `yaml:"sandbox"`
 }
 
 // PlanConfig limits the test author's proposal, independently of implementation limits.
@@ -241,6 +243,11 @@ func checkConfigYAML(b []byte) (reviewersDeclared bool, err error) {
 func (c *Config) validate() error {
 	if err := c.validatePlanConfig(); err != nil {
 		return err
+	}
+	if c.Sandbox != nil {
+		if err := c.Sandbox.validate(); err != nil {
+			return err
+		}
 	}
 	if err := c.validateDiscoveryConfig(); err != nil {
 		return err
