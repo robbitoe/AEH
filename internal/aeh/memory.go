@@ -1,0 +1,1980 @@
+package aeh
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+// The product memory is a local wiki in <main checkout>/.aeh/memory/. It is its own Git
+// repository with no remote: every spec version is a commit there. The project ignores
+// .aeh/, so nothing in it is published by AEH. Only aeh commands write it; agents receive
+// what they need inside the prompt.
+//
+//	.aeh/memory/
+//	  schema.md                      conventions
+//	  wiki/index.md                  generated: feature, version, last accepted implementation
+//	  wiki/log.md                    append-only
+//	  wiki/features/<slug>/spec.md   one spec per feature
+//
+// Without a sandbox this is a cooperation rule, not isolation: agents, builds and tests run
+// with the user's permissions. The engine detects changes against a snapshot and refuses to
+// record on top of them.
+
+var (
+	ErrMemoryDirty   = errors.New("memory has uncommitted changes")
+	ErrMemoryChanged = errors.New("memory changed since the run started")
+)
+
+// memoryNow and memoryWriteFile are replaced in tests.
+var (
+	memoryNow       = time.Now
+	memoryWriteFile = writeFileAtomic
+)
+
+// memoryGitIdentity signs memory commits. They never leave the machine.
+// author.* and committer.* override user.*, so all of them are pinned.
+var memoryGitIdentity = []string{
+	"-c", "user.name=aeh", "-c", "user.email=aeh@localhost",
+	"-c", "author.name=aeh", "-c", "author.email=aeh@localhost",
+	"-c", "committer.name=aeh", "-c", "committer.email=aeh@localhost",
+	"-c", "commit.gpgsign=false",
+}
+
+// Spec is one feature's document. Paths name the code the feature owns.
+type Spec struct {
+	Feature string
+	Title   string
+	Version string
+	Paths   []string
+	Body    string
+	// Approval is the owner's last approval of this spec, or nil; see Approved.
+	Approval *SpecApproval
+	// Queued is set on the result of approving a version that cannot yet become current.
+	Queued *QueuedApproval
+	// Implemented lists the accepted implementations of approved contents, oldest first.
+	Implemented []Implementation
+	// rev is the memory commit the spec was read from, or "" for the working tree. Criteria
+	// identity replays history up to it, so a pinned spec is judged as it was then.
+	rev string
+}
+
+// Criteria parses the spec's acceptance criteria; see parseCriteria.
+func (s Spec) Criteria() ([]SpecCriterion, bool, error) { return parseCriteria(s.Body) }
+
+// SpecApproval records that the owner approved one exact content of a spec.
+type SpecApproval struct {
+	Version string `yaml:"version"`
+	Content string `yaml:"content_sha256"`
+	Date    string `yaml:"date"`
+	// Criteria are the criterion IDs the approved content had; MaxCriterion is the highest ID
+	// ever approved for the feature, so a removed criterion's number stays retired.
+	Criteria     []int `yaml:"criteria,omitempty,flow"`
+	MaxCriterion int   `yaml:"max_criterion,omitempty"`
+	// DeltaBase is what the approval's criteria delta was computed against: the approval
+	// digest of the feature's last implementation then, or "none". Empty in approvals written
+	// before stage 5, which are not checked.
+	DeltaBase string `yaml:"delta_base,omitempty"`
+	// Clarifications are the changed criteria the owner marked as wording-only when
+	// approving: their new tests may pass on the base, and QA must confirm the equivalence.
+	// Each is bound to the exact old and new texts, so a different delta voids it.
+	Clarifications []Clarification `yaml:"clarifications,omitempty"`
+	// Relocations are the literal owner-declared moves included in Content.
+	Relocations []Relocation `yaml:"relocations,omitempty" json:",omitempty"`
+}
+
+// Clarification marks one changed criterion as a clarification of its old text.
+type Clarification struct {
+	ID  int    `yaml:"id" json:"id"`
+	Old string `yaml:"old_sha256" json:"old_sha256"`
+	New string `yaml:"new_sha256" json:"new_sha256"`
+}
+
+// criterionDigest identifies a criterion text for a clarification.
+func criterionDigest(text string) string {
+	sum := sha256.Sum256([]byte(normalizeCriterion(text)))
+	return hex.EncodeToString(sum[:])
+}
+
+// ApproveOptions are the owner's choices when approving a spec.
+type ApproveOptions struct {
+	// Clarify lists the changed criteria (by number) to mark as clarifications. SetClarify
+	// says the owner passed the list, possibly empty ("none"); without it, an approval that
+	// is current keeps its clarifications and a new approval has none.
+	Clarify    []int
+	SetClarify bool
+	// Without SetRelocate, recomputing an existing approval keeps its pairs. A new content
+	// approval needs an explicit declaration; completed moves must not recur in later deltas.
+	Relocations []Relocation
+	SetRelocate bool
+}
+
+// noImplementation is the DeltaBase of an approval given before any implementation.
+const noImplementation = "none"
+
+// deltaBase is what a new approval's delta is computed against: the last implementation's
+// approval digest, or noImplementation.
+func (s Spec) deltaBase() string {
+	if im, ok := s.LastImplementation(); ok {
+		return im.Approval
+	}
+	return noImplementation
+}
+
+// staleApproval reports that the spec's approval was computed against an implementation that
+// is no longer the last one, and that the last one is not of this approval: a version in
+// between was implemented (or abandoned), so the approved delta is not the real one.
+func (s Spec) staleApproval() bool {
+	a := s.Approval
+	if a == nil || a.DeltaBase == "" || a.DeltaBase == s.deltaBase() {
+		return false
+	}
+	im, _ := s.LastImplementation()
+	return im.SpecVersion != a.Version
+}
+
+// Approved reports whether the owner approved the spec as it reads now: the digest of its
+// title, paths and whole body equals the approved one. No Markdown is interpreted and nothing
+// is exempt, so any edit voids it. Recording an accepted change carries a valid approval
+// forward in the same memory commit (see RecordChange); a hand edit never does.
+func (s Spec) Approved() bool {
+	return s.Approval != nil && s.Approval.Content == approvalDigest(s.Title, s.Paths, s.Body, s.Approval.Relocations)
+}
+
+// approvalDigest hashes what the owner approves: title, paths, body text and declared moves.
+// With no moves it preserves the digest format of approvals written before relocation.
+func approvalDigest(title string, paths []string, body string, pairs ...[]Relocation) string {
+	v := struct {
+		Title       string
+		Paths       []string
+		Body        string
+		Relocations []Relocation `json:",omitempty"`
+	}{Title: title, Paths: paths, Body: strings.TrimRight(body, "\n")}
+	if len(pairs) > 0 {
+		v.Relocations = pairs[0]
+	}
+	b, _ := json.Marshal(v)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// lastHeading returns the last second-level heading outside fenced code and its offset.
+func lastHeading(body string) (string, int) {
+	last, at := "", -1
+	var f codeFence
+	offset := 0
+	for _, l := range strings.SplitAfter(body, "\n") {
+		if !f.step(l) && strings.HasPrefix(l, "## ") {
+			last, at = strings.TrimSpace(l), offset
+		}
+		offset += len(l)
+	}
+	return last, at
+}
+
+// codeFence follows Markdown fenced code blocks: a run of three or more backticks or tildes,
+// indented at most three spaces, opens a block that only a run of the same character at least
+// as long closes. A shorter or different run inside the block is content.
+type codeFence struct {
+	char byte
+	n    int
+}
+
+// step reports whether the line belongs to a fenced block (its fences included).
+func (f *codeFence) step(line string) bool {
+	t := strings.TrimRight(line, "\r\n")
+	trimmed := strings.TrimLeft(t, " ")
+	if len(t)-len(trimmed) > 3 || trimmed == "" {
+		return f.n > 0
+	}
+	c := trimmed[0]
+	if c != '`' && c != '~' {
+		return f.n > 0
+	}
+	n := len(trimmed) - len(strings.TrimLeft(trimmed, string(c)))
+	if n < 3 {
+		return f.n > 0
+	}
+	rest := trimmed[n:]
+	if f.n == 0 {
+		if c == '`' && strings.Contains(rest, "`") {
+			return false // an inline code span, not a fence
+		}
+		f.char, f.n = c, n
+		return true
+	}
+	if c == f.char && n >= f.n && strings.Trim(rest, " \t") == "" { // only spaces or tabs may follow a closing fence
+		f.n = 0
+	}
+	return true
+}
+
+// MemorySnapshot is what a run reads from memory. Fingerprint covers everything the drift
+// gate uses, so a run can detect that memory changed under it.
+type MemorySnapshot struct {
+	Present bool
+	Dir     string
+	// Commit is the memory commit a pinned snapshot was read from; "" for the working tree.
+	Commit      string
+	Specs       []Spec
+	Fingerprint string
+}
+
+// Spec returns the spec of a feature.
+func (m MemorySnapshot) Spec(feature string) (Spec, bool) {
+	for _, s := range m.Specs {
+		if s.Feature == feature {
+			return s, true
+		}
+	}
+	return Spec{}, false
+}
+
+// MemoryLink ties one outcome or `aeh do` change to the feature it modifies.
+type MemoryLink struct {
+	Feature string
+	Change  string // patch | minor | major
+	Note    string // changelog line
+}
+
+// Validate checks the link's form. An empty link is valid: the change declares no feature.
+func (l MemoryLink) Validate() error {
+	if l.Feature == "" {
+		if l.Change != "" || l.Note != "" {
+			return errors.New("a change level or note needs a feature")
+		}
+		return nil
+	}
+	if err := checkSlug(l.Feature); err != nil {
+		return err
+	}
+	if _, err := bumpVersion("0.0.0", l.Change); err != nil {
+		return err
+	}
+	if _, err := changelogNote(l.Note); err != nil {
+		return err
+	}
+	return nil
+}
+
+// PendingRecord is an accepted change that still has to be written to memory.
+type PendingRecord struct {
+	OutcomeID string
+	Feature   string
+	Change    string
+	Note      string
+	Commit    string // verified head of the integration branch
+	// Implementation, for an outcome generated from an approved spec, is written in the same
+	// memory commit. RecordChange sets its MaxCriterion.
+	Implementation *Implementation `json:",omitempty"`
+	// MemoryBase is the memory commit the plan was pinned to: the implementation is checked
+	// against the spec as it read there, even when a newer version was approved since.
+	MemoryBase string `json:",omitempty"`
+}
+
+// MemoryDir is the memory of the project's main checkout, also from linked worktrees.
+func MemoryDir(r Repo) (string, error) {
+	main, err := MainCheckout(r)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(main, ".aeh", "memory"), nil
+}
+
+// InitMemory creates the memory repository. It returns false when it already exists.
+func InitMemory(r Repo) (bool, error) {
+	unlock, err := lockLiveProject(r)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	return initMemoryLocked(r)
+}
+
+// initMemoryLocked also lets abandon record a marker for a manual run predating memory.
+func initMemoryLocked(r Repo) (bool, error) {
+	main, err := MainCheckout(r)
+	if err != nil {
+		return false, err
+	}
+	if err := checkProjectPrivacy(main); err != nil {
+		return false, err
+	}
+	dir := filepath.Join(main, ".aeh", "memory")
+	if err := rejectLink(dir); err != nil {
+		return false, fmt.Errorf("memory init: %w", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, ".git")); err == nil {
+		if err := rejectLinksInside(dir); err != nil {
+			return false, err
+		}
+		if err := verifyMemoryRepo(dir); err != nil {
+			return false, err
+		}
+		if _, err := git(dir, "rev-parse", "--verify", "--quiet", "HEAD"); err != nil {
+			// Finish an init that stopped before its first commit, but only when nothing in
+			// the directory could be someone else's work.
+			if err := checkUnfinishedInit(dir); err != nil {
+				return false, err
+			}
+			return true, seedMemory(dir)
+		}
+		return false, checkMemoryLayout(dir)
+	}
+	if entries, err := os.ReadDir(dir); err == nil && len(entries) > 0 {
+		return false, fmt.Errorf("memory init: %s exists and is not a memory repository; move it away first", dir)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return false, fmt.Errorf("memory init: %w", err)
+	}
+	if _, err := git(dir, "init", "-q", "-b", "main"); err != nil {
+		return false, fmt.Errorf("memory init: %w", err)
+	}
+	if _, err := git(dir, "config", "core.autocrlf", "false"); err != nil {
+		return false, fmt.Errorf("memory init: %w", err)
+	}
+	if err := verifyMemoryRepo(dir); err != nil {
+		return false, err
+	}
+	return true, seedMemory(dir)
+}
+
+// memoryLayout lists the files every initialized memory has.
+var memoryLayout = []string{"schema.md", "wiki/features/.gitkeep", "wiki/index.md", "wiki/log.md"}
+
+// seedMemory writes the initial files and makes the first commit.
+func seedMemory(dir string) error {
+	today := memoryNow().UTC().Format("2006-01-02")
+	files := map[string]string{
+		"schema.md":              memorySchema,
+		"wiki/index.md":          renderIndex(nil),
+		"wiki/log.md":            "# Log" + nl + nl + "Append-only. One entry per memory change." + nl + nl + "## [" + today + "] init | memory created" + nl,
+		"wiki/features/.gitkeep": "",
+	}
+	for _, name := range memoryLayout {
+		if err := writeFileAtomic(filepath.Join(dir, filepath.FromSlash(name)), []byte(files[name])); err != nil {
+			return fmt.Errorf("memory init: %w", err)
+		}
+	}
+	return commitMemory(dir, memoryLayout, "aeh: initialize memory")
+}
+
+const nl = "\n"
+
+// checkUnfinishedInit accepts a repository only when HEAD is unborn, anything staged is one of
+// aeh's init files exactly as on disk, and every file present is one aeh's init writes, with the
+// content aeh writes. Anything else may be the owner's work, so init refuses instead of replacing it.
+func checkUnfinishedInit(dir string) error {
+	if _, err := git(dir, "symbolic-ref", "-q", "HEAD"); err != nil {
+		return fmt.Errorf("memory init: %s has no readable HEAD; inspect it or move it away", dir)
+	}
+	expected := map[string]bool{}
+	for _, name := range memoryLayout {
+		expected[name] = true
+	}
+	// An init may stop after staging its seed files: those may stay staged, exactly as on disk.
+	staged, err := git(dir, "ls-files", "-s")
+	if err != nil {
+		return fmt.Errorf("memory init: %w", err)
+	}
+	for _, line := range strings.Split(staged, "\n") {
+		if line == "" {
+			continue
+		}
+		meta, rel, ok := strings.Cut(line, "\t")
+		fields := strings.Fields(meta)
+		if !ok || len(fields) != 3 || !expected[rel] {
+			return fmt.Errorf("memory init: %s has no commit and stages %s, which aeh did not write; move the directory away first", dir, rel)
+		}
+		disk, err := git(dir, "hash-object", "--", rel)
+		if err != nil || disk != fields[1] {
+			return fmt.Errorf("memory init: %s has no commit and its staged %s differs from the file; move the directory away first", dir, rel)
+		}
+	}
+	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if p == filepath.Join(dir, ".git") {
+			return filepath.SkipDir
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		if !expected[rel] || !isSeedContent(rel, b) {
+			return fmt.Errorf("memory init: %s has no commit and contains %s, which aeh did not write; move the directory away first", dir, rel)
+		}
+		return nil
+	})
+}
+
+// isSeedContent reports whether b is what seedMemory writes for name (the log's date may differ).
+func isSeedContent(name string, b []byte) bool {
+	switch name {
+	case "schema.md":
+		return string(b) == memorySchema
+	case "wiki/index.md":
+		return string(b) == renderIndex(nil)
+	case "wiki/features/.gitkeep":
+		return len(b) == 0
+	case "wiki/log.md":
+		head := "# Log" + nl + nl + "Append-only. One entry per memory change." + nl + nl + "## ["
+		tail := "] init | memory created" + nl
+		s := string(b)
+		return strings.HasPrefix(s, head) && strings.HasSuffix(s, tail) && len(s) == len(head)+len("2006-01-02")+len(tail)
+	}
+	return false
+}
+
+// checkMemoryLayout reports files an initialized memory is missing from its last commit.
+func checkMemoryLayout(dir string) error {
+	var missing []string
+	for _, name := range memoryLayout {
+		if _, err := git(dir, "cat-file", "-e", "HEAD:"+name); err != nil {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("memory init: %s is incomplete (missing from its last commit: %s); restore them from its history or move the directory away", dir, strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+// LoadMemory reads every spec. A missing memory is not an error; a corrupt one is.
+func LoadMemory(r Repo) (MemorySnapshot, error) {
+	dir, err := MemoryDir(r)
+	if err != nil {
+		return MemorySnapshot{}, err
+	}
+	return loadMemoryDir(dir)
+}
+
+func loadMemoryDir(dir string) (MemorySnapshot, error) {
+	snap := MemorySnapshot{Dir: dir}
+	if err := rejectLink(filepath.Dir(dir)); err != nil {
+		return snap, fmt.Errorf("memory: %w", err)
+	}
+	if _, err := os.Lstat(dir); errors.Is(err, os.ErrNotExist) {
+		snap.Fingerprint = fingerprint(snap)
+		return snap, nil
+	}
+	if err := rejectLink(dir); err != nil {
+		return snap, fmt.Errorf("memory: %w", err)
+	}
+	if err := rejectLinksInside(dir); err != nil {
+		return snap, err
+	}
+	if err := verifyMemoryRepo(dir); err != nil {
+		return snap, err
+	}
+	snap.Present = true
+	featuresDir := filepath.Join(dir, "wiki", "features")
+	entries, err := os.ReadDir(featuresDir)
+	if err != nil {
+		return snap, fmt.Errorf("memory: %w", err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			if strings.HasPrefix(e.Name(), ".") {
+				continue
+			}
+			return snap, fmt.Errorf("memory: wiki/features/%s: only feature directories belong here", e.Name())
+		}
+		if err := checkSlug(e.Name()); err != nil {
+			return snap, fmt.Errorf("memory: wiki/features/%s: %w", e.Name(), err)
+		}
+		b, err := os.ReadFile(filepath.Join(featuresDir, e.Name(), "spec.md"))
+		if err != nil {
+			return snap, fmt.Errorf("memory: feature %s: %w", e.Name(), err)
+		}
+		s, err := parseSpec(string(b))
+		if err != nil {
+			return snap, fmt.Errorf("memory: feature %s: %w", e.Name(), err)
+		}
+		if s.Feature != e.Name() {
+			return snap, fmt.Errorf("memory: feature %s: spec declares feature %q", e.Name(), s.Feature)
+		}
+		if s.Approval, err = readApproval(filepath.Join(featuresDir, e.Name(), approvalFile)); err != nil {
+			return snap, fmt.Errorf("memory: feature %s: %w", e.Name(), err)
+		}
+		if s.Implemented, err = readImplementations(filepath.Join(featuresDir, e.Name(), implementedFile)); err != nil {
+			return snap, fmt.Errorf("memory: feature %s: %w", e.Name(), err)
+		}
+		legacyImplementationPaths(dir, &s)
+		snap.Specs = append(snap.Specs, s)
+	}
+	sort.Slice(snap.Specs, func(i, j int) bool { return snap.Specs[i].Feature < snap.Specs[j].Feature })
+	snap.Fingerprint = fingerprint(snap)
+	return snap, nil
+}
+
+// fingerprint hashes what the drift gate uses: presence, and each feature's slug, version and paths.
+func fingerprint(m MemorySnapshot) string {
+	type entry struct {
+		Feature, Version string
+		Paths            []string
+	}
+	v := struct {
+		Present bool
+		Specs   []entry
+	}{Present: m.Present}
+	for _, s := range m.Specs {
+		v.Specs = append(v.Specs, entry{s.Feature, s.Version, s.OwnedPaths()})
+	}
+	b, _ := json.Marshal(v)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// ContractFingerprint is what a run's contract depends on: which code every feature owns, and
+// the declared feature's title, version and text (everything the prompt shows of it). Other features' versions are left out, so recording
+// another outcome does not stop a blocked outcome from resuming.
+func (m MemorySnapshot) ContractFingerprint(declared string) string {
+	type owner struct {
+		Feature string
+		Paths   []string
+	}
+	v := struct {
+		Present          bool
+		Owners           []owner
+		Declared         string
+		DeclaredTitle    string
+		DeclaredVersion  string
+		DeclaredBody     string
+		DeclaredApproved bool
+	}{Present: m.Present, Declared: declared}
+	for _, s := range m.Specs {
+		v.Owners = append(v.Owners, owner{s.Feature, s.OwnedPaths()})
+		if s.Feature == declared {
+			v.DeclaredTitle, v.DeclaredVersion = s.Title, s.Version
+			sum := sha256.Sum256([]byte(s.Body))
+			v.DeclaredBody = hex.EncodeToString(sum[:])
+			v.DeclaredApproved = s.Approved()
+		}
+	}
+	b, _ := json.Marshal(v)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// CreateSpec adds a feature at version 0.1.0 with an empty body for the owner to write.
+func CreateSpec(r Repo, feature, title string, paths []string) (Spec, error) {
+	unlock, err := lockLiveProject(r)
+	if err != nil {
+		return Spec{}, err
+	}
+	defer unlock()
+	snap, err := LoadMemory(r)
+	if err != nil {
+		return Spec{}, err
+	}
+	if !snap.Present {
+		return Spec{}, errors.New("memory is not initialized; run: aeh memory init")
+	}
+	if err := checkSlug(feature); err != nil {
+		return Spec{}, err
+	}
+	if _, ok := snap.Spec(feature); ok {
+		return Spec{}, fmt.Errorf("feature %s already exists", feature)
+	}
+	if err := memoryClean(snap.Dir); err != nil {
+		return Spec{}, err
+	}
+	front := specFront{Feature: feature, Title: strings.TrimSpace(title), Version: "0.1.0", Paths: paths}
+	if err := front.validate(); err != nil {
+		return Spec{}, err
+	}
+	if err := admitWork(r, feature, paths, ""); err != nil {
+		return Spec{}, err
+	}
+	fm, err := yaml.Marshal(front)
+	if err != nil {
+		return Spec{}, err
+	}
+	today := memoryNow().UTC().Format("2006-01-02")
+	text := "---\n" + string(fm) + "---\n# " + front.Title + "\n\n" +
+		specPlaceholder + "\n\n" +
+		"## Changelog\n- 0.1.0 (" + today + ") created; not implemented yet.\n"
+	spec, err := parseSpec(text)
+	if err != nil {
+		return Spec{}, err
+	}
+	w := memoryWrites{}
+	err = w.write(snap.Dir, specRel(feature), []byte(text))
+	if err == nil {
+		err = writeIndexAndLog(snap.Dir, w, "["+today+"] create | "+feature+" 0.1.0")
+	}
+	if err == nil {
+		err = w.commit(snap.Dir, "create "+feature+" 0.1.0")
+	}
+	if err != nil {
+		return Spec{}, w.restore(snap.Dir, err)
+	}
+	return spec, nil
+}
+
+const approvalFile = "approval.yaml"
+
+func approvalRel(feature string) string { return "wiki/features/" + feature + "/" + approvalFile }
+
+func readApproval(p string) (*SpecApproval, error) {
+	b, err := os.ReadFile(p)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return parseApproval(b)
+}
+
+func parseApproval(b []byte) (*SpecApproval, error) {
+	var a SpecApproval
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true)
+	if err := dec.Decode(&a); err != nil {
+		return nil, fmt.Errorf("%s: %w", approvalFile, err)
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%s: must hold exactly one YAML document", approvalFile)
+	}
+	if _, err := parseSemver(a.Version); err != nil {
+		return nil, fmt.Errorf("%s: %w", approvalFile, err)
+	}
+	if !isSHA256Hex(a.Content) {
+		return nil, fmt.Errorf("%s: content_sha256 must be a sha256 in hex", approvalFile)
+	}
+	for i, id := range a.Criteria {
+		if id < 1 || id > a.MaxCriterion || (i > 0 && id <= a.Criteria[i-1]) {
+			return nil, fmt.Errorf("%s: criteria must be positive, sorted, unique and at most max_criterion", approvalFile)
+		}
+	}
+	if a.MaxCriterion < 0 {
+		return nil, fmt.Errorf("%s: max_criterion must not be negative", approvalFile)
+	}
+	if a.DeltaBase != "" && a.DeltaBase != noImplementation && !isSHA256Hex(a.DeltaBase) {
+		return nil, fmt.Errorf("%s: delta_base must be %q or a sha256 in hex", approvalFile, noImplementation)
+	}
+	for i, c := range a.Clarifications {
+		if c.ID < 1 || (i > 0 && c.ID <= a.Clarifications[i-1].ID) || !isSHA256Hex(c.Old) || !isSHA256Hex(c.New) {
+			return nil, fmt.Errorf("%s: clarifications must have sorted, unique positive IDs and sha256 texts", approvalFile)
+		}
+		if !containsInt(a.Criteria, c.ID) {
+			return nil, fmt.Errorf("%s: clarification AC-%d is not an approved criterion", approvalFile, c.ID)
+		}
+	}
+	if err := validateRelocationPairs(a.Relocations); err != nil {
+		return nil, fmt.Errorf("%s: %w", approvalFile, err)
+	}
+	return &a, nil
+}
+
+func containsInt(list []int, n int) bool {
+	for _, x := range list {
+		if x == n {
+			return true
+		}
+	}
+	return false
+}
+
+// clarificationsFor checks the owner's list against the spec: each must be a criterion
+// whose text changed since the last implementation. It binds each to both texts.
+func clarificationsFor(spec Spec, crit []SpecCriterion, ids []int) ([]Clarification, error) {
+	last, ok := spec.LastImplementation()
+	prev := map[int]string{}
+	if ok {
+		for _, c := range last.Criteria {
+			prev[c.ID] = c.Text
+		}
+	}
+	now := map[int]string{}
+	for _, c := range crit {
+		now[c.ID] = c.Text
+	}
+	var out []Clarification
+	seen := map[int]bool{}
+	for _, id := range ids {
+		old, had := prev[id]
+		text, has := now[id]
+		switch {
+		case seen[id]:
+			return nil, fmt.Errorf("AC-%d is listed twice", id)
+		case !had || !has || old == text:
+			return nil, fmt.Errorf("AC-%d is not a changed criterion: a clarification marks a criterion whose text changed since the last implementation", id)
+		}
+		seen[id] = true
+		out = append(out, Clarification{ID: id, Old: criterionDigest(old), New: criterionDigest(text)})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func sameClarifications(a, b []Clarification) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// ownerApprovals returns the versions and contents the owner approved for a feature, oldest
+// first: every memory commit whose approval.yaml matches the spec next to it at the same
+// version. Records carry an approval forward to a bumped spec version, so they never count.
+func ownerApprovals(dir, feature string) ([]SpecApproval, error) {
+	aRel, sRel := approvalRel(feature), specRel(feature)
+	// --full-history: path simplification would skip a side branch whose files a merge did
+	// not keep, hiding an approval that is still in HEAD's history.
+	log, err := git(dir, "log", "--full-history", "--reverse", "--format=%H", "--", aRel, sRel, queueRel(feature))
+	if err != nil {
+		return nil, fmt.Errorf("approval history of %s: %w", feature, err)
+	}
+	var out []SpecApproval
+	for _, sha := range strings.Fields(log) {
+		if b, ok := gitBlob(dir, sha, queueRel(feature)); ok {
+			q, err := parseQueue([]byte(b))
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, q.Approval)
+		}
+		b, ok := gitBlob(dir, sha, aRel)
+		if !ok {
+			continue
+		}
+		a, err := parseApproval([]byte(b))
+		if err != nil || a == nil {
+			continue
+		}
+		text, ok := gitBlob(dir, sha, sRel)
+		if !ok {
+			continue
+		}
+		sp, err := parseSpec(text)
+		if err != nil || sp.Version != a.Version || approvalDigest(sp.Title, sp.Paths, sp.Body, a.Relocations) != a.Content {
+			continue
+		}
+		out = append(out, *a)
+	}
+	return out, nil
+}
+
+// checkApprovalVersion refuses to approve a content under a version the owner already
+// approved with other content, or under a version below one already approved: an approved
+// version is immutable, so a changed spec must raise its version.
+func checkApprovalVersion(dir string, spec Spec, content string) error {
+	history, err := ownerApprovals(dir, spec.Feature)
+	if err != nil {
+		return err
+	}
+	v, err := parseSemver(spec.Version)
+	if err != nil {
+		return err
+	}
+	var high [3]int
+	highText, same := "", false
+	for _, a := range history {
+		n, err := parseSemver(a.Version)
+		if err != nil {
+			continue
+		}
+		if highText == "" || semverLess(high, n) {
+			high, highText, same = n, a.Version, false
+		}
+		if a.Version == highText && a.Content == content {
+			same = true
+		}
+	}
+	switch {
+	case highText == "" || semverLess(high, v):
+		return nil
+	case spec.Version == highText && same:
+		return nil // the newest approved version and content again: only the delta base changes
+	}
+	next, _ := bumpVersion(highText, "patch")
+	return fmt.Errorf("version %s of %s was already approved with other content (highest approved: %s); an approved version never changes. Set version: %s or higher in the spec's front matter, commit it, and approve again",
+		spec.Version, spec.Feature, highText, next)
+}
+
+func semverLess(a, b [3]int) bool {
+	for i := range a {
+		if a[i] != b[i] {
+			return a[i] < b[i]
+		}
+	}
+	return false
+}
+
+// ApproveSpec records the owner's approval of a feature's spec as it reads now, in one memory
+// commit. Approving an unchanged, already approved spec does nothing and returns false.
+func ApproveSpec(r Repo, feature string) (Spec, bool, error) {
+	return ApproveSpecWith(r, feature, ApproveOptions{})
+}
+
+// ApproveSpecWith is ApproveSpec with the owner's clarifications and path relocations.
+func ApproveSpecWith(r Repo, feature string, opt ApproveOptions) (Spec, bool, error) {
+	unlock, err := lockLiveProject(r)
+	if err != nil {
+		return Spec{}, false, err
+	}
+	defer unlock()
+	snap, err := LoadMemory(r)
+	if err != nil {
+		return Spec{}, false, err
+	}
+	if !snap.Present {
+		return Spec{}, false, errors.New("memory is not initialized; run: aeh memory init")
+	}
+	spec, ok := snap.Spec(feature)
+	if !ok {
+		return Spec{}, false, fmt.Errorf("feature %q does not exist in memory", feature)
+	}
+	if err := memoryClean(snap.Dir); err != nil {
+		return Spec{}, false, fmt.Errorf("approve %s: %w; commit your spec edits in the memory repository first", feature, err)
+	}
+	replacing, err := queuedReplacement(snap, spec)
+	if err != nil {
+		return Spec{}, false, err
+	}
+	except := ""
+	if replacing {
+		except = feature
+	}
+	if err := admitWorkExceptQueue(r, feature, spec.Paths, "", except); err != nil {
+		return Spec{}, false, err
+	}
+	// The approved paths are a claim: no other feature or adopted area may own them, and an
+	// adopted feature keeps its area's paths.
+	base, err := approvedPathsBase(snap.Dir, spec)
+	if err != nil {
+		return Spec{}, false, fmt.Errorf("approve %s: %w", feature, err)
+	}
+	if err := checkPathClaim(snap.Dir, snap, feature, spec.Paths, base); err != nil {
+		return Spec{}, false, fmt.Errorf("approve %s: %w", feature, err)
+	}
+	// Criteria are checked before the already-approved shortcut, so an approval never stands
+	// for criteria aeh cannot plan from.
+	crit, ident, err := checkSpecCriteria(snap.Dir, spec)
+	if err != nil {
+		return Spec{}, false, fmt.Errorf("approve %s: acceptance criteria: %w", feature, err)
+	}
+	// The approval digest leaves the version out (records bump it), so the version rule is
+	// checked even for a spec that reads as approved: lowering only the version, or restoring
+	// an old approved pair, must not pass for the newest approval.
+	pairs := opt.Relocations
+	if !opt.SetRelocate && spec.Approved() {
+		pairs = spec.Approval.Relocations
+	}
+	if replacing {
+		queues, err := listQueues(snap.Dir)
+		if err != nil {
+			return Spec{}, false, fmt.Errorf("approve %s queued relocations: %w", feature, err)
+		}
+		for _, q := range queues {
+			if q.Feature == feature {
+				if opt.SetRelocate && approvalDigest(spec.Title, spec.Paths, spec.Body, pairs) != q.Approval.Content {
+					return Spec{}, false, fmt.Errorf("approve %s: collision recovery must keep the queued relocation pairs", feature)
+				}
+				pairs = q.Approval.Relocations
+			}
+		}
+	}
+	if len(pairs) > 0 {
+		cfg, err := r.LoadConfig()
+		if err != nil {
+			return Spec{}, false, fmt.Errorf("approve %s relocations: %w", feature, err)
+		}
+		if err := validateRelocations(snap, spec, cfg, pairs); err != nil {
+			return Spec{}, false, fmt.Errorf("approve %s: %w", feature, err)
+		}
+	}
+	content := approvalDigest(spec.Title, spec.Paths, spec.Body, pairs)
+	if err := checkApprovalVersion(snap.Dir, spec, content); err != nil {
+		return Spec{}, false, fmt.Errorf("approve %s: %w", feature, err)
+	}
+	// A spec whose version moved past its approval (the owner raised only the version, or a
+	// record bumped it) is approved again under its own version, so that version enters
+	// history and its content cannot change later.
+	var clarifications []Clarification
+	if opt.SetClarify {
+		if clarifications, err = clarificationsFor(spec, crit, opt.Clarify); err != nil {
+			return Spec{}, false, fmt.Errorf("approve %s: %w", feature, err)
+		}
+	}
+	if spec.Approved() && spec.Approval.Version == spec.Version && !spec.staleApproval() &&
+		content == spec.Approval.Content &&
+		(!opt.SetClarify || sameClarifications(spec.Approval.Clarifications, clarifications)) {
+		return spec, false, nil
+	}
+	if strings.Contains(spec.Body, specPlaceholder) {
+		return Spec{}, false, fmt.Errorf("approve %s: the spec still has the placeholder text; describe the feature first", feature)
+	}
+	today := memoryNow().UTC().Format("2006-01-02")
+	a := SpecApproval{Version: spec.Version, Content: content, Date: today, MaxCriterion: ident.High, DeltaBase: spec.deltaBase(), Clarifications: clarifications, Relocations: pairs}
+	for _, c := range crit {
+		a.Criteria = append(a.Criteria, c.ID)
+		if c.ID > a.MaxCriterion {
+			a.MaxCriterion = c.ID
+		}
+	}
+	sort.Ints(a.Criteria)
+	if q, err := enqueueApproval(r, snap, spec, a); err != nil {
+		return Spec{}, false, fmt.Errorf("queue approval %s: %w", feature, err)
+	} else if q != nil {
+		spec.Queued = q
+		spec.Approval = &a
+		return spec, true, nil
+	}
+	b, err := yaml.Marshal(a)
+	if err != nil {
+		return Spec{}, false, err
+	}
+	w := memoryWrites{}
+	err = w.write(snap.Dir, approvalRel(feature), b)
+	if err == nil {
+		err = appendLog(snap.Dir, w, "["+today+"] approve | "+feature+" "+spec.Version) // the index does not show approvals
+	}
+	if err == nil {
+		err = w.commit(snap.Dir, "approve "+feature+" "+spec.Version)
+	}
+	if err != nil {
+		return Spec{}, false, w.restore(snap.Dir, err)
+	}
+	spec.Approval = &a
+	return spec, true, nil
+}
+
+// RecordChange writes an accepted change into memory: it bumps the feature's version, adds a
+// changelog line with the verified commit, regenerates the index and appends to the log, in one
+// memory commit. It is idempotent by (outcome, commit): a repeated call returns the first result.
+// An empty expectedFingerprint skips the snapshot check (the owner retrying by hand).
+// The caller must hold the project lock.
+func RecordChange(r Repo, p PendingRecord, expectedFingerprint string) (version, memoryCommit string, err error) {
+	if !validID(p.OutcomeID) {
+		return "", "", fmt.Errorf("record: invalid outcome ID %q", p.OutcomeID)
+	}
+	if !isFullSHA(p.Commit) {
+		return "", "", fmt.Errorf("record %s: commit %q is not a full SHA", p.OutcomeID, p.Commit)
+	}
+	main, err := MainCheckout(r)
+	if err != nil {
+		return "", "", err
+	}
+	r = Repo{Root: main}
+	if s, err := loadState(r, p.OutcomeID); err != nil {
+		return "", "", fmt.Errorf("record %s: load acceptance: %w", p.OutcomeID, err)
+	} else if s.Status == StatusAbandoned {
+		return "", "", fmt.Errorf("record %s: abandoned work cannot be accepted", p.OutcomeID)
+	}
+	note, err := changelogNote(p.Note)
+	if err != nil {
+		return "", "", fmt.Errorf("record %s: %w", p.OutcomeID, err)
+	}
+	dir, err := MemoryDir(r)
+	if err != nil {
+		return "", "", err
+	}
+	snap, err := loadMemoryDir(dir)
+	if err != nil {
+		return "", "", err
+	}
+	if !snap.Present {
+		return "", "", fmt.Errorf("record %s: memory is not initialized", p.OutcomeID)
+	}
+	if err := memoryClean(dir); err != nil {
+		return "", "", fmt.Errorf("record %s: %w", p.OutcomeID, err)
+	}
+	marker := "AEH-Record: " + p.OutcomeID + " " + p.Commit
+	if v, c, ok, err := findRecord(dir, marker); err != nil {
+		return "", "", err
+	} else if ok {
+		return v, c, nil
+	}
+	if expectedFingerprint != "" && snap.Fingerprint != expectedFingerprint {
+		return "", "", fmt.Errorf("record %s: %w", p.OutcomeID, ErrMemoryChanged)
+	}
+	spec, ok := snap.Spec(p.Feature)
+	if !ok {
+		return "", "", fmt.Errorf("record %s: feature %q does not exist in memory", p.OutcomeID, p.Feature)
+	}
+	// The record raises the version past the one that was planned. A pinned plan's spec may
+	// have moved on since (the owner raised the version to approve a newer one): then the
+	// spec keeps its higher version.
+	from := spec.Version
+	var pinned *Spec
+	if p.MemoryBase != "" {
+		ps, err := pinnedSpec(dir, p.MemoryBase, p.Feature)
+		if err != nil {
+			return "", "", fmt.Errorf("record %s: %w", p.OutcomeID, err)
+		}
+		pinned, from = &ps, ps.Version
+	}
+	version, err = bumpVersion(from, p.Change)
+	if err != nil {
+		return "", "", fmt.Errorf("record %s: %w", p.OutcomeID, err)
+	}
+	if cur, _ := parseSemver(spec.Version); semverLess(mustSemver(version), cur) {
+		version = spec.Version
+	}
+	version = belowQueuedTarget(dir, p.Feature, from, version, spec.Version)
+	rel := specRel(p.Feature)
+	full := filepath.Join(dir, filepath.FromSlash(rel))
+	raw, err := os.ReadFile(full)
+	if err != nil {
+		return "", "", err
+	}
+	today := memoryNow().UTC().Format("2006-01-02")
+	short := p.Commit[:7]
+	line := fmt.Sprintf("- %s (%s) %s accepted on %s @ %s: %s\n", version, today, p.OutcomeID, IntegrationBranch(p.OutcomeID), short, note)
+	text, err := setSpecVersion(string(raw), version)
+	if err != nil {
+		return "", "", fmt.Errorf("record %s: %w", p.OutcomeID, err)
+	}
+	if !strings.HasSuffix(text, "\n") {
+		text += "\n"
+	}
+	text += line
+	updated, err := parseSpec(text)
+	if err != nil {
+		return "", "", fmt.Errorf("record %s: updated spec is invalid: %w", p.OutcomeID, err)
+	}
+	if _, _, before := spec.Criteria(); before == nil {
+		// aeh's own changelog line must not make valid criteria unreadable.
+		if _, _, after := updated.Criteria(); after != nil {
+			return "", "", fmt.Errorf("record %s: the changelog line would invalidate the acceptance criteria: %w", p.OutcomeID, after)
+		}
+	}
+	var implemented []byte
+	if p.Implementation != nil {
+		if implemented, err = implementationRecord(dir, spec, pinned, p); err != nil {
+			return "", "", fmt.Errorf("record %s: %w", p.OutcomeID, err)
+		}
+	}
+	w := memoryWrites{}
+	err = w.write(dir, rel, []byte(text))
+	if err == nil && implemented != nil {
+		err = w.write(dir, implementedRel(p.Feature), implemented)
+	}
+	if err == nil && spec.Approved() {
+		// The owner approved the spec as it read before this record; aeh only bumped the
+		// version and appended its own changelog line, so the approval carries forward.
+		a := *spec.Approval
+		a.Content = approvalDigest(updated.Title, updated.Paths, updated.Body, a.Relocations)
+		var b []byte
+		if b, err = yaml.Marshal(a); err == nil {
+			err = w.write(dir, approvalRel(p.Feature), b)
+		}
+	}
+	if err == nil {
+		err = writeIndexAndLog(dir, w, fmt.Sprintf("[%s] record | %s %s | %s @ %s", today, p.Feature, version, p.OutcomeID, short))
+	}
+	if err == nil {
+		err = w.commit(dir, fmt.Sprintf("record %s %s (%s)", p.Feature, version, p.OutcomeID), marker, "AEH-Version: "+version)
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("record %s: %w", p.OutcomeID, w.restore(dir, err))
+	}
+	memoryCommit, err = git(dir, "rev-parse", "HEAD")
+	return version, memoryCommit, err
+}
+
+// implementationRecord checks an implementation against the spec it claims to implement and
+// returns the feature's implementation file with it appended. That spec is the pinned one
+// when the plan was pinned (it must read as the owner approved and planned it there), and
+// otherwise the current one; the criteria must be exactly that spec's.
+func implementationRecord(dir string, spec Spec, pinned *Spec, p PendingRecord) ([]byte, error) {
+	im := *p.Implementation
+	if im.Outcome != p.OutcomeID || im.Code != p.Commit {
+		return nil, errors.New("implementation does not match the recorded outcome and commit")
+	}
+	planned := spec
+	if pinned != nil {
+		planned = *pinned
+	}
+	if !planned.Approved() || planned.Approval.Content != im.Approval {
+		return nil, fmt.Errorf("feature %s no longer reads as the approved spec that was planned", spec.Feature)
+	}
+	if im.SpecVersion != "" && im.SpecVersion != planned.Version {
+		return nil, fmt.Errorf("implementation of %s %s does not match the planned version %s", spec.Feature, im.SpecVersion, planned.Version)
+	}
+	crit, ident, err := checkSpecCriteria(dir, planned)
+	if err != nil {
+		return nil, fmt.Errorf("feature %s: acceptance criteria: %w", spec.Feature, err)
+	}
+	if len(crit) == 0 && (pinned == nil || len(im.Retired) == 0 && !planned.PathsMigrating()) {
+		return nil, fmt.Errorf("feature %s has no acceptance criteria to implement", spec.Feature)
+	}
+	if pinned != nil {
+		// One plan, one predecessor: an implementation recorded after the plan was reserved
+		// (a newer version's run finished first) supersedes this one.
+		if lastCode(spec) != lastCode(*pinned) {
+			return nil, fmt.Errorf("feature %s: another implementation was recorded after this plan was reserved; the plan is superseded", spec.Feature)
+		}
+		// Numbers approved since the pin stay retired or reserved: the high-water mark is the
+		// higher of both histories.
+		now, err := loadCriteriaIdentity(dir, spec)
+		if err != nil {
+			return nil, fmt.Errorf("feature %s: acceptance criteria: %w", spec.Feature, err)
+		}
+		ident.High = max(ident.High, now.High)
+	}
+	sort.Slice(crit, func(i, j int) bool { return crit[i].ID < crit[j].ID })
+	if len(crit) != len(im.Criteria) {
+		return nil, fmt.Errorf("implementation lists %d criteria; the approved spec has %d", len(im.Criteria), len(crit))
+	}
+	for i, c := range crit {
+		if im.Criteria[i].ID != c.ID || im.Criteria[i].Text != c.Text {
+			return nil, fmt.Errorf("implementation criterion %d differs from the approved AC-%d", im.Criteria[i].ID, c.ID)
+		}
+	}
+	im.MaxCriterion = ident.High
+	im.Paths = append([]string(nil), planned.Paths...)
+	if len(crit) > 0 && crit[len(crit)-1].ID > im.MaxCriterion {
+		im.MaxCriterion = crit[len(crit)-1].ID
+	}
+	if err := im.validate(); err != nil {
+		return nil, fmt.Errorf("implementation: %w", err)
+	}
+	return yaml.Marshal(append(append([]Implementation{}, spec.Implemented...), im))
+}
+
+// findRecord looks for an earlier memory commit with the same record marker.
+func findRecord(dir, marker string) (version, commit string, ok bool, err error) {
+	out, err := git(dir, "log", "--fixed-strings", "--grep="+marker, "--format=%H%x00%B%x01")
+	if err != nil {
+		return "", "", false, fmt.Errorf("memory log: %w", err)
+	}
+	for _, rec := range strings.Split(out, "\x01") {
+		sha, body, found := strings.Cut(strings.TrimSpace(rec), "\x00")
+		if !found {
+			continue
+		}
+		var v string
+		match := false
+		for _, l := range strings.Split(body, "\n") {
+			l = strings.TrimSpace(l)
+			if l == marker {
+				match = true
+			}
+			if after, ok := strings.CutPrefix(l, "AEH-Version: "); ok {
+				v = after
+			}
+		}
+		if match {
+			return v, sha, true, nil
+		}
+	}
+	return "", "", false, nil
+}
+
+// Pending records live next to the outcome state, so `aeh memory record <ID>` can retry them.
+// They are kept out of the state directory, which holds only outcome states.
+func pendingDir(r Repo) string             { return filepath.Join(r.Root, ".aeh", "pending") }
+func pendingPath(r Repo, id string) string { return filepath.Join(pendingDir(r), id+".json") }
+
+// SavePending stores a record that still has to reach memory.
+func SavePending(r Repo, p PendingRecord) error {
+	if !validID(p.OutcomeID) {
+		return fmt.Errorf("pending record: invalid outcome ID %q", p.OutcomeID)
+	}
+	return writePrivateJSON(pendingPath(r, p.OutcomeID), p)
+}
+
+// LoadPending returns the pending record of an outcome, if any.
+func LoadPending(r Repo, id string) (PendingRecord, bool, error) {
+	if !validID(id) {
+		return PendingRecord{}, false, fmt.Errorf("invalid outcome ID %q", id)
+	}
+	b, err := os.ReadFile(pendingPath(r, id))
+	if errors.Is(err, os.ErrNotExist) {
+		return PendingRecord{}, false, nil
+	}
+	if err != nil {
+		return PendingRecord{}, false, err
+	}
+	var p PendingRecord
+	if err := json.Unmarshal(b, &p); err != nil {
+		return p, false, fmt.Errorf("pending record %s: %w", id, err)
+	}
+	if p.OutcomeID != id {
+		return p, false, fmt.Errorf("pending record for %q has ID %q", id, p.OutcomeID)
+	}
+	return p, true, nil
+}
+
+// ClearPending removes the pending record of an outcome.
+func ClearPending(r Repo, id string) error {
+	if !validID(id) {
+		return fmt.Errorf("invalid outcome ID %q", id)
+	}
+	err := os.Remove(pendingPath(r, id))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+// ListPending returns every pending record of this checkout.
+func ListPending(r Repo) ([]PendingRecord, error) {
+	matches, err := filepath.Glob(filepath.Join(pendingDir(r), "*.json"))
+	if err != nil {
+		return nil, err
+	}
+	var out []PendingRecord
+	for _, m := range matches {
+		id := strings.TrimSuffix(filepath.Base(m), ".json")
+		p, ok, err := LoadPending(r, id)
+		if err != nil {
+			return out, err
+		}
+		if ok {
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
+
+// RecordPending retries the pending record of an outcome by hand. The owner asked for it, so the
+// snapshot check is skipped; the record stays idempotent.
+func RecordPending(r Repo, id string) (version, memoryCommit string, err error) {
+	main, err := MainCheckout(r)
+	if err != nil {
+		return "", "", err
+	}
+	r = Repo{Root: main}
+	unlock, err := lockLiveProject(r)
+	if err != nil {
+		return "", "", err
+	}
+	defer unlock()
+	p, ok, err := LoadPending(r, id)
+	if err != nil {
+		return "", "", err
+	}
+	if !ok {
+		return "", "", fmt.Errorf("no pending memory record for %s", id)
+	}
+	version, memoryCommit, err = RecordChange(r, p, "")
+	if err != nil {
+		return "", "", err
+	}
+	s, err := loadState(r, id)
+	if err != nil {
+		return "", "", err
+	}
+	s.Status, s.MemoryVersion, s.MemoryCommit, s.MemoryError = StatusAccepted, version, memoryCommit, ""
+	if err := saveState(r, &s); err != nil {
+		return "", "", err
+	}
+	if err := ClearPending(r, id); err != nil {
+		return "", "", err
+	}
+	if err := reconcileQueues(r); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: reconcile queues after recording: %v\n", err)
+	}
+	return version, memoryCommit, nil
+}
+
+// MemoryStatus summarizes memory for `aeh memory status`.
+type MemoryStatus struct {
+	Dir     string
+	Present bool
+	Dirty   string // git status of the memory repository; empty when clean
+	Specs   []Spec
+	Pending []PendingRecord
+	Work    []PendingWork
+	Queues  []QueuedApproval
+	Errors  []string // recovery/queue errors; readers can still inspect the memory and registry
+	// Revisions maps each feature with a pending revision (spec.next.md) to its session.
+	Revisions map[string]string
+}
+
+func ReadMemoryStatus(r Repo) (MemoryStatus, error) {
+	main, err := MainCheckout(r)
+	if err != nil {
+		return MemoryStatus{}, err
+	}
+	r = Repo{Root: main}
+	unlock, recovery, err := lockLiveProjectMode(r, true)
+	if err != nil {
+		return MemoryStatus{}, err
+	}
+	defer unlock()
+	snap, err := LoadMemory(r)
+	st := MemoryStatus{Dir: snap.Dir, Present: snap.Present, Specs: snap.Specs, Queues: recovery.Queues, Errors: recovery.Errors}
+	if err != nil {
+		return st, err
+	}
+	if snap.Present {
+		st.Dirty, err = git(snap.Dir, "status", "--porcelain", "--untracked-files=all")
+		if err != nil {
+			return st, err
+		}
+	}
+	st.Pending, err = ListPending(r)
+	if err != nil {
+		return st, err
+	}
+	st.Work, err = pendingWork(r)
+	if err != nil {
+		return st, err
+	}
+	if snap.Present {
+		st.Revisions, err = PendingRevisions(r)
+	}
+	return st, err
+}
+
+// LastAccepted returns the newest "accepted on" changelog entry of a spec, or "".
+func LastAccepted(s Spec) string {
+	last := ""
+	for _, l := range strings.Split(s.Body, "\n") {
+		if m := acceptedLine.FindStringSubmatch(l); m != nil {
+			last = fmt.Sprintf("%s @ %s (%s)", m[3], m[5], m[2])
+		}
+	}
+	return last
+}
+
+var acceptedLine = regexp.MustCompile(`^- (\S+) \((\d{4}-\d{2}-\d{2})\) (\S+) accepted on (\S+) @ ([0-9a-f]+):`)
+
+// LintMemory checks memory and its privacy settings. Errors make memory unusable; warnings do not.
+func LintMemory(r Repo) (errs, warnings []string, err error) {
+	unlock, recovery, err := lockLiveProjectMode(r, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer unlock()
+	errs = append(errs, recovery.Errors...)
+	for _, q := range recovery.Queues {
+		if q.ActivationWaiting != "" {
+			warnings = append(warnings, fmt.Sprintf("queued approval %s %s: activation waiting: %s", q.Feature, q.Approval.Version, q.ActivationWaiting))
+		}
+	}
+	main, err := MainCheckout(r)
+	if err != nil {
+		return nil, nil, err
+	}
+	if perr := checkProjectPrivacy(main); perr != nil {
+		errs = append(errs, perr.Error())
+	}
+	snap, lerr := LoadMemory(r)
+	if lerr != nil {
+		return append(errs, lerr.Error()), warnings, nil
+	}
+	if !snap.Present {
+		return append(errs, "memory is not initialized; run: aeh memory init"), warnings, nil
+	}
+	if dirty, _ := git(snap.Dir, "status", "--porcelain", "--untracked-files=all"); dirty != "" {
+		warnings = append(warnings, "memory has uncommitted changes; aeh will not record until they are committed:\n"+dirty)
+	}
+	for i, a := range snap.Specs {
+		for _, b := range snap.Specs[i+1:] {
+			if pathsOverlap(a.OwnedPaths(), b.OwnedPaths()) {
+				warnings = append(warnings, fmt.Sprintf("features %s and %s claim overlapping paths; a change there fails the drift gate", a.Feature, b.Feature))
+			}
+		}
+	}
+	for _, s := range snap.Specs {
+		if _, _, cerr := checkSpecCriteria(snap.Dir, s); cerr != nil {
+			errs = append(errs, fmt.Sprintf("feature %s: acceptance criteria: %v", s.Feature, cerr))
+		}
+		if s.Approval != nil && !s.Approved() {
+			warnings = append(warnings, fmt.Sprintf("feature %s was edited after its approval of %s; approve it again with: aeh memory approve %s", s.Feature, s.Approval.Version, s.Feature))
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(snap.Dir, "wiki", "index.md")); err != nil || string(b) != renderIndex(snap.Specs) {
+		warnings = append(warnings, "wiki/index.md is out of date; aeh regenerates it on the next write")
+	}
+	return errs, warnings, nil
+}
+
+func pathsOverlap(a, b []string) bool {
+	base := func(p string) string {
+		p = strings.TrimPrefix(strings.ReplaceAll(p, "\\", "/"), "./")
+		if i := strings.IndexAny(p, "*?["); i >= 0 {
+			p = p[:i]
+		}
+		return strings.TrimSuffix(p, "/")
+	}
+	for _, pa := range a {
+		for _, pb := range b {
+			ba, bb := base(pa), base(pb)
+			if ba == "" || bb == "" || matchAny(ba, []string{pb}) || matchAny(bb, []string{pa}) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// --- spec format ---
+
+type specFront struct {
+	Feature string   `yaml:"feature"`
+	Title   string   `yaml:"title"`
+	Version string   `yaml:"version"`
+	Paths   []string `yaml:"paths,flow"`
+}
+
+func (f specFront) validate() error {
+	if err := checkSlug(f.Feature); err != nil {
+		return err
+	}
+	if f.Title == "" || strings.ContainsAny(f.Title, "\r\n") || len(f.Title) > 120 {
+		return errors.New("title must be one line of 1 to 120 characters")
+	}
+	if _, err := parseSemver(f.Version); err != nil {
+		return err
+	}
+	if len(f.Paths) == 0 {
+		return errors.New("paths must name at least one path the feature owns")
+	}
+	for _, p := range f.Paths {
+		if err := checkSpecPath(p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func parseSpec(text string) (Spec, error) {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	rest, ok := strings.CutPrefix(text, "---\n")
+	if !ok {
+		return Spec{}, errors.New("spec must start with a --- frontmatter block")
+	}
+	fm, body, ok := strings.Cut(rest, "\n---\n")
+	if !ok {
+		return Spec{}, errors.New("spec frontmatter is not closed with ---")
+	}
+	var f specFront
+	dec := yaml.NewDecoder(strings.NewReader(fm))
+	dec.KnownFields(true)
+	if err := dec.Decode(&f); err != nil {
+		return Spec{}, fmt.Errorf("spec frontmatter: %w", err)
+	}
+	if err := f.validate(); err != nil {
+		return Spec{}, err
+	}
+	if err := checkChangelog(body); err != nil {
+		return Spec{}, err
+	}
+	return Spec{Feature: f.Feature, Title: f.Title, Version: f.Version, Paths: f.Paths, Body: body}, nil
+}
+
+// checkChangelog requires "## Changelog" as the last second-level heading, so records append at the end.
+func checkChangelog(body string) error {
+	if last, _ := lastHeading(body); last != "## Changelog" {
+		return errors.New(`spec must end with a "## Changelog" section`)
+	}
+	return nil
+}
+
+// setSpecVersion replaces the version line inside the frontmatter and nothing else.
+func setSpecVersion(text, version string) (string, error) {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	lines := strings.Split(text, "\n")
+	if len(lines) == 0 || lines[0] != "---" {
+		return "", errors.New("spec has no frontmatter")
+	}
+	for i := 1; i < len(lines); i++ {
+		if lines[i] == "---" {
+			break
+		}
+		if strings.HasPrefix(lines[i], "version:") {
+			lines[i] = "version: " + version
+			return strings.Join(lines, "\n"), nil
+		}
+	}
+	return "", errors.New("spec frontmatter has no version line")
+}
+
+var slugPattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+
+// checkSlug accepts names that are safe directory names on every platform.
+func checkSlug(s string) error {
+	if len(s) > 64 || !slugPattern.MatchString(s) {
+		return fmt.Errorf("feature %q must be lowercase letters, digits and single hyphens (at most 64)", s)
+	}
+	switch s {
+	case "con", "prn", "aux", "nul":
+		return fmt.Errorf("feature %q is a reserved name on Windows", s)
+	}
+	if len(s) == 4 && (strings.HasPrefix(s, "com") || strings.HasPrefix(s, "lpt")) && s[3] >= '0' && s[3] <= '9' {
+		return fmt.Errorf("feature %q is a reserved name on Windows", s)
+	}
+	return nil
+}
+
+// checkSpecPath accepts repository-relative patterns outside AEH's own directories.
+func checkSpecPath(p string) error {
+	q := strings.TrimPrefix(strings.ReplaceAll(strings.TrimSpace(p), "\\", "/"), "./")
+	switch {
+	case q == "" || q == "**" || q == "*":
+		return fmt.Errorf("path %q would claim the whole repository", p)
+	case strings.HasPrefix(q, "/") || strings.Contains(q, ":"):
+		return fmt.Errorf("path %q must be relative to the repository", p)
+	case q == ".." || strings.HasPrefix(q, "../") || strings.Contains(q, "/../"):
+		return fmt.Errorf("path %q leaves the repository", p)
+	}
+	low := strings.ToLower(q)
+	for _, own := range []string{".git", ".aeh", "aeh"} {
+		if low == own || strings.HasPrefix(low, own+"/") {
+			return fmt.Errorf("path %q is inside %s/, which no feature owns", p, own)
+		}
+	}
+	if _, err := path.Match(q, ""); err != nil {
+		return fmt.Errorf("path %q: %w", p, err)
+	}
+	return nil
+}
+
+func parseSemver(v string) ([3]int, error) {
+	var n [3]int
+	parts := strings.Split(v, ".")
+	if len(parts) != 3 {
+		return n, fmt.Errorf("version %q must be MAJOR.MINOR.PATCH", v)
+	}
+	for i, p := range parts {
+		if p == "" || len(p) > 1 && p[0] == '0' || strings.Trim(p, "0123456789") != "" {
+			return n, fmt.Errorf("version %q must be MAJOR.MINOR.PATCH", v)
+		}
+		x, err := strconv.Atoi(p)
+		if err != nil || x < 0 {
+			return n, fmt.Errorf("version %q must be MAJOR.MINOR.PATCH", v)
+		}
+		n[i] = x
+	}
+	return n, nil
+}
+
+// lastCode is the commit of the feature's last implementation, or "".
+func lastCode(s Spec) string {
+	im, _ := s.LastImplementation()
+	return im.Code
+}
+
+// mustSemver parses a version aeh itself produced.
+func mustSemver(v string) [3]int {
+	n, _ := parseSemver(v)
+	return n
+}
+
+func bumpVersion(v, change string) (string, error) {
+	n, err := parseSemver(v)
+	if err != nil {
+		return "", err
+	}
+	switch change {
+	case "patch":
+		n[2]++
+	case "minor":
+		n[1], n[2] = n[1]+1, 0
+	case "major":
+		n[0], n[1], n[2] = n[0]+1, 0, 0
+	default:
+		return "", fmt.Errorf("change %q must be patch, minor or major", change)
+	}
+	return fmt.Sprintf("%d.%d.%d", n[0], n[1], n[2]), nil
+}
+
+func changelogNote(s string) (string, error) {
+	s = strings.Join(strings.Fields(s), " ")
+	if s == "" {
+		return "", errors.New("a changelog note is required")
+	}
+	if len(s) > 200 {
+		return "", errors.New("the changelog note must be at most 200 characters")
+	}
+	return s, nil
+}
+
+func isFullSHA(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+const specPlaceholder = "Describe the behavior, acceptance criteria, data and risks of this feature."
+
+func specRel(feature string) string { return "wiki/features/" + feature + "/spec.md" }
+
+// --- files and git ---
+
+func renderIndex(specs []Spec) string {
+	var b strings.Builder
+	b.WriteString("# Index\n\nGenerated by aeh. Do not edit by hand.\n\n")
+	if len(specs) == 0 {
+		b.WriteString("No features yet. Create one with: aeh memory new <feature> --title \"...\" --paths src/feature/**\n")
+		return b.String()
+	}
+	b.WriteString("| Feature | Title | Version | Last accepted |\n| --- | --- | --- | --- |\n")
+	for _, s := range specs {
+		last := LastAccepted(s)
+		if last == "" {
+			last = "not implemented yet"
+		}
+		fmt.Fprintf(&b, "| [%s](features/%s/spec.md) | %s | %s | %s |\n", s.Feature, s.Feature,
+			strings.ReplaceAll(s.Title, "|", `\|`), s.Version, last)
+	}
+	return b.String()
+}
+
+func writeIndexAndLog(dir string, w memoryWrites, logEntry string) error {
+	snap, err := loadMemoryDir(dir)
+	if err != nil {
+		return err
+	}
+	if err := w.write(dir, "wiki/index.md", []byte(renderIndex(snap.Specs))); err != nil {
+		return err
+	}
+	return appendLog(dir, w, logEntry)
+}
+
+// appendLog adds one entry to wiki/log.md.
+func appendLog(dir string, w memoryWrites, logEntry string) error {
+	logPath := filepath.Join(dir, "wiki", "log.md")
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		return err
+	}
+	if len(b) > 0 && !bytes.HasSuffix(b, []byte("\n")) {
+		b = append(b, '\n')
+	}
+	b = append(b, []byte("\n## "+logEntry+"\n")...)
+	return w.write(dir, "wiki/log.md", b)
+}
+
+// commit stages exactly the files this command wrote, after checking nobody changed them.
+func (w memoryWrites) commit(dir, subject string, trailers ...string) error {
+	return w.commitWith(dir, nil, subject, trailers...)
+}
+
+// commitWith also commits the deletion of removed, files this command deleted.
+func (w memoryWrites) commitWith(dir string, removed []string, subject string, trailers ...string) error {
+	files := make([]string, 0, len(w)+len(removed))
+	for _, rel := range removed {
+		if _, err := os.Lstat(filepath.Join(dir, filepath.FromSlash(rel))); !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("memory commit: %s reappeared while aeh was removing it", rel)
+		}
+		files = append(files, rel)
+	}
+	for rel, wrote := range w {
+		if now, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(rel))); err != nil || !bytes.Equal(now, wrote) {
+			return fmt.Errorf("memory commit: %s changed while aeh was writing it", rel)
+		}
+		files = append(files, rel)
+	}
+	sort.Strings(files)
+	return commitMemory(dir, files, subject, trailers...)
+}
+
+func commitMemory(dir string, files []string, subject string, trailers ...string) error {
+	if _, err := git(dir, append([]string{"add", "--"}, files...)...); err != nil {
+		return fmt.Errorf("memory commit: %w", err)
+	}
+	// With paths, commit records only those paths: anything else staged in the shared
+	// index (for example by the owner) stays staged and out of this commit.
+	args := append(append([]string{}, memoryGitIdentity...), "commit", "-q", "--no-verify", "-m", subject)
+	if len(trailers) > 0 {
+		args = append(args, "-m", strings.Join(trailers, "\n"))
+	}
+	args = append(append(args, "--"), files...)
+	if _, err := git(dir, args...); err != nil {
+		return fmt.Errorf("memory commit: %w", err)
+	}
+	if files[0] == "." {
+		return nil
+	}
+	// NUL-separated, so Git never quotes a name and the comparison is byte for byte.
+	changed, err := git(dir, "diff-tree", "-z", "--no-commit-id", "--name-only", "-r", "--root", "HEAD")
+	if err != nil {
+		return fmt.Errorf("memory commit: %w", err)
+	}
+	got := strings.Split(strings.TrimRight(changed, "\x00"), "\x00")
+	sort.Strings(got)
+	want := append([]string{}, files...)
+	sort.Strings(want)
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		return fmt.Errorf("memory commit: HEAD changed %v, expected exactly %v; check the memory repository", got, want)
+	}
+	return nil
+}
+
+// memoryWrites remembers what this command wrote, so a rollback touches only its own work.
+type memoryWrites map[string][]byte
+
+// write replaces a file only while it still matches HEAD (memory was clean when the command
+// started), so an edit saved in the meantime is never overwritten.
+func (w memoryWrites) write(dir, rel string, b []byte) error {
+	full := filepath.Join(dir, filepath.FromSlash(rel))
+	if _, mine := w[rel]; !mine {
+		if err := unchangedSinceHead(dir, rel); err != nil {
+			return err
+		}
+	}
+	if err := memoryWriteFile(full, b); err != nil {
+		if _, statErr := os.Lstat(full); errors.Is(statErr, os.ErrNotExist) {
+			_ = os.Remove(filepath.Dir(full)) // only succeeds when empty, e.g. a new feature directory
+		}
+		return err
+	}
+	w[rel] = b
+	return nil
+}
+
+func unchangedSinceHead(dir, rel string) error {
+	full := filepath.Join(dir, filepath.FromSlash(rel))
+	headBlob, inHead := git(dir, "rev-parse", "--verify", "--quiet", "HEAD:"+rel)
+	_, statErr := os.Lstat(full)
+	switch {
+	case inHead != nil && errors.Is(statErr, os.ErrNotExist):
+		return nil
+	case inHead != nil:
+		return fmt.Errorf("memory write: %s appeared while aeh was writing; nothing was overwritten", rel)
+	case statErr != nil:
+		return fmt.Errorf("memory write: %s: %w", rel, statErr)
+	}
+	disk, err := git(dir, "hash-object", "--", rel)
+	if err != nil {
+		return fmt.Errorf("memory write: %w", err)
+	}
+	if disk != headBlob {
+		return fmt.Errorf("memory write: %s changed while aeh was writing; nothing was overwritten", rel)
+	}
+	return nil
+}
+
+// restore undoes this command's uncommitted writes. A file whose content is no longer what
+// this command wrote was edited by someone else meanwhile: it is kept and reported.
+func (w memoryWrites) restore(dir string, cause error) error {
+	var kept []string
+	for rel, wrote := range w {
+		full := filepath.Join(dir, filepath.FromSlash(rel))
+		if now, err := os.ReadFile(full); err != nil || !bytes.Equal(now, wrote) {
+			kept = append(kept, rel)
+			continue
+		}
+		_, _ = git(dir, "reset", "-q", "HEAD", "--", rel)
+		if _, err := git(dir, "cat-file", "-e", "HEAD:"+rel); err == nil {
+			_, _ = git(dir, "checkout", "-q", "HEAD", "--", rel)
+		} else {
+			_ = os.Remove(full)
+			_ = os.Remove(filepath.Dir(full)) // only succeeds when empty, e.g. a new feature directory
+		}
+	}
+	if len(kept) > 0 {
+		sort.Strings(kept)
+		return fmt.Errorf("%w; these files changed during the write and were left as they are, check them by hand: %s", cause, strings.Join(kept, ", "))
+	}
+	return cause
+}
+
+func memoryClean(dir string) error {
+	// assume-unchanged (lowercase tag) and skip-worktree (S) hide edits from status.
+	flags, err := git(dir, "ls-files", "-v")
+	if err != nil {
+		return fmt.Errorf("memory status: %w", err)
+	}
+	for _, line := range strings.Split(flags, "\n") {
+		if line != "" && (line[0] == 'S' || line[0] >= 'a' && line[0] <= 'z') {
+			return fmt.Errorf("%w: an index flag hides changes to %s; clear it with git update-index --no-assume-unchanged --no-skip-worktree", ErrMemoryDirty, line[2:])
+		}
+	}
+	// Refreshing the index exits nonzero when a tracked file changed; status reports that below.
+	_, _ = git(dir, "update-index", "-q", "--really-refresh")
+	out, err := git(dir, "status", "--porcelain", "--untracked-files=all")
+	if err != nil {
+		return fmt.Errorf("memory status: %w", err)
+	}
+	if out != "" {
+		return fmt.Errorf("%w (commit or discard them in %s):\n%s", ErrMemoryDirty, dir, out)
+	}
+	return nil
+}
+
+// verifyMemoryRepo checks that dir is its own repository and has no remote.
+func verifyMemoryRepo(dir string) error {
+	// Checked before Git runs: a .git file or .git/commondir would point Git at another repository.
+	gitPath := filepath.Join(dir, ".git")
+	if fi, err := os.Lstat(gitPath); err != nil || !fi.IsDir() {
+		return fmt.Errorf("memory: %s must be a plain .git directory", gitPath)
+	}
+	if _, err := os.Lstat(filepath.Join(gitPath, "commondir")); !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("memory: %s has a commondir file; memory must not share another repository's Git data", gitPath)
+	}
+	common, err := git(dir, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return fmt.Errorf("memory: %w", err)
+	}
+	if !samePath(common, gitPath) {
+		return fmt.Errorf("memory: Git data resolves to %s, not %s", common, gitPath)
+	}
+	top, err := git(dir, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return fmt.Errorf("memory: %w", err)
+	}
+	if !samePath(top, dir) {
+		return fmt.Errorf("memory: %s is not its own Git repository (found %s); run: aeh memory init", dir, top)
+	}
+	gitDir, err := git(dir, "rev-parse", "--absolute-git-dir")
+	if err != nil {
+		return fmt.Errorf("memory: %w", err)
+	}
+	if !samePath(gitDir, filepath.Join(dir, ".git")) {
+		return fmt.Errorf("memory: %s must keep its Git data in its own .git directory", dir)
+	}
+	remotes, err := git(dir, "remote")
+	if err != nil {
+		return fmt.Errorf("memory: %w", err)
+	}
+	if remotes != "" {
+		return fmt.Errorf("memory: repository has remotes (%s); memory is local by default, remove them or keep a private backup outside aeh",
+			strings.ReplaceAll(remotes, "\n", ", "))
+	}
+	return nil
+}
+
+// checkProjectPrivacy requires .aeh/ to be ignored and untracked in the project.
+func checkProjectPrivacy(main string) error {
+	// icase: on Windows and macOS, .AEH/ names the same files as .aeh/.
+	tracked, err := git(main, "ls-files", "--", ":(icase).aeh")
+	if err != nil {
+		return fmt.Errorf("memory privacy: %w", err)
+	}
+	if tracked != "" {
+		return fmt.Errorf("memory privacy: the project tracks files under .aeh/; untrack them (git rm -r --cached .aeh) before using memory")
+	}
+	// The directory itself must be ignored: then Git never descends into it and no rule
+	// inside can re-include a file. A probe below it guards against odd patterns.
+	for _, probe := range []string{".aeh/", ".aeh/memory/wiki/features/probe/spec.md", ".aeh/pending/probe.json"} {
+		if _, err := git(main, "check-ignore", "-q", "--no-index", probe); err != nil {
+			return errors.New("memory privacy: the .aeh/ directory is not ignored by the project; add \".aeh/\" to .gitignore (aeh init does)")
+		}
+	}
+	return nil
+}
+
+// rejectLinksInside walks memory, its .git included, and fails on any link or reparse point,
+// so no Git command or write can be redirected outside the memory directory.
+func rejectLinksInside(dir string) error {
+	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := os.Lstat(p)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+			return fmt.Errorf("memory: %s is a link or reparse point; memory must contain only plain files", p)
+		}
+		return nil
+	})
+}
+
+func writeFileAtomic(p string, b []byte) error {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".aeh-tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	_, werr := tmp.Write(b)
+	if err := errors.Join(werr, tmp.Close()); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), p)
+}
+
+const memorySchema = `# Memory schema
+
+This is the product memory of the project: a local wiki with its own Git repository and no
+remote. aeh created it in .aeh/memory/ of the main checkout. The project ignores .aeh/, so
+aeh never publishes it. A private backup is the owner's choice.
+
+## Layout
+
+- wiki/index.md: generated by aeh; one row per feature with its version and last accepted change.
+- wiki/log.md: append-only; one "## [date] operation | subject" entry per change.
+- wiki/features/<feature>/spec.md: one spec per feature.
+- wiki/features/<feature>/approval.yaml: written by "aeh memory approve <feature>"; the owner
+  approved the spec's title, paths and text as they read then. Editing any of them by hand voids
+  the approval. Recording an accepted change carries a valid approval forward in the same commit.
+- wiki/features/<feature>/implemented.yaml: written by aeh when an outcome generated from an
+  approved spec is accepted: the approved content, the accepted commit, and each criterion with
+  its sealed tests. Never edit it.
+
+## Spec format
+
+    ---
+    feature: checkout              # the directory name: a-z, 0-9 and hyphens
+    title: Checkout
+    version: 1.3.1                 # MAJOR.MINOR.PATCH
+    paths: [src/checkout/**]       # code this feature owns
+    ---
+    # Checkout
+    Behavior, data and risks.
+
+    ## Acceptance criteria
+    - AC-1: Given a cart with items, when the user pays, then one order is created.
+    - AC-2: Given a failed payment, when the user retries, then no second charge is made.
+
+    ## Changelog
+    - 1.3.1 (2026-11-13) OUT-007 accepted on aeh/OUT-007 @ a1b2c3d: Pay button reads "Confirm payment".
+
+"## Changelog" must be the last section. A changelog entry records the verified branch and
+commit; it does not mean the change was merged.
+
+Acceptance criteria are what aeh plans and tests from. The section starts at the column-0
+heading "## Acceptance criteria" and holds only lines "- AC-<n>: <text>" and blank lines; put
+prose before the heading. A changed criterion keeps its number; a new one takes a number above
+every number used before; a number removed in an approved version is never reused. In a spec
+with criteria, fences start at column 0, "<" appears only inside fences, and "AC-<n>:" only
+in the section.
+
+## Rules
+
+- aeh writes version bumps, changelog entries, index.md and log.md after a change is accepted.
+- The owner may edit spec text and paths by hand, then commit here (git commit -am "...").
+  aeh refuses to record on top of uncommitted changes.
+- Agents never write here; they receive the spec of the declared feature inside their prompt.
+`

@@ -1,0 +1,221 @@
+package aeh
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+const configTemplate = `# AEH constitution for this project. Committed with the code.
+project: my-project
+
+# The only thing AEH knows about your stack: how to build (lint included) and test it.
+commands:
+  build: ""            # e.g. "dotnet build -warnaserror" or "npm run build && npm run lint"
+  test: "echo set commands.test && exit 1"   # e.g. "dotnet test" or "npm test"
+  # Required for aeh plan: run only the repository-relative test paths in the manifest.
+  # acceptance: 'node scripts/acceptance.js --manifest "{{manifest}}"'
+  timeout_minutes: 20
+
+# Agents and build/test commands inherit only OS and tool-discovery variables
+# (PATH, HOME, TEMP...). List any other variable names they need, e.g. JAVA_HOME.
+pass_env: []
+
+# Paths no agent may modify. aeh/ and each outcome's acceptance tests are always protected.
+protected: []
+
+limits:
+  max_diff_lines: 400  # per task, unless the task sets its own
+
+# Escalation order. A task starts at the first profile (or its own "start"),
+# retries once with feedback, then tries the next profile, then blocks.
+ladder: [medio, fuerte]
+
+# Plan author settings. Empty ladder uses the main ladder; limits include plan.yaml.
+# plan:
+#   ladder: []
+#   acceptance_dir: tests/acceptance
+#   max_diff_lines: 400
+#   max_files: 20
+#   max_bytes: 262144
+
+# Triage classifies each outcome before any agent runs. The route decides who reviews:
+#   trivial -> qa;  change and new -> qa + security.  Rules may raise the route or add
+# reviewers (never lower or remove them). Without a triage profile and without a route
+# declared in the outcome, the route is "change". If triage fails, the route is "new".
+triage:
+  profile: codex-review
+  # Example rules; adjust the paths to where this project keeps its data model and auth.
+  # "**" matches any number of directories; a match on a directory covers everything below.
+  rules:
+    - name: data
+      paths: ["**/migrations", "**/*.sql", "db"]
+      route: new
+      reviewers: [dba]
+    - name: auth
+      paths: ["**/auth", "**/security"]
+      route: new
+      reviewers: [security]
+
+# Reviewer profiles per role, in order of preference. For each review aeh takes the first
+# profile that is independent from the author of the change. Reviewers need plain-text output.
+reviewers:
+  independence: provider   # provider: another provider than the author; profile: any other profile
+  qa: [claude-review, codex-review]
+  security: [codex-review, claude-review]
+  dba: [claude-review, codex-review]
+
+notify:
+  webhook: ""          # POST {event, outcome, title, message} when an outcome blocks or is accepted
+
+# Optional sandbox: build, test and acceptance commands run in a local Docker container with
+# no network, no credentials and no Git metadata (see docs/sandbox.md in the AEH repository).
+# Commands must then be POSIX shell commands, and dependencies must be inside the image.
+# Check it with: aeh sandbox check
+# sandbox:
+#   image: "sha256:<image id>"   # a local image, pinned by ID or name@sha256:<digest>; aeh never pulls
+#   memory: 4g
+#   cpus: 2
+#   gate_env: {}                 # literal, non-secret variables for gate commands
+
+# How each agent is launched. provider is a free name used to keep reviewers independent
+# from authors; transport is "cli" (an "api" transport is planned, not available yet).
+# {{prompt}} is replaced with the prompt text, {{prompt_file}} with a file holding it;
+# set stdin: true to pipe it instead. Check the flags against the CLI version you have installed.
+# Discovery runs agents in an output directory that is not a Git repository; Codex refuses
+# such a directory unless --skip-git-repo-check is given. aeh always chooses the directory.
+profiles:
+  medio:
+    provider: openai
+    command: ["codex", "exec", "--skip-git-repo-check", "--sandbox", "workspace-write", "-"]
+    stdin: true
+    timeout_minutes: 30
+    # quota_exit_codes: []  # Set only when the CLI documents a distinct quota exit code.
+  codex-review:
+    provider: openai
+    command: ["codex", "exec", "--skip-git-repo-check", "--sandbox", "read-only", "-"]
+    stdin: true
+    timeout_minutes: 15
+  # Claude Code reads the prompt from stdin (on Windows a multi-line argument to the
+  # claude.cmd shim is cut at the first newline). --safe-mode skips your personal
+  # CLAUDE.md, plugins, hooks and MCP servers so runs are reproducible.
+  # --permission-prompts none denies anything that would ask instead of waiting.
+  # acceptEdits lets it edit files; to let it run your tests too, add for example
+  # "--allowedTools", "Bash(npm test:*)".
+  # Text output keeps a final SPEC-QUESTION line readable; json would hide it.
+  fuerte:
+    provider: anthropic
+    command: ["claude", "-p", "--safe-mode", "--permission-mode", "acceptEdits", "--permission-prompts", "none", "--output-format", "text"]
+    stdin: true
+    timeout_minutes: 30
+  # Read-only Claude reviewer; it reviews what Codex implements.
+  claude-review:
+    provider: anthropic
+    command: ["claude", "-p", "--safe-mode", "--tools", "Read,Grep,Glob", "--permission-prompts", "none", "--output-format", "text"]
+    stdin: true
+    timeout_minutes: 15
+  # A local model through LM Studio's Anthropic-compatible endpoint. Use the port your
+  # server listens on and a model id it has loaded.
+  local:
+    provider: lmstudio
+    command: ["claude", "-p", "--safe-mode", "--permission-mode", "acceptEdits", "--permission-prompts", "none", "--model", "qwen/qwen3-4b-2507"]
+    stdin: true
+    env:
+      ANTHROPIC_BASE_URL: "http://localhost:1234"
+      ANTHROPIC_AUTH_TOKEN: "lmstudio"
+    timeout_minutes: 30
+`
+
+const outcomeExample = `# Copy to OUT-001.yaml and edit. Level 2 = sealed acceptance tests; level 1 = gates without them.
+# Every outcome is reviewed; the route (trivial, change, new) decides by whom.
+id: OUT-001
+title: The administrator generates the month's fees without duplicate charges
+level: 2
+actor: administrator
+description: |
+  Generate one fee per unit for a given month. Running it twice must not create duplicates.
+
+criteria:
+  - given: unit 12 has no fee for March
+    when: the administrator generates the March fees
+    then: unit 12 has exactly one fee for March
+  - given: the March fees were already generated
+    when: the administrator generates them again
+    then: no unit has more than one fee for March
+
+# Optional. Your route for this outcome: triage does not run, and rules may still raise it.
+# route: change
+# Optional. Reviewer roles to add to the route's, e.g. when the data model lives in entities.
+# reviewers: [dba]
+
+# Acceptance tests you approve with "aeh tests approve OUT-001". Agents can never change them.
+acceptance:
+  - tests/Acceptance/OUT001/
+
+# Optional. Without tasks the outcome runs as a single task.
+tasks:
+  - id: T1
+    goal: Implement fee generation for a month, idempotent per unit and month
+    paths: [src/Fees/]
+    # start: fuerte        # profile to begin with; default is the first in the ladder
+    # max_diff_lines: 300
+`
+
+// Init creates aeh/config.yaml, an example outcome and ignores .aeh/. It never overwrites files.
+func Init(r Repo) ([]string, error) {
+	var created []string
+	write := func(path, content string) error {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			return err
+		}
+		created = append(created, rel(r.Root, path))
+		return nil
+	}
+	if err := write(r.ConfigPath(), configTemplate); err != nil {
+		return created, err
+	}
+	if err := write(filepath.Join(r.Root, "aeh", "outcomes", "OUT-001.example.yaml"), outcomeExample); err != nil {
+		return created, err
+	}
+	added, err := ensureIgnored(filepath.Join(r.Root, ".gitignore"), ".aeh/")
+	if err != nil {
+		return created, err
+	}
+	if added {
+		created = append(created, ".gitignore (added .aeh/)")
+	}
+	return created, nil
+}
+
+func ensureIgnored(path, entry string) (bool, error) {
+	b, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.TrimSpace(line) == entry {
+			return false, nil
+		}
+	}
+	prefix := ""
+	if len(b) > 0 && !strings.HasSuffix(string(b), "\n") {
+		prefix = "\n"
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	_, err = fmt.Fprintf(f, "%s\n# AEH local and private: state, runs, reports, product memory\n%s\n", prefix, entry)
+	return err == nil, err
+}
