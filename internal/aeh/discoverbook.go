@@ -346,6 +346,10 @@ func (d *discoverySession) reviewBook(ctx context.Context, p *pendingBook, files
 		return nil
 	}
 	v.Profile, v.Provider = discoveryDiagnostic(profile), discoveryDiagnostic(d.cfg.Profiles[profile].Provider)
+	if err := codexRepoCheckError(profile, d.cfg.Profiles[profile]); err != nil {
+		v.Status, v.Feedback = "invalid", discoveryDiagnostic(err.Error()+"; then run aeh discover review "+d.state.Slug)
+		return nil
+	}
 	if templateErr != nil {
 		v.Status, v.Feedback = "invalid", discoveryDiagnostic(templateErr.Error())
 		return nil
