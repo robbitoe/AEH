@@ -251,17 +251,67 @@ func (c *ignoreChecker) checkExactNames() error {
 func (c *ignoreChecker) Close() { _ = os.RemoveAll(c.dir) }
 
 // faithful reports whether the private repository can evaluate p as Linux would. A path
-// under a host alias (another case, an NTFS short name, a trailing dot) cannot; nor can a
-// file whose name is a directory aeh wrote there (a tracked directory the agent replaced
-// with a file): Git would apply directory-only rules to it. Such paths count as not
-// ignored, the safe side.
+// under a host alias (another case, an NTFS short name, a trailing dot) cannot: it counts
+// as not ignored, the safe side.
 func (c *ignoreChecker) faithful(p string) bool {
-	dir := strings.HasSuffix(p, "/")
-	p = strings.TrimSuffix(p, "/")
-	if c.hostAlias(p) {
-		return false
+	return !c.hostAlias(strings.TrimSuffix(p, "/"))
+}
+
+// replacedDir reports a file path that is a directory in the private repository (a
+// tracked directory holding a .gitignore that the agent replaced with a file). Git there
+// would see a directory and apply directory-only rules; replacedDirIgnored evaluates it
+// as the file it is.
+func (c *ignoreChecker) replacedDir(p string) bool {
+	return !strings.HasSuffix(p, "/") && c.created[p]
+}
+
+// replacedDirIgnored evaluates file p in a second private repository holding only the
+// .gitignore files of p's ancestors, where nothing exists at p: the rules that apply to a
+// file named p are exactly those.
+func (c *ignoreChecker) replacedDirIgnored(p string) (bool, error) {
+	var files []exportFile
+	for q := range c.created {
+		if path.Base(q) != ".gitignore" {
+			continue
+		}
+		if info, err := os.Stat(filepath.Join(c.dir, filepath.FromSlash(q))); err != nil || info.IsDir() {
+			continue
+		}
+		if d := path.Dir(q); d == "." || strings.HasPrefix(p, d+"/") {
+			files = append(files, exportFile{Path: q})
+		}
 	}
-	return dir || !c.created[p]
+	dir, err := os.MkdirTemp("", "aeh-ignore-")
+	if err != nil {
+		return false, fmt.Errorf("ignore rules: %w", err)
+	}
+	sub := &ignoreChecker{dir: dir, created: map[string]bool{}}
+	defer sub.Close()
+	if _, err := git(dir, "init", "-q", "--template=", "."); err != nil {
+		return false, fmt.Errorf("ignore rules: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".git", "empty-excludes"), nil, 0o600); err != nil {
+		return false, fmt.Errorf("ignore rules: %w", err)
+	}
+	for _, f := range files {
+		b, err := os.ReadFile(filepath.Join(c.dir, filepath.FromSlash(f.Path)))
+		if err != nil {
+			return false, fmt.Errorf("ignore rules: %w", err)
+		}
+		dst := filepath.Join(dir, filepath.FromSlash(f.Path))
+		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+			return false, fmt.Errorf("ignore rules: %w", err)
+		}
+		if err := os.WriteFile(dst, b, 0o600); err != nil {
+			return false, fmt.Errorf("ignore rules: %w", err)
+		}
+		sub.created[f.Path] = true
+		for d := path.Dir(f.Path); d != "."; d = path.Dir(d) {
+			sub.created[d] = true
+		}
+	}
+	got, err := sub.ignored([]string{p})
+	return got[p], err
 }
 
 // checkIgnoreArgs runs git check-ignore against the commit's rules only. Matching is
@@ -281,7 +331,17 @@ func (c *ignoreChecker) ignored(paths []string) (map[string]bool, error) {
 	out := map[string]bool{}
 	var query []string
 	for _, p := range paths {
-		if c.faithful(p) {
+		switch {
+		case !c.faithful(p):
+		case c.replacedDir(p):
+			ign, err := c.replacedDirIgnored(p)
+			if err != nil {
+				return nil, err
+			}
+			if ign {
+				out[p] = true
+			}
+		default:
 			query = append(query, p)
 		}
 	}
@@ -340,6 +400,9 @@ func (c *ignoreChecker) session(ctx context.Context) (*ignoreSession, error) {
 func (s *ignoreSession) ignored(p string) (bool, error) {
 	if !s.c.faithful(p) {
 		return false, nil
+	}
+	if s.c.replacedDir(p) {
+		return s.c.replacedDirIgnored(p)
 	}
 	if _, err := io.WriteString(s.in, p+"\x00"); err != nil {
 		return false, fmt.Errorf("ignore rules: %w: %s", err, strings.TrimSpace(s.errb.String()))

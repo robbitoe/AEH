@@ -99,6 +99,9 @@ func captureCandidate(ctx context.Context, root, base string, e *commitExport, r
 		if errors.Is(err, io.EOF) {
 			break
 		}
+		if errors.Is(err, errReadBackLimit) {
+			return "", agentContent("the agent's work directory exceeds %d GiB", readBackLimit>>30)
+		}
 		if err != nil {
 			return "", fmt.Errorf("capture: read back: %w", err)
 		}
@@ -113,14 +116,19 @@ func captureCandidate(ctx context.Context, root, base string, e *commitExport, r
 			continue
 		}
 		rel, ok := strings.CutPrefix(name, "work/")
-		if !ok || checkTreePath(rel) != nil {
+		if !ok {
 			return "", fmt.Errorf("capture: unexpected entry %q", h.Name)
+		}
+		if err := checkTreePath(rel); err != nil {
+			return "", agentContent("the agent left a path the repository cannot hold: %v", err)
 		}
 		if underIgnored(rel) {
 			continue // never read, never committed
 		}
 		f, isTracked := tracked[rel]
-		if !isTracked && !baseDirs[rel] {
+		// A tracked directory is never ignored (it holds tracked files); anything else
+		// new, including a file that replaced a tracked directory, is evaluated.
+		if !isTracked && !(h.Typeflag == tar.TypeDir && baseDirs[rel]) {
 			query := rel
 			if h.Typeflag == tar.TypeDir {
 				query += "/"

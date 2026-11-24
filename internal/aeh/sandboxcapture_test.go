@@ -366,3 +366,46 @@ func TestAgentEnvExpandsOnlyForwardedVariables(t *testing.T) {
 		t.Fatalf("%q %v", env, err)
 	}
 }
+
+func TestCaptureEvaluatesAReplacedDirectoryAsAFile(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q")
+	if err := os.MkdirAll(filepath.Join(dir, "cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{".gitignore": "cache\n", "cache/.gitignore": "!keep\n", "cache/README": "tracked\n"} {
+		if err := os.WriteFile(filepath.Join(dir, filepath.FromSlash(name)), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustGit(t, dir, "add", "-f", ".gitignore", "cache/.gitignore", "cache/README")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base")
+	base := mustGit(t, dir, "rev-parse", "HEAD")
+	e, err := newCommitExport(dir, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := mustIgnore(t, dir, base, e)
+	files := map[string][]byte{".gitignore": []byte("cache\n"), "cache": []byte("ignored file\n")}
+	commit, err := captureCandidate(context.Background(), dir, base, e, rules, captureTar(t, files, nil), t.TempDir(), "capture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// git add -A would remove the tracked children and leave the ignored file out.
+	if status := mustGit(t, dir, "diff", "--name-status", base, commit); status != "D\tcache/.gitignore\nD\tcache/README" {
+		t.Fatalf("status:\n%s", status)
+	}
+}
+
+func TestCaptureRefusesPathsTheRepositoryCannotHoldAsTheAgentsFailure(t *testing.T) {
+	dir, base, e, rules := captureFixture(t)
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	_ = tw.WriteHeader(&tar.Header{Name: `work/bad\name`, Typeflag: tar.TypeReg, Mode: 0o644, ModTime: time.Unix(0, 0)})
+	_ = tw.Close()
+	_, err := captureCandidate(context.Background(), dir, base, e, rules, bytes.NewReader(buf.Bytes()), t.TempDir(), "capture")
+	var content *agentContentError
+	if !errors.As(err, &content) {
+		t.Fatalf("got %v", err)
+	}
+}
