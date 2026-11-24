@@ -199,7 +199,7 @@ func TestHostGateCommandClass(t *testing.T) {
 
 func TestCheckCreated(t *testing.T) {
 	s := &sandbox{image: sandboxImage{ID: "sha256:img", Env: []string{"PATH=/bin", "LANG=C"}}}
-	own, want, err := s.launchEnv([]string{"A=1"})
+	own, want, err := s.launchEnv(s.image, []string{"A=1"})
 	if err != nil || len(own) != 13 {
 		t.Fatalf("env %v %v", own, err)
 	}

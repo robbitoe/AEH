@@ -256,7 +256,7 @@ func (c *ignoreChecker) ignored(paths []string) (map[string]bool, error) {
 	// cannot be evaluated faithfully on this host: it counts as not ignored (the safe side).
 	var query []string
 	for _, p := range paths {
-		if !c.hostAlias(p) {
+		if !c.hostAlias(strings.TrimSuffix(p, "/")) {
 			query = append(query, p)
 		}
 	}
