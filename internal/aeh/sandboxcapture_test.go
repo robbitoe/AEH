@@ -3,7 +3,12 @@ package aeh
 import (
 	"archive/tar"
 	"bytes"
+	"context"
+	"errors"
+	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -49,7 +54,7 @@ func captureTar(t *testing.T, files map[string][]byte, exec map[string]bool) *by
 func TestCaptureWithoutChangesGivesTheBaseTree(t *testing.T) {
 	dir, base, e, rules := captureFixture(t)
 	files, exec := exportedTree(t, dir, e)
-	commit, err := captureCandidate(dir, base, e, rules, captureTar(t, files, exec), t.TempDir(), "capture")
+	commit, err := captureCandidate(context.Background(), dir, base, e, rules, captureTar(t, files, exec), t.TempDir(), "capture")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +81,7 @@ func TestCaptureRecordsChangesWithoutFilters(t *testing.T) {
 	delete(files, "v.sub")
 	exec["plain.sh"] = true
 	exec["tool.sh"] = false
-	commit, err := captureCandidate(dir, base, e, rules, captureTar(t, files, exec), t.TempDir(), "capture")
+	commit, err := captureCandidate(context.Background(), dir, base, e, rules, captureTar(t, files, exec), t.TempDir(), "capture")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +130,7 @@ func TestCaptureRefusesLinksAndGitPaths(t *testing.T) {
 			_, _ = tw.Write([]byte("x"))
 		}
 		_ = tw.Close()
-		if _, err := captureCandidate(dir, base, e, rules, bytes.NewReader(buf.Bytes()), t.TempDir(), "capture"); err == nil {
+		if _, err := captureCandidate(context.Background(), dir, base, e, rules, bytes.NewReader(buf.Bytes()), t.TempDir(), "capture"); err == nil {
 			t.Errorf("%s: captured", name)
 		}
 	}
@@ -137,8 +142,9 @@ func TestCaptureLimitsFileSize(t *testing.T) {
 	tw := tar.NewWriter(&buf)
 	_ = tw.WriteHeader(&tar.Header{Name: "work/big", Typeflag: tar.TypeReg, Mode: 0o644, Size: captureFileLimit + 1, ModTime: time.Unix(0, 0)})
 	// The header alone must stop the capture: no byte of the body is needed.
-	_, err := captureCandidate(dir, base, e, rules, bytes.NewReader(buf.Bytes()), t.TempDir(), "capture")
-	if err == nil || !strings.Contains(err.Error(), "per file") {
+	_, err := captureCandidate(context.Background(), dir, base, e, rules, bytes.NewReader(buf.Bytes()), t.TempDir(), "capture")
+	var content *agentContentError
+	if !errors.As(err, &content) || !strings.Contains(err.Error(), "per changed file") {
 		t.Fatalf("got %v", err)
 	}
 }
@@ -205,5 +211,158 @@ func TestAgentErrorKeepsTheHostMeanings(t *testing.T) {
 	}
 	if !uncertainExit(agentError(p, LaunchResult{Class: ClassTerminated, Reason: "timed out after 1m0s"})) {
 		t.Error("a timeout must stay uncertain")
+	}
+}
+
+// dirRepo tracks cache/.gitignore under a root rule that ignores cache/ (force-added), and
+// a large file, to test replacements and unchanged content over the limit.
+func dirRepo(t *testing.T, big int) (string, string, *commitExport, *ignoreChecker) {
+	t.Helper()
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q")
+	write := func(name string, body []byte) {
+		p := filepath.Join(dir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(".gitignore", []byte("cache/\nnode_modules/\n"))
+	write("cache/.gitignore", []byte("*\n"))
+	if big > 0 {
+		write("big.bin", bytes.Repeat([]byte{7}, big))
+	}
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "add", "-f", "cache/.gitignore")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base")
+	base := mustGit(t, dir, "rev-parse", "HEAD")
+	e, err := newCommitExport(dir, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir, base, e, mustIgnore(t, dir, base, e)
+}
+
+func TestCaptureKeepsAFileThatReplacedATrackedDirectory(t *testing.T) {
+	dir, base, e, rules := dirRepo(t, 0)
+	files, exec := exportedTree(t, dir, e)
+	delete(files, "cache/.gitignore")
+	files["cache"] = []byte("now a file\n")
+	commit, err := captureCandidate(context.Background(), dir, base, e, rules, captureTar(t, files, exec), t.TempDir(), "capture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := mustGit(t, dir, "diff", "--name-status", base, commit); status != "A\tcache\nD\tcache/.gitignore" {
+		t.Fatalf("status:\n%s", status)
+	}
+}
+
+func TestCaptureAcceptsUnchangedFilesOverTheLimit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("writes a file over 100 MiB")
+	}
+	dir, base, e, rules := dirRepo(t, int(captureFileLimit)+1)
+	files, exec := exportedTree(t, dir, e)
+	commit, err := captureCandidate(context.Background(), dir, base, e, rules, captureTar(t, files, exec), t.TempDir(), "capture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mustGit(t, dir, "rev-parse", commit+"^{tree}") != mustGit(t, dir, "rev-parse", base+"^{tree}") {
+		t.Fatal("tree changed")
+	}
+	exec["big.bin"] = true // a mode change reuses the base's blob
+	commit, err = captureCandidate(context.Background(), dir, base, e, rules, captureTar(t, files, exec), t.TempDir(), "capture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := mustGit(t, dir, "diff", "--raw", base, commit); !strings.Contains(status, ":100644 100755") {
+		t.Fatalf("mode change lost: %s", status)
+	}
+	files["big.bin"] = bytes.Repeat([]byte{8}, int(captureFileLimit)+1)
+	_, err = captureCandidate(context.Background(), dir, base, e, rules, captureTar(t, files, exec), t.TempDir(), "capture")
+	var content *agentContentError
+	if !errors.As(err, &content) {
+		t.Fatalf("a changed file over the limit must be the agent's failure: %v", err)
+	}
+}
+
+// ignoredTar holds many new directories and, under an ignored directory, a link and a
+// .git directory, as npm or a git dependency would leave them.
+func TestCaptureSkipsIgnoredContentUnreadAndUsesOneProcess(t *testing.T) {
+	dir, base, e, rules := dirRepo(t, 0)
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	hdr := func(h *tar.Header) {
+		h.ModTime = time.Unix(0, 0)
+		if err := tw.WriteHeader(h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hdr(&tar.Header{Name: "work/", Typeflag: tar.TypeDir, Mode: 0o755})
+	hdr(&tar.Header{Name: "work/.gitignore", Typeflag: tar.TypeReg, Mode: 0o644, Size: 21})
+	tw.Write([]byte("cache/\nnode_modules/\n"))
+	hdr(&tar.Header{Name: "work/cache/", Typeflag: tar.TypeDir, Mode: 0o755})
+	hdr(&tar.Header{Name: "work/cache/.gitignore", Typeflag: tar.TypeReg, Mode: 0o644, Size: 2})
+	tw.Write([]byte("*\n"))
+	hdr(&tar.Header{Name: "work/node_modules/", Typeflag: tar.TypeDir, Mode: 0o755})
+	hdr(&tar.Header{Name: "work/node_modules/.bin/", Typeflag: tar.TypeDir, Mode: 0o755})
+	hdr(&tar.Header{Name: "work/node_modules/.bin/tool", Typeflag: tar.TypeSymlink, Linkname: "../tool/cli.js"})
+	hdr(&tar.Header{Name: "work/node_modules/dep/.git/config", Typeflag: tar.TypeReg, Mode: 0o644})
+	for i := 0; i < 3000; i++ {
+		hdr(&tar.Header{Name: fmt.Sprintf("work/d%d/", i), Typeflag: tar.TypeDir, Mode: 0o755})
+	}
+	tw.Close()
+	start := time.Now()
+	commit, err := captureCandidate(context.Background(), dir, base, e, rules, bytes.NewReader(buf.Bytes()), t.TempDir(), "capture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mustGit(t, dir, "rev-parse", commit+"^{tree}") != mustGit(t, dir, "rev-parse", base+"^{tree}") {
+		t.Fatal("ignored content was captured")
+	}
+	// 3000 directories through one process take well under the cost of 3000 processes.
+	if d := time.Since(start); d > 20*time.Second {
+		t.Fatalf("capture took %s", d)
+	}
+}
+
+func TestIgnoreSessionMatchesBatchAnswers(t *testing.T) {
+	_, _, e, rules := captureFixture(t)
+	_ = e
+	paths := []string{"out/", "out/x", "a.log", "keep.log", "sub/gen/", "sub/gen/y", "src/", "new.txt"}
+	batch, err := rules.ignored(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := rules.session(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for _, p := range paths {
+		got, err := s.ignored(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != batch[p] {
+			t.Errorf("%s: session %v, batch %v", p, got, batch[p])
+		}
+	}
+	if !batch["out/"] || batch["keep.log"] || !batch["a.log"] {
+		t.Errorf("unexpected batch answers %v", batch)
+	}
+}
+
+func TestAgentEnvExpandsOnlyForwardedVariables(t *testing.T) {
+	t.Setenv("AEH_TEST_SECRET", "s3cret")
+	t.Setenv("AEH_TEST_FWD", "ok")
+	if _, err := agentEnv(Profile{Env: map[string]string{"TOKEN": "${AEH_TEST_SECRET}"}}, nil); err == nil {
+		t.Fatal("env expanded a variable the profile does not forward")
+	}
+	env, err := agentEnv(Profile{Env: map[string]string{"URL": "x/$AEH_TEST_FWD"}}, []string{"AEH_TEST_FWD"})
+	if err != nil || strings.Join(env, ",") != "AEH_TEST_FWD=ok,URL=x/ok" {
+		t.Fatalf("%q %v", env, err)
 	}
 }

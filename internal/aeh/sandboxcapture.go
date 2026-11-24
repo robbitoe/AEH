@@ -3,6 +3,7 @@ package aeh
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
@@ -33,14 +34,26 @@ type captured struct {
 	spool      string // host file holding the bytes until Git stores them
 }
 
+// agentContentError is a capture refusal caused by what the agent left in its work
+// directory (a link, a .git path, a file over the limit). It is the agent's failure, not
+// the runtime's: it spends a ladder step like a failed gate.
+type agentContentError struct{ msg string }
+
+func (e *agentContentError) Error() string { return e.msg }
+
+func agentContent(format string, args ...any) error {
+	return &agentContentError{msg: fmt.Sprintf(format, args...)}
+}
+
 // captureCandidate builds the candidate commit from an agent's work volume, read back as
 // a tar stream, without running Git on anything the container wrote. It replaces
 // git add -A in an agent's worktree (stage 6, S2): no filter driver, attribute, ident,
 // encoding or end-of-line conversion runs, and no .git file the agent could rewrite is
 // read. Tracked files keep the base's entries when bytes and executable bit are equal;
-// new files the base's ignore rules ignore are left out; any link, device or .git path
-// fails with the path.
-func captureCandidate(root, base string, e *commitExport, rules *ignoreChecker, r io.Reader, spoolDir, msg string) (string, error) {
+// new files and directories the base's ignore rules ignore are left out unread, as Git
+// would leave them (so npm's links under an ignored node_modules/ are harmless); any
+// other link, device or .git path fails with the path.
+func captureCandidate(ctx context.Context, root, base string, e *commitExport, rules *ignoreChecker, r io.Reader, spoolDir, msg string) (string, error) {
 	format, err := git(root, "rev-parse", "--show-object-format")
 	if err != nil {
 		return "", fmt.Errorf("capture: %w", err)
@@ -53,6 +66,11 @@ func captureCandidate(root, base string, e *commitExport, rules *ignoreChecker, 
 		return "", fmt.Errorf("capture: %w", err)
 	}
 	defer os.RemoveAll(spool)
+	ign, err := rules.session(ctx)
+	if err != nil {
+		return "", fmt.Errorf("capture: %w", err)
+	}
+	defer ign.Close()
 
 	tracked := map[string]exportFile{}
 	baseDirs := map[string]bool{}
@@ -63,7 +81,7 @@ func captureCandidate(root, base string, e *commitExport, rules *ignoreChecker, 
 		}
 	}
 	seen := map[string]bool{}
-	var changed, added []captured
+	var write []captured
 	ignoredDirs := map[string]bool{}
 	underIgnored := func(p string) bool {
 		for d := path.Dir(p); d != "."; d = path.Dir(d) {
@@ -85,10 +103,10 @@ func captureCandidate(root, base string, e *commitExport, rules *ignoreChecker, 
 			return "", fmt.Errorf("capture: read back: %w", err)
 		}
 		if entries++; entries > maxTreeEntries {
-			return "", fmt.Errorf("capture: more than %d entries", maxTreeEntries)
+			return "", agentContent("the agent left more than %d entries in its work directory", maxTreeEntries)
 		}
 		if len(h.Name) > maxTreePath {
-			return "", errors.New("capture: a path is longer than the limit")
+			return "", agentContent("the agent left a path longer than %d bytes", maxTreePath)
 		}
 		name := strings.TrimSuffix(path.Clean(strings.TrimPrefix(h.Name, "./")), "/")
 		if name == "work" {
@@ -99,71 +117,62 @@ func captureCandidate(root, base string, e *commitExport, rules *ignoreChecker, 
 			return "", fmt.Errorf("capture: unexpected entry %q", h.Name)
 		}
 		if underIgnored(rel) {
-			continue
+			continue // never read, never committed
+		}
+		f, isTracked := tracked[rel]
+		if !isTracked && !baseDirs[rel] {
+			query := rel
+			if h.Typeflag == tar.TypeDir {
+				query += "/"
+			}
+			skip, err := ign.ignored(query)
+			if err != nil {
+				return "", fmt.Errorf("capture: %w", err)
+			}
+			if skip {
+				if h.Typeflag == tar.TypeDir {
+					ignoredDirs[rel] = true
+				}
+				continue
+			}
 		}
 		for _, part := range strings.Split(rel, "/") {
 			if strings.EqualFold(part, ".git") {
-				return "", fmt.Errorf("the agent created %s: .git paths are not allowed in the sandbox work directory", rel)
+				return "", agentContent("the agent created %s: .git paths are not allowed in the sandbox work directory", rel)
 			}
 		}
 		switch h.Typeflag {
 		case tar.TypeDir:
-			// A new directory the base's rules ignore is skipped whole, as Git would.
-			if !baseDirs[rel] {
-				ign, err := rules.ignored([]string{rel + "/"})
-				if err != nil {
-					return "", fmt.Errorf("capture: %w", err)
-				}
-				if ign[rel+"/"] {
-					ignoredDirs[rel] = true
-				}
-			}
 			continue
 		case tar.TypeReg:
 		default:
-			return "", fmt.Errorf("the agent left %s, which is not a regular file or directory (type %q); links are not allowed", rel, h.Typeflag)
-		}
-		if h.Size > captureFileLimit {
-			return "", fmt.Errorf("the agent left %s with %d bytes; the limit is %d MiB per file", rel, h.Size, captureFileLimit>>20)
+			return "", agentContent("the agent left %s, which is not a regular file or directory (type %q); links are allowed only where .gitignore ignores them", rel, h.Typeflag)
 		}
 		seen[rel] = true
+		// An unchanged tracked file of any size is accepted; the limit applies to content
+		// the agent adds or changes.
+		sameSize := isTracked && h.Size == f.Size
+		if !sameSize && h.Size > captureFileLimit {
+			return "", agentContent("the agent left %s with %d bytes; the limit is %d MiB per changed file", rel, h.Size, captureFileLimit>>20)
+		}
 		executable := h.Mode&0o111 != 0
 		spoolPath := filepath.Join(spool, strconv.Itoa(entries))
 		blob, err := spoolBlob(tr, h.Size, format, spoolPath)
 		if err != nil {
 			return "", fmt.Errorf("capture %s: %w", rel, err)
 		}
-		c := captured{Path: rel, Executable: executable, Blob: blob, spool: spoolPath}
-		if f, ok := tracked[rel]; ok {
-			if f.Blob == blob && f.Executable == executable {
-				os.Remove(spoolPath)
+		if isTracked && f.Blob == blob {
+			os.Remove(spoolPath)
+			if f.Executable == executable {
 				continue
 			}
-			changed = append(changed, c)
-		} else {
-			added = append(added, c)
+			spoolPath = "" // only the mode changed: the base's blob is reused
+		} else if h.Size > captureFileLimit {
+			return "", agentContent("the agent changed %s to %d bytes; the limit is %d MiB per changed file", rel, h.Size, captureFileLimit>>20)
+		} else if total += h.Size; total > captureTotalLimit {
+			return "", agentContent("the agent's changes exceed %d GiB", captureTotalLimit>>30)
 		}
-		if total += h.Size; total > captureTotalLimit {
-			return "", fmt.Errorf("the agent's changes exceed %d GiB", captureTotalLimit>>30)
-		}
-	}
-	// New files the base's ignore rules ignore stay out, as git add -A would leave them.
-	if len(added) > 0 {
-		paths := make([]string, len(added))
-		for i, c := range added {
-			paths[i] = c.Path
-		}
-		ign, err := rules.ignored(paths)
-		if err != nil {
-			return "", fmt.Errorf("capture: %w", err)
-		}
-		kept := added[:0]
-		for _, c := range added {
-			if !ign[c.Path] {
-				kept = append(kept, c)
-			}
-		}
-		added = kept
+		write = append(write, captured{Path: rel, Executable: executable, Blob: blob, spool: spoolPath})
 	}
 	var removed []string
 	for p := range tracked {
@@ -172,7 +181,6 @@ func captureCandidate(root, base string, e *commitExport, rules *ignoreChecker, 
 		}
 	}
 	sort.Strings(removed)
-	write := append(changed, added...)
 	sort.Slice(write, func(i, j int) bool { return write[i].Path < write[j].Path })
 	if err := storeBlobs(root, write); err != nil {
 		return "", err
@@ -208,7 +216,13 @@ func spoolBlob(r io.Reader, size int64, format, dst string) (string, error) {
 
 // storeBlobs writes the spooled files as blobs with no filters, and checks that Git
 // stored exactly the bytes that were hashed while reading.
-func storeBlobs(root string, files []captured) error {
+func storeBlobs(root string, all []captured) error {
+	var files []captured // a mode-only change reuses the base's blob: nothing to store
+	for _, c := range all {
+		if c.spool != "" {
+			files = append(files, c)
+		}
+	}
 	if len(files) == 0 {
 		return nil
 	}

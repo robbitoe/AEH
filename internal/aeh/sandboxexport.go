@@ -3,6 +3,7 @@ package aeh
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -249,14 +250,38 @@ func (c *ignoreChecker) checkExactNames() error {
 
 func (c *ignoreChecker) Close() { _ = os.RemoveAll(c.dir) }
 
+// faithful reports whether the private repository can evaluate p as Linux would. A path
+// under a host alias (another case, an NTFS short name, a trailing dot) cannot; nor can a
+// file whose name is a directory aeh wrote there (a tracked directory the agent replaced
+// with a file): Git would apply directory-only rules to it. Such paths count as not
+// ignored, the safe side.
+func (c *ignoreChecker) faithful(p string) bool {
+	dir := strings.HasSuffix(p, "/")
+	p = strings.TrimSuffix(p, "/")
+	if c.hostAlias(p) {
+		return false
+	}
+	return dir || !c.created[p]
+}
+
+// checkIgnoreArgs runs git check-ignore against the commit's rules only. Matching is
+// case-sensitive, as in the Linux volume; git init would otherwise turn core.ignorecase
+// on for a case-insensitive host file system.
+func (c *ignoreChecker) checkIgnoreCmd(ctx context.Context, extra ...string) *exec.Cmd {
+	args := append(append([]string{}, gitSafety...), "-c", "core.excludesFile="+filepath.Join(c.dir, ".git", "empty-excludes"),
+		"-c", "core.ignorecase=false", "check-ignore", "--no-index", "--stdin", "-z")
+	cmd := exec.CommandContext(ctx, "git", append(args, extra...)...)
+	cmd.Dir = c.dir
+	cmd.Env = append(commandEnv(nil), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_FLUSH=1")
+	return cmd
+}
+
 // ignored returns the subset of paths the commit's ignore rules ignore.
 func (c *ignoreChecker) ignored(paths []string) (map[string]bool, error) {
 	out := map[string]bool{}
-	// A path under a directory that matches a rules directory only when case is folded
-	// cannot be evaluated faithfully on this host: it counts as not ignored (the safe side).
 	var query []string
 	for _, p := range paths {
-		if !c.hostAlias(strings.TrimSuffix(p, "/")) {
+		if c.faithful(p) {
 			query = append(query, p)
 		}
 	}
@@ -264,13 +289,7 @@ func (c *ignoreChecker) ignored(paths []string) (map[string]bool, error) {
 	if len(paths) == 0 {
 		return out, nil
 	}
-	// Matching is case-sensitive, as in the Linux volume; git init would otherwise turn
-	// core.ignorecase on for a case-insensitive host file system.
-	args := append(append([]string{}, gitSafety...), "-c", "core.excludesFile="+filepath.Join(c.dir, ".git", "empty-excludes"),
-		"-c", "core.ignorecase=false", "check-ignore", "--no-index", "--stdin", "-z")
-	cmd := exec.Command("git", args...)
-	cmd.Dir = c.dir
-	cmd.Env = append(commandEnv(nil), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
+	cmd := c.checkIgnoreCmd(context.Background())
 	cmd.Stdin = strings.NewReader(strings.Join(paths, "\x00") + "\x00")
 	var stdout, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &errb
@@ -285,6 +304,64 @@ func (c *ignoreChecker) ignored(paths []string) (map[string]bool, error) {
 		}
 	}
 	return out, nil
+}
+
+// ignoreSession answers one path at a time from a single git check-ignore process, so a
+// tree with many new directories costs one process, not one per directory.
+type ignoreSession struct {
+	c    *ignoreChecker
+	cmd  *exec.Cmd
+	in   io.WriteCloser
+	out  *bufio.Reader
+	errb bytes.Buffer
+}
+
+func (c *ignoreChecker) session(ctx context.Context) (*ignoreSession, error) {
+	s := &ignoreSession{c: c, cmd: c.checkIgnoreCmd(ctx, "--verbose", "--non-matching")}
+	s.cmd.Stderr = &s.errb
+	var err error
+	if s.in, err = s.cmd.StdinPipe(); err != nil {
+		return nil, err
+	}
+	stdout, err := s.cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	s.out = bufio.NewReader(stdout)
+	if err := s.cmd.Start(); err != nil {
+		return nil, fmt.Errorf("ignore rules: %w", err)
+	}
+	return s, nil
+}
+
+// ignored asks about one path. With --verbose --non-matching every path gets one record
+// of four NUL-terminated fields: source, line, pattern and path. A path is ignored when a
+// rule matched and the rule is not a negation.
+func (s *ignoreSession) ignored(p string) (bool, error) {
+	if !s.c.faithful(p) {
+		return false, nil
+	}
+	if _, err := io.WriteString(s.in, p+"\x00"); err != nil {
+		return false, fmt.Errorf("ignore rules: %w: %s", err, strings.TrimSpace(s.errb.String()))
+	}
+	var fields [4]string
+	for i := range fields {
+		f, err := s.out.ReadString(0)
+		if err != nil {
+			return false, fmt.Errorf("ignore rules: git check-ignore: %w: %s", err, strings.TrimSpace(s.errb.String()))
+		}
+		fields[i] = strings.TrimSuffix(f, "\x00")
+	}
+	if fields[3] != p {
+		return false, fmt.Errorf("ignore rules: git check-ignore answered for %q, asked %q", fields[3], p)
+	}
+	return fields[0] != "" && !strings.HasPrefix(fields[2], "!"), nil
+}
+
+// Close ends the process; exit status 1 only means the last batch matched nothing.
+func (s *ignoreSession) Close() {
+	_ = s.in.Close()
+	_ = s.cmd.Wait()
 }
 
 // checkExport compares a volume read back after a command with the exported tree.

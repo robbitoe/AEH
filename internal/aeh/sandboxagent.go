@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -73,6 +74,7 @@ func agentArgv(p Profile, prompt string, out bool) ([]string, error) {
 // values of the names it forwards. HOME, TMPDIR and the proxy variables belong to aeh.
 func agentEnv(p Profile, passEnv []string) ([]string, error) {
 	var env []string
+	forwarded := map[string]bool{}
 	check := func(name string) error {
 		if !envNamePlain.MatchString(name) {
 			return fmt.Errorf("invalid variable name %q", name)
@@ -86,15 +88,34 @@ func agentEnv(p Profile, passEnv []string) ([]string, error) {
 		if err := check(name); err != nil {
 			return nil, err
 		}
+		forwarded[name] = true
 		if v, ok := os.LookupEnv(name); ok {
 			env = append(env, name+"="+v)
 		}
 	}
-	for k, v := range p.Env {
+	keys := make([]string, 0, len(p.Env))
+	for k := range p.Env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
 		if err := check(k); err != nil {
 			return nil, err
 		}
-		env = append(env, k+"="+os.ExpandEnv(v))
+		// A reference expands only to a variable the profile forwards: env must not
+		// become a way around pass_env.
+		var refused string
+		v := os.Expand(p.Env[k], func(name string) string {
+			if !forwarded[name] {
+				refused = name
+				return ""
+			}
+			return os.Getenv(name)
+		})
+		if refused != "" {
+			return nil, fmt.Errorf("env %s refers to $%s, which the profile does not forward (add it to its sandbox pass_env)", k, refused)
+		}
+		env = append(env, k+"="+v)
 	}
 	return env, nil
 }
@@ -167,11 +188,14 @@ func (s *sandbox) runAgent(ctx context.Context, a agentLaunch) (outPath string, 
 	}
 	defer errf.Close()
 	var after func(string) error
+	var content *agentContentError
 	if a.ReadBack != nil {
 		after = func(cid string) error {
-			return a.ReadBack(func(target string, fn func(io.Reader) error) error {
+			err := a.ReadBack(func(target string, fn func(io.Reader) error) error {
 				return s.readBack(ctx, cid, target, fn)
 			})
+			errors.As(err, &content)
+			return err
 		}
 	}
 	res, err = s.run(ctx, sandboxLaunch{Kind: a.Kind, Argv: argv, Volumes: vols, Env: env, Workdir: workdir,
@@ -179,6 +203,10 @@ func (s *sandbox) runAgent(ctx context.Context, a agentLaunch) (outPath string, 
 		Stderr: &cappedFile{f: errf, left: agentOutputLimit}, Agent: true}, after)
 	if err != nil {
 		return outPath, res, err
+	}
+	if res.Class == ClassInfrastructure && content != nil {
+		// The process ran and left content the capture refuses: the agent failed.
+		return outPath, LaunchResult{Class: ClassProcess, ExitCode: -1, Reason: content.Error()}, nil
 	}
 	if res.Class == ClassInfrastructure && strings.Contains(res.Reason, errOutputLimit.Error()) {
 		// The process ran; its output is too large to trust. That is the agent's failure.

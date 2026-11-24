@@ -3,6 +3,7 @@ package aeh
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -266,7 +267,7 @@ echo VERDICT: APPROVE`
 		Memory: treeFiles(map[string][]byte{"index.md": []byte("# memory\n")}, nil), Prompt: "the task\n", RunDir: runDir, LogName: "agent",
 		ReadBack: func(read func(string, func(io.Reader) error) error) error {
 			return read(sandboxWork, func(r io.Reader) (err error) {
-				commit, err = captureCandidate(dir, base, e, rules, r, t.TempDir(), "candidate")
+				commit, err = captureCandidate(context.Background(), dir, base, e, rules, r, t.TempDir(), "candidate")
 				return err
 			})
 		}})
@@ -339,6 +340,28 @@ func TestDockerAgentOutputLimitFailsTheAgent(t *testing.T) {
 	_, res, err := s.runAgent(context.Background(), agentLaunch{Kind: "review", Profile: p, Prompt: "x", RunDir: t.TempDir(), LogName: "big"})
 	if err != nil || res.Class != ClassProcess || agentError(p, res) == nil || !strings.Contains(res.Reason, "MiB") {
 		t.Fatalf("%+v %v", res, err)
+	}
+	assertNoLeftovers(t, s)
+}
+
+func TestDockerAgentContentRefusalIsTheAgentsFailure(t *testing.T) {
+	s, _ := dockerSandbox(t, SandboxConfig{})
+	s.agent = s.image
+	dir, base, e, rules := captureFixture(t)
+	p := Profile{Command: []string{"sh", "-c", "ln -s /etc/passwd leak"}}
+	_, res, err := s.runAgent(context.Background(), agentLaunch{Kind: "implement", Profile: p, Work: e.source(), WorkRW: true,
+		Prompt: "x", RunDir: t.TempDir(), LogName: "agent",
+		ReadBack: func(read func(string, func(io.Reader) error) error) error {
+			return read(sandboxWork, func(r io.Reader) error {
+				_, err := captureCandidate(context.Background(), dir, base, e, rules, r, t.TempDir(), "candidate")
+				return err
+			})
+		}})
+	if err != nil || res.Class != ClassProcess || !strings.Contains(res.Reason, "leak") {
+		t.Fatalf("%+v %v", res, err)
+	}
+	if aerr := agentError(p, res); aerr == nil || errors.Is(aerr, errSandboxInfrastructure) {
+		t.Fatalf("agent error %v", aerr)
 	}
 	assertNoLeftovers(t, s)
 }
