@@ -404,9 +404,18 @@ func (d *discoverySession) reviewBook(ctx context.Context, p *pendingBook, files
 				back, err = readAgentOutput(r, limit.MaxFiles, limit.MaxTotal)
 				return err
 			}})
-		if serr != nil {
-			p.Running = false
-			return serr
+		cause := serr
+		if cause == nil && errors.Is(step.AgentErr, errSandboxInfrastructure) {
+			cause = step.AgentErr
+		}
+		if cause != nil {
+			// Nothing is known about the review: it stays not run, so the book is never
+			// imported unreviewed because Docker was unavailable.
+			p.Running, v.Status, v.Feedback = false, "not_run", ""
+			if err := d.save(); err != nil {
+				return errors.Join(cause, err)
+			}
+			return fmt.Errorf("the book review could not run in the sandbox; fix the cause (for example start Docker), then run again: aeh discover run %s: %w", d.state.Slug, cause)
 		}
 		outPath, runErr = step.OutPath, step.AgentErr
 	} else {

@@ -746,16 +746,21 @@ func (a *adoptSession) inspectAttempt(ctx context.Context, n int, base, profile 
 // back into memory. The read-only view replaces the host integrity check.
 func (a *adoptSession) inspectSandboxed(ctx context.Context, n int, base, profile string, cfg Config, data promptData,
 	manifest outputManifest, feedback string, info AdoptInspection) (frozenOutput, AdoptInspection, bool, error) {
+	// Failures before or around the launch are the runtime's, not the agent's: they block
+	// the inspection (uncertainExit) instead of moving to the next agent of the ladder.
+	infra := func(err error) (frozenOutput, AdoptInspection, bool, error) {
+		return frozenOutput{}, info, false, fmt.Errorf("%w: %v", errSandboxInfrastructure, err)
+	}
 	if a.sb == nil {
 		sb, err := openFlowSandbox(a.repo, cfg, a.runName())
 		if err != nil {
-			return frozenOutput{}, info, false, err
+			return infra(err)
 		}
 		a.sb = sb
 	}
 	e, excluded, err := newInspectionExport(a.repo.Root, base, cfg.Adopt.Exclude)
 	if err != nil {
-		return frozenOutput{}, info, false, err
+		return infra(err)
 	}
 	info.Excluded = len(excluded)
 	data.BaseSHA, data.OutputDir, data.Excluded, data.Feedback = base, sandboxOut, strings.Join(excluded, "\n"), feedback
@@ -780,7 +785,7 @@ func (a *adoptSession) inspectSandboxed(ctx context.Context, n int, base, profil
 			return err
 		}})
 	if err != nil {
-		return frozenOutput{}, info, false, err
+		return infra(err)
 	}
 	if step.AgentErr != nil {
 		// Unknown outcomes (the runtime failed, the launch stopped) block like an

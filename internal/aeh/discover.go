@@ -612,6 +612,11 @@ func DiscoverRun(ctx context.Context, r Repo, slug string, log io.Writer) (_ Dis
 			return *st, err
 		}
 	}
+	// A sandbox that cannot open stops the command before an attempt is recorded, so
+	// Docker being unavailable never spends a ladder try.
+	if _, err := d.agentSandbox(); err != nil {
+		return *st, err
+	}
 	for i := range st.Attempts {
 		if st.Attempts[i].Result == "running" {
 			st.Attempts[i].Result, st.Attempts[i].Feedback = "interrupted", "the previous aeh discover run stopped during this attempt"

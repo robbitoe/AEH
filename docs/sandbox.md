@@ -105,7 +105,7 @@ Each agent launch gets only what its step needs:
 - **Codex profiles** need `--skip-git-repo-check`, because `/work` is not a Git repository.
 - **Failures.** If Docker or the image fails during a launch, the step blocks with the reason without consuming a ladder attempt. A triage that cannot finish for such a reason is not replaced by the default route: the command stops and triages again next time.
 
-`aeh sandbox check` also runs a throwaway container from the agent image and warns about every profile whose program the image lacks. Each launch writes `<log>.launch.json` beside its output, with the class, exit code, image, network, the commit at `/work`, the memory commit and the captured candidate. The contract pins policy 2, the agent image and every profile's `sandbox.pass_env`.
+`aeh sandbox check` also runs a throwaway container from the agent image and warns about every profile whose program the image lacks. Each launch writes `<log>.launch.json` beside its output, with the class, exit code, image, network, the commit at `/work`, the memory commit and the captured candidate. The contracts of runs and plans pin policy 2, the agent image and every profile's `sandbox.pass_env`. Discovery sessions and adoption areas do not pin them: their outputs are documents you review, and each command uses the current configuration.
 
 ## A .NET example
 
