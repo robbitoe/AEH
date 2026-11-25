@@ -217,9 +217,11 @@ func (c *ignoreChecker) writeExcludes(root, commit string, rules []exportFile) e
 		if rule.Size > maxIgnoreFile {
 			return fmt.Errorf("ignore rules: %s has %d bytes; the sandbox reads .gitignore files up to %d MiB", rule.Path, rule.Size, maxIgnoreFile>>20)
 		}
-		b, ok := gitBlob(root, commit, rule.Path)
-		if !ok {
-			return fmt.Errorf("ignore rules: read %s at %s", rule.Path, short(commit))
+		// By object ID: a path argument would be re-encoded on Windows (arguments are
+		// UTF-16 there), so a name that is not valid UTF-8 could not be read by path.
+		b, err := gitRaw(root, "cat-file", "blob", rule.Blob)
+		if err != nil {
+			return fmt.Errorf("ignore rules: read %s at %s: %w", rule.Path, short(commit), err)
 		}
 		// As Git reads a .gitignore: a UTF-8 byte order mark at the start is skipped, and
 		// each line loses one trailing carriage return. Lines are walked in place, with no
@@ -282,12 +284,14 @@ func anchorIgnoreLine(dir, line string) string {
 // escapeIgnoreDir escapes glob characters of a directory name, and a leading # or !, so
 // the directory is matched literally.
 func escapeIgnoreDir(dir string) string {
+	// Byte by byte: a name need not be valid UTF-8, and Git matches bytes.
 	var b strings.Builder
-	for i, r := range dir {
-		if strings.ContainsRune(`*?[\`, r) || (i == 0 && (r == '#' || r == '!')) {
+	for i := 0; i < len(dir); i++ {
+		c := dir[i]
+		if strings.IndexByte(`*?[\`, c) >= 0 || (i == 0 && (c == '#' || c == '!')) {
 			b.WriteByte('\\')
 		}
-		b.WriteRune(r)
+		b.WriteByte(c)
 	}
 	return b.String()
 }

@@ -52,6 +52,32 @@ func TestIgnoreDegenerateLinesHaveNoEffect(t *testing.T) {
 	})
 }
 
+// Directory names are matched as bytes, including bytes that are not valid UTF-8.
+func TestIgnoreRulesKeepDirectoryBytes(t *testing.T) {
+	// The index entry goes through stdin: Windows passes arguments as UTF-16, which
+	// would turn \xff into U+FFFD before Git sees it.
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q")
+	blob := mustGitInput(t, dir, "*.tmp\n", "hash-object", "-w", "--stdin")
+	mustGitInput(t, dir, "100644 "+blob+"\tbad\xff/.gitignore\x00", "-c", "core.protectNTFS=false", "update-index", "-z", "--index-info")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "byte name")
+	commit := mustGit(t, dir, "rev-parse", "HEAD")
+	e, err := newCommitExport(dir, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(e.Files) != 1 || e.Files[0].Path != "bad\xff/.gitignore" {
+		t.Fatalf("fixture %+v", e.Files)
+	}
+	c := mustIgnore(t, dir, commit, e)
+	expectIgnored(t, c, map[string]bool{
+		"bad\xff/secret.tmp": true, "bad�/important.tmp": false, "bad/x.tmp": false,
+	})
+	if got := escapeIgnoreDir("a\xff*"); got != "a\xff\\*" {
+		t.Fatalf("escaped %q", got)
+	}
+}
+
 // A .gitignore over the per-file cap is refused before it is read.
 func TestIgnoreRulesFileIsCapped(t *testing.T) {
 	dir := t.TempDir()
