@@ -1243,6 +1243,13 @@ func (p *planner) attempt(ctx context.Context, a *PlanAttempt, feedback string) 
 	if err != nil {
 		return "", err
 	}
+	if p.sb.agents() {
+		// No host worktree holds the frozen commit under policy 2: a private ref keeps
+		// it from Git's garbage collection while the plan can still resume.
+		if _, err := git(r.Root, "update-ref", fmt.Sprintf("refs/aeh/plans/%s/a%d", st.ID, a.N), frozen); err != nil {
+			return "", fmt.Errorf("retain plan commit: %w", err)
+		}
+	}
 	a.Frozen, a.FailedStep = frozen, "checking"
 	if err := writePrivateJSON(filepath.Join(runDir, "candidate.json"), map[string]string{"base": st.Base, "candidate": candidate, "frozen": frozen}); err != nil {
 		return "", err
@@ -1371,7 +1378,11 @@ func (p *planner) verifyFrozen(ctx context.Context, a *PlanAttempt) (string, err
 		case g.Uncertain:
 			keep = !sandboxed
 			a.FailedStep, a.Feedback = "review", g.Output
-			question = p.blockNow(fmt.Sprintf("The %s review of the plan was interrupted or timed out (%s). Confirm all processes stopped, then answer to retry.", role, kept()))
+			if sandboxed {
+				question = p.blockNow(fmt.Sprintf("The %s review of the plan stopped without a result:\n%s\nFix the cause (for example start Docker), then answer to retry.", role, tail(g.Output, 1500)))
+			} else {
+				question = p.blockNow(fmt.Sprintf("The %s review of the plan was interrupted or timed out (%s). Confirm all processes stopped, then answer to retry.", role, kept()))
+			}
 		case !g.Passed:
 			a.FailedStep, a.Feedback = "review", g.Output
 		}

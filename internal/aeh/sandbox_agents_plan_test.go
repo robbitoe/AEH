@@ -26,10 +26,26 @@ func TestDockerSandboxedPlanAndPlannedRun(t *testing.T) {
 		"  impl:\n    provider: implementer\n    command: [sh, -c, " + strconvQuote(memoryCheck+implementPay) + "]\n" +
 		"sandbox:\n  image: \"" + image + "\"\n  agent_image: \"" + image + "\"\n  memory: 256m\n"
 	write(t, f.dir, "aeh/config.yaml", cfg)
+	// A checkout filter on the acceptance tests leaves a sentinel whenever the host checks
+	// out agent-written tests, even in a worktree removed right afterwards.
+	sentinel := filepath.ToSlash(filepath.Join(t.TempDir(), "checked-out"))
+	mustGit(t, f.dir, "config", "filter.aehsentinel.smudge", "sh -c 'echo x >> \""+sentinel+"\"; cat'")
+	mustGit(t, f.dir, "config", "filter.aehsentinel.clean", "cat")
+	write(t, f.dir, ".gitattributes", "tests/acceptance/** filter=aehsentinel\n")
 	f.commitAll("sandboxed agents")
 	p := f.plan()
 	if p.Phase != PlanLogged {
 		t.Fatalf("plan not finished: %+v", p)
+	}
+	if ref, err := git(f.dir, "rev-parse", "refs/aeh/plans/"+planID+"/a1"); err != nil || ref != p.Attempts[0].Frozen {
+		t.Fatalf("frozen plan not retained: %q %v", ref, err)
+	}
+	// Memory moves on after the plan: the planned run's agents still see the pinned commit.
+	if _, err := CreateSpec(f.repo, "other", "Other", []string{"lib/**"}); err != nil {
+		t.Fatal(err)
+	}
+	if head := mustGit(t, memDir(t, f.repo), "rev-parse", "HEAD"); head == p.MemoryCommit {
+		t.Fatal("memory did not advance")
 	}
 	if blob, ok := gitBlob(f.dir, p.PlanCommit, planDir+"/pay.sh"); !ok || !strings.Contains(blob, "paid") {
 		t.Fatalf("captured test %q", blob)
@@ -51,5 +67,18 @@ func TestDockerSandboxedPlanAndPlannedRun(t *testing.T) {
 	}
 	if list := mustGit(t, f.dir, "worktree", "list", "--porcelain"); strings.Count(list, "worktree ") != 1 {
 		t.Fatalf("host worktrees left:\n%s", list)
+	}
+	b, err := os.ReadFile(filepath.Join(f.dir, filepath.FromSlash(st.Tasks[0].Attempts[0].RunDir), "agent.launch.json"))
+	var rec launchRecord
+	if err != nil || json.Unmarshal(b, &rec) != nil || rec.MemoryCommit != p.MemoryCommit {
+		t.Fatalf("run agent memory %s (%v), want the plan's %s", b, err, p.MemoryCommit)
+	}
+	if _, err := os.Stat(filepath.FromSlash(sentinel)); err == nil {
+		t.Fatal("agent-written tests were checked out on the host")
+	}
+	// The sentinel works: a host checkout of the plan commit trips it.
+	mustGit(t, f.dir, "worktree", "add", "-q", "--detach", filepath.Join(t.TempDir(), "probe"), p.PlanCommit)
+	if _, err := os.Stat(filepath.FromSlash(sentinel)); err != nil {
+		t.Fatalf("the sentinel filter did not run: %v", err)
 	}
 }

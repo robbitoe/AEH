@@ -716,6 +716,11 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 			if captured == "" {
 				return res, errors.New("the sandbox returned no candidate for a clean agent exit")
 			}
+			// No host worktree holds the candidate: a private ref keeps it from Git's
+			// garbage collection while the attempt can still resume.
+			if _, err := git(r.Root, "update-ref", fmt.Sprintf("refs/aeh/candidates/%s/%s-a%d", o.ID, t.ID, n), captured); err != nil {
+				return res, fmt.Errorf("retain candidate: %w", err)
+			}
 			commit = captured
 		}
 	}

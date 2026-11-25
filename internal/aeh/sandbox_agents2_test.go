@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A profile without a sandbox section serializes as before, so digests of plans that
@@ -110,4 +112,39 @@ func TestDockerSandboxedTriageInfrastructureFailureIsRetried(t *testing.T) {
 	if st.InitialRoute != "" || st.TriageSource != "" {
 		t.Fatalf("provisional route kept: %q %q", st.InitialRoute, st.TriageSource)
 	}
+}
+
+// slowReader pauses once, after its first read, longer than the Docker client's wait delay.
+type slowReader struct {
+	r      io.Reader
+	paused bool
+}
+
+func (s *slowReader) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	if !s.paused {
+		s.paused = true
+		time.Sleep(7 * time.Second)
+	}
+	return n, err
+}
+
+// A consumer slower than docker cp (the capture hashes as it reads) still receives the
+// whole archive: no copy deadline runs after docker cp exits.
+func TestDockerReadBackToleratesASlowConsumer(t *testing.T) {
+	s, _ := dockerSandbox(t, SandboxConfig{})
+	s.agent = s.image
+	p := Profile{Command: []string{"sh", "-c", "head -c 1048576 /dev/zero > /out/big"}}
+	var back map[string]treeEntry
+	_, res, err := s.runAgent(context.Background(), agentLaunch{Kind: "discover", Profile: p, Out: true, Prompt: "x", RunDir: t.TempDir(), LogName: "slow",
+		ReadBack: func(read func(string, func(io.Reader) error) error) error {
+			return read(sandboxOut, func(r io.Reader) (err error) {
+				back, err = readTree(&slowReader{r: r}, "out", 4<<20)
+				return err
+			})
+		}})
+	if err != nil || res.Class != ClassProcess || res.ExitCode != 0 || back["big"].Size != 1<<20 {
+		t.Fatalf("%+v %v %+v", res, err, back["big"])
+	}
+	assertNoLeftovers(t, s)
 }

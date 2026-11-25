@@ -180,6 +180,57 @@ func (d dockerCLI) run(ctx context.Context, stdin io.Reader, stdout io.Writer, a
 	return strings.TrimSpace(out.String()), nil
 }
 
+// stream runs one docker command and hands its standard output to fn as it arrives. The
+// reader is the process's own pipe, so a slow consumer (the capture hashes as it reads)
+// only slows the command down: no copy deadline runs after the process exits. When fn
+// fails, the command is stopped; when it succeeds, the rest of the output is drained
+// before the exit status is read.
+func (d dockerCLI) stream(ctx context.Context, fn func(io.Reader) error, args ...string) error {
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "docker", args...)
+	cmd.Env = d.env
+	cmd.WaitDelay = 5 * time.Second
+	var errb bytes.Buffer
+	cmd.Stderr = &errb
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("docker %s: %w", args[0], err)
+	}
+	ferr := fn(out)
+	if ferr == nil {
+		// What follows the parsed archive is its padding; anything large is not.
+		const tailLimit = 1 << 20
+		n, err := io.Copy(io.Discard, io.LimitReader(out, tailLimit+1))
+		switch {
+		case err != nil:
+			ferr = err
+		case n > tailLimit:
+			ferr = errors.New("unexpected output after the archive")
+		}
+	}
+	if ferr != nil {
+		cancel()
+	}
+	werr := cmd.Wait()
+	switch {
+	case ferr != nil:
+		return ferr
+	case ctx.Err() != nil:
+		return fmt.Errorf("docker %s: %w", args[0], ctx.Err())
+	case werr != nil:
+		msg := strings.TrimSpace(errb.String())
+		if len(msg) > 2000 {
+			msg = msg[:2000] + "..."
+		}
+		return fmt.Errorf("docker %s: %v: %s", args[0], werr, msg)
+	}
+	return nil
+}
+
 // isolatedDockerCLI talks to the resolved local endpoint with a runner-private, empty
 // client configuration. The user's Docker configuration can define proxies (possibly
 // with credentials) that the client injects into every container it creates, even over
@@ -942,21 +993,8 @@ func (s *sandbox) writeEnvFile(id string, env []string) (string, error) {
 
 // readBack streams a directory of a stopped container as a tar to fn.
 func (s *sandbox) readBack(ctx context.Context, container, target string, fn func(io.Reader) error) error {
-	pr, pw := io.Pipe()
-	done := make(chan error, 1)
-	go func() {
-		_, err := s.d.run(ctx, nil, pw, "cp", container+":"+target, "-")
-		pw.CloseWithError(err)
-		done <- err
-	}()
-	ferr := fn(pr)
-	pr.CloseWithError(errors.New("read back stopped"))
-	cerr := <-done
-	if ferr != nil {
-		return ferr
-	}
-	if cerr != nil {
-		return fmt.Errorf("read back %s: %w", target, cerr)
+	if err := s.d.stream(ctx, fn, "cp", container+":"+target, "-"); err != nil {
+		return fmt.Errorf("read back %s: %w", target, err)
 	}
 	return nil
 }
