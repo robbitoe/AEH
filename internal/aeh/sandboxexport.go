@@ -223,9 +223,9 @@ func (c *ignoreChecker) writeExcludes(root, commit string, rules []exportFile) e
 		if err != nil {
 			return fmt.Errorf("ignore rules: read %s at %s: %w", rule.Path, short(commit), err)
 		}
-		// As Git reads a .gitignore: a UTF-8 byte order mark at the start is skipped, and
-		// each line loses one trailing carriage return. Lines are walked in place, with no
-		// slice of all of them.
+		// As Git reads a .gitignore: a UTF-8 byte order mark at the start is skipped, each
+		// line loses one trailing carriage return, and a pattern ends at its first NUL (Git
+		// handles it as a C string). Lines are walked in place, with no slice of all of them.
 		b = strings.TrimPrefix(b, utf8BOM)
 		dir := path.Dir(rule.Path)
 		for len(b) > 0 {
@@ -235,7 +235,11 @@ func (c *ignoreChecker) writeExcludes(root, commit string, rules []exportFile) e
 			} else {
 				b = ""
 			}
-			out := anchorIgnoreLine(dir, strings.TrimSuffix(line, "\r"))
+			line = strings.TrimSuffix(line, "\r")
+			if i := strings.IndexByte(line, 0); i >= 0 {
+				line = line[:i]
+			}
+			out := anchorIgnoreLine(dir, line)
 			if size += int64(len(out)) + 1; size > maxIgnoreRules {
 				return fmt.Errorf("ignore rules: the .gitignore files of %s exceed %d MiB once anchored at their directories", short(commit), maxIgnoreRules>>20)
 			}

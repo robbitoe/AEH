@@ -87,6 +87,7 @@ func TestIgnoreCheckerMatchesGitOnARealCheckout(t *testing.T) {
 		"#hash/.gitignore":   "h\n",
 		"crlf/.gitignore":    "gen/\r\n*.secret\r\n/top\r\n",
 		"bom/.gitignore":     "\xef\xbb\xbf*.secret\n#c\n",
+		"zero/.gitignore":    "secret\x00/suffix\nkeep\x00\n\x00all\n",
 	}
 	c, dir := caseRulesRepo(t, rules)
 	mustGit(t, dir, "-c", "core.autocrlf=false", "checkout", "-q", "-f", "HEAD") // the commit's bytes, as in the volume
@@ -97,6 +98,7 @@ func TestIgnoreCheckerMatchesGitOnARealCheckout(t *testing.T) {
 		"#hash/h", "#hash/x/h", "h", "trail", "trail ",
 		"crlf/deep/gen/output", "crlf/gen/x", "crlf/a.secret", "crlf/x/a.secret", "crlf/top", "crlf/x/top",
 		"bom/a.secret", "bom/x/b.secret", "a.secret",
+		"zero/sub/secret", "zero/secret", "zero/keep", "zero/sub/keep", "zero/all", "zero/x",
 		// neg/.gitignore holds only degenerate lines; directories asked with a trailing
 		// slash are left to TestIgnoreDegenerateLinesHaveNoEffect (Git's answer there
 		// differs from git add -A).
