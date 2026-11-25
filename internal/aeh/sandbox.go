@@ -277,9 +277,9 @@ type sandbox struct {
 	engine  sandboxEngine
 	image   sandboxImage // gates
 	agent   sandboxImage // agents (S2); empty until an agent image is configured
-	project string // label: first 12 hex digits of sha256(project root)
-	dir     string // runner-private directory: .aeh/sandbox
-	flow    string // intents of this flow live in dir/intents/<flow>
+	project string       // label: first 12 hex digits of sha256(project root)
+	dir     string       // runner-private directory: .aeh/sandbox
+	flow    string       // intents of this flow live in dir/intents/<flow>
 }
 
 func projectLabel(root string) string {
