@@ -94,8 +94,9 @@ Each agent launch gets only what its step needs:
 - **Environment.** The container gets `HOME` (empty and private to the launch), the profile's `env` map and the host values of the names in its `sandbox.pass_env`. The project's `pass_env` is never forwarded, and `env` may refer only to names the profile forwards. Host paths such as `CODEX_HOME` or `CLAUDE_CONFIG_DIR` are not forwarded.
 - **Network.** Agents use Docker's default network so their CLIs can reach their providers; the network is not filtered yet. Gates keep no network.
 - **Sign-in.** Agents start with an empty home directory in this version, so a CLI must authenticate through variables in `sandbox.pass_env` (for example an API key). Keeping a CLI's login between launches is the next step.
+- **Sealed tests you approved by hand** (`aeh tests approve`) must be committed exactly as approved: every sealed file tracked, no untracked file under the acceptance paths, and the same bytes in the commit (line endings converted by `core.autocrlf` are accepted). Containers run the committed bytes, so a test Git ignores or a filter rewrites would otherwise not be the one that runs.
 - **Codex profiles** need `--skip-git-repo-check`, because `/work` is not a Git repository.
-- **Failures.** If Docker or the image fails during a launch, the step blocks with the reason without consuming a ladder attempt.
+- **Failures.** If Docker or the image fails during a launch, the step blocks with the reason without consuming a ladder attempt. A triage that cannot finish for such a reason is not replaced by the default route: the command stops and triages again next time.
 
 `aeh sandbox check` also runs a throwaway container from the agent image and warns about every profile whose program the image lacks. Each launch writes `<log>.launch.json` beside its output, with the class, exit code, image, network, the commit at `/work`, the memory commit and the captured candidate. The contract pins policy 2, the agent image and every profile's `sandbox.pass_env`.
 
