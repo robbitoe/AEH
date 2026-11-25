@@ -159,6 +159,9 @@ type ignoreChecker struct {
 	// case, an NTFS short name such as LONGDI~1, a trailing dot): Git would read rules
 	// through it that Linux would not.
 	created map[string]bool
+	// ancestors marks the second repository of ancestorsIgnored: what it cannot evaluate
+	// directly counts as not ignored (the safe side) instead of recursing.
+	ancestors bool
 }
 
 func newIgnoreChecker(root, commit string, files []exportFile) (*ignoreChecker, error) {
@@ -250,25 +253,23 @@ func (c *ignoreChecker) checkExactNames() error {
 
 func (c *ignoreChecker) Close() { _ = os.RemoveAll(c.dir) }
 
-// faithful reports whether the private repository can evaluate p as Linux would. A path
-// under a host alias (another case, an NTFS short name, a trailing dot) cannot: it counts
-// as not ignored, the safe side.
-func (c *ignoreChecker) faithful(p string) bool {
-	return !c.hostAlias(strings.TrimSuffix(p, "/"))
+// direct reports whether the private repository can evaluate p as Linux would. It cannot
+// for a path under a host alias (another case, an NTFS short name, a trailing dot): the
+// host would read the aliased directory's rules. Nor for a file whose name is a directory
+// there (a tracked directory holding a .gitignore that the agent replaced with a file):
+// Git would apply directory-only rules to it. ancestorsIgnored evaluates those.
+func (c *ignoreChecker) direct(p string) bool {
+	if c.hostAlias(strings.TrimSuffix(p, "/")) {
+		return false
+	}
+	return strings.HasSuffix(p, "/") || !c.created[p]
 }
 
-// replacedDir reports a file path that is a directory in the private repository (a
-// tracked directory holding a .gitignore that the agent replaced with a file). Git there
-// would see a directory and apply directory-only rules; replacedDirIgnored evaluates it
-// as the file it is.
-func (c *ignoreChecker) replacedDir(p string) bool {
-	return !strings.HasSuffix(p, "/") && c.created[p]
-}
-
-// replacedDirIgnored evaluates file p in a second private repository holding only the
-// .gitignore files of p's ancestors, where nothing exists at p: the rules that apply to a
-// file named p are exactly those.
-func (c *ignoreChecker) replacedDirIgnored(p string) (bool, error) {
+// ancestorsIgnored evaluates p in a second private repository holding only the
+// .gitignore files of p's exact ancestors, where nothing exists at p: those are exactly
+// the rules Linux applies to p.
+func (c *ignoreChecker) ancestorsIgnored(p string) (bool, error) {
+	trimmed := strings.TrimSuffix(p, "/")
 	var files []exportFile
 	for q := range c.created {
 		if path.Base(q) != ".gitignore" {
@@ -277,7 +278,7 @@ func (c *ignoreChecker) replacedDirIgnored(p string) (bool, error) {
 		if info, err := os.Stat(filepath.Join(c.dir, filepath.FromSlash(q))); err != nil || info.IsDir() {
 			continue
 		}
-		if d := path.Dir(q); d == "." || strings.HasPrefix(p, d+"/") {
+		if d := path.Dir(q); d == "." || strings.HasPrefix(trimmed, d+"/") {
 			files = append(files, exportFile{Path: q})
 		}
 	}
@@ -285,7 +286,7 @@ func (c *ignoreChecker) replacedDirIgnored(p string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("ignore rules: %w", err)
 	}
-	sub := &ignoreChecker{dir: dir, created: map[string]bool{}}
+	sub := &ignoreChecker{dir: dir, created: map[string]bool{}, ancestors: true}
 	defer sub.Close()
 	if _, err := git(dir, "init", "-q", "--template=", "."); err != nil {
 		return false, fmt.Errorf("ignore rules: %w", err)
@@ -332,9 +333,9 @@ func (c *ignoreChecker) ignored(paths []string) (map[string]bool, error) {
 	var query []string
 	for _, p := range paths {
 		switch {
-		case !c.faithful(p):
-		case c.replacedDir(p):
-			ign, err := c.replacedDirIgnored(p)
+		case !c.direct(p) && c.ancestors:
+		case !c.direct(p):
+			ign, err := c.ancestorsIgnored(p)
 			if err != nil {
 				return nil, err
 			}
@@ -398,11 +399,8 @@ func (c *ignoreChecker) session(ctx context.Context) (*ignoreSession, error) {
 // of four NUL-terminated fields: source, line, pattern and path. A path is ignored when a
 // rule matched and the rule is not a negation.
 func (s *ignoreSession) ignored(p string) (bool, error) {
-	if !s.c.faithful(p) {
-		return false, nil
-	}
-	if s.c.replacedDir(p) {
-		return s.c.replacedDirIgnored(p)
+	if !s.c.direct(p) {
+		return s.c.ancestorsIgnored(p)
 	}
 	if _, err := io.WriteString(s.in, p+"\x00"); err != nil {
 		return false, fmt.Errorf("ignore rules: %w: %s", err, strings.TrimSpace(s.errb.String()))
@@ -533,7 +531,7 @@ func checkHostPaths(paths []string) error {
 
 // hostAlias reports a path that the host resolves, through a prefix aeh did not create
 // with that exact name, to something in the private repository. Such a path cannot be
-// evaluated faithfully here and counts as not ignored (the safe side).
+// evaluated directly: the aliased directory's rules would apply (see ancestorsIgnored).
 func (c *ignoreChecker) hostAlias(p string) bool {
 	parts := strings.Split(p, "/")
 	for i := range parts {

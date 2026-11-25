@@ -409,3 +409,51 @@ func TestCaptureRefusesPathsTheRepositoryCannotHoldAsTheAgentsFailure(t *testing
 		t.Fatalf("got %v", err)
 	}
 }
+
+// On a case-insensitive host SRC/ aliases the private repository's src/; Linux applies the
+// root rules to SRC/ but never src/.gitignore.
+func TestCaptureAppliesOnlyExactAncestorRulesUnderAnAlias(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q")
+	if err := os.MkdirAll(filepath.Join(dir, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{".gitignore": "*.log\n", "src/.gitignore": "*.tmp\n"} {
+		if err := os.WriteFile(filepath.Join(dir, filepath.FromSlash(name)), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base")
+	base := mustGit(t, dir, "rev-parse", "HEAD")
+	e, err := newCommitExport(dir, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := mustIgnore(t, dir, base, e)
+	files, exec := exportedTree(t, dir, e)
+	files["SRC/build.log"] = []byte("ignored by the root rule\n")
+	files["SRC/a.tmp"] = []byte("src/.gitignore does not apply to SRC/\n")
+	files["src/b.tmp"] = []byte("ignored by src/.gitignore\n")
+	commit, err := captureCandidate(context.Background(), dir, base, e, rules, captureTar(t, files, exec), t.TempDir(), "capture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := mustGit(t, dir, "diff", "--name-status", base, commit); status != "A\tSRC/a.tmp" {
+		t.Fatalf("status:\n%s", status)
+	}
+}
+
+func TestCaptureReadLimitInsideAFileIsTheAgentsFailure(t *testing.T) {
+	dir, base, e, rules := captureFixture(t)
+	files, exec := exportedTree(t, dir, e)
+	files["new.bin"] = bytes.Repeat([]byte{1}, 64<<10)
+	r := captureTar(t, files, exec)
+	defer func(old int64) { captureReadLimit = old }(captureReadLimit)
+	captureReadLimit = int64(r.Len()) - 32<<10 // inside new.bin's body
+	_, err := captureCandidate(context.Background(), dir, base, e, rules, r, t.TempDir(), "capture")
+	var content *agentContentError
+	if !errors.As(err, &content) {
+		t.Fatalf("got %v", err)
+	}
+}

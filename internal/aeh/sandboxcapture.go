@@ -26,6 +26,9 @@ const (
 	captureTotalLimit = int64(2) << 30
 )
 
+// captureReadLimit caps the raw tar stream of a capture (tests lower it).
+var captureReadLimit = readBackLimit
+
 // captured is one path of the candidate that differs from the base.
 type captured struct {
 	Path       string
@@ -92,7 +95,7 @@ func captureCandidate(ctx context.Context, root, base string, e *commitExport, r
 		return false
 	}
 	var total int64
-	tr := tar.NewReader(&cappedReader{r: r, left: readBackLimit})
+	tr := tar.NewReader(&cappedReader{r: r, left: captureReadLimit})
 	entries := 0
 	for {
 		h, err := tr.Next()
@@ -100,7 +103,7 @@ func captureCandidate(ctx context.Context, root, base string, e *commitExport, r
 			break
 		}
 		if errors.Is(err, errReadBackLimit) {
-			return "", agentContent("the agent's work directory exceeds %d GiB", readBackLimit>>30)
+			return "", agentContent("the agent's work directory exceeds the read-back limit of %d bytes", captureReadLimit)
 		}
 		if err != nil {
 			return "", fmt.Errorf("capture: read back: %w", err)
@@ -166,6 +169,9 @@ func captureCandidate(ctx context.Context, root, base string, e *commitExport, r
 		executable := h.Mode&0o111 != 0
 		spoolPath := filepath.Join(spool, strconv.Itoa(entries))
 		blob, err := spoolBlob(tr, h.Size, format, spoolPath)
+		if errors.Is(err, errReadBackLimit) {
+			return "", agentContent("the agent's work directory exceeds the read-back limit of %d bytes", captureReadLimit)
+		}
 		if err != nil {
 			return "", fmt.Errorf("capture %s: %w", rel, err)
 		}
