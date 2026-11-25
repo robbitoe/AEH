@@ -263,5 +263,27 @@ echo AGENT-OK`
 			fmt.Fprintf(w, "warning   %s (profiles %s) was not found in the agent image\n", p, strings.Join(programs[p], ", "))
 		}
 	}
+	// Sessions live in the main checkout, also when aeh runs from a linked worktree.
+	main, merr := MainCheckout(Repo{Root: s.root()})
+	for _, name := range names {
+		paths := cfg.Profiles[name].sandboxSession()
+		if len(paths) > 0 && merr != nil {
+			fmt.Fprintf(w, "warning   profile %s: %v\n", name, merr)
+			continue
+		}
+		if len(paths) == 0 {
+			continue
+		}
+		store, err := sessionStore(main, name, false)
+		var files map[string][]byte
+		if err == nil {
+			files, err = loadSession(store, paths)
+		}
+		if err != nil {
+			fmt.Fprintf(w, "warning   profile %s: %v\n", name, err)
+		} else if len(files) == 0 {
+			fmt.Fprintf(w, "warning   profile %s has no saved session; run: aeh sandbox login %s\n", name, name)
+		}
+	}
 	return nil
 }

@@ -1,0 +1,27 @@
+# Example image for AEH agents (sandbox, stage 6). It must hold the program of every
+# profile your configuration launches, and the tools those agents call while they work
+# (the gate image's tools are a good start). Agents run as user 10001 with a read-only
+# root filesystem; /tmp and HOME are writable, and HOME starts empty or with the
+# profile's saved session files. Pin the CLI versions you use.
+#
+#   docker build -t myproject-agents -f Dockerfile.agents \
+#     --build-arg CODEX_VERSION=<version> --build-arg CLAUDE_CODE_VERSION=<version> .
+#   docker image inspect -f '{{.Id}}' myproject-agents    # put this ID in sandbox.agent_image
+#
+# Then sign in once per profile that uses a session: aeh sandbox login <profile>
+FROM node:22-bookworm-slim
+
+ARG CODEX_VERSION
+ARG CLAUDE_CODE_VERSION
+RUN test -n "$CODEX_VERSION" && test -n "$CLAUDE_CODE_VERSION" \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates git \
+ && rm -rf /var/lib/apt/lists/* \
+ && npm install -g --ignore-scripts=false \
+      "@openai/codex@${CODEX_VERSION}" \
+      "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+ && npm cache clean --force
+
+ENV npm_config_cache=/tmp/npm-cache \
+    npm_config_update_notifier=false \
+    DISABLE_AUTOUPDATER=1

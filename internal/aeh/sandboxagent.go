@@ -29,9 +29,10 @@ var errOutputLimit = errors.New("agent output exceeds the limit")
 // step it runs (the view matrix of stage 6, section 4); nothing is inferred from the
 // profile.
 type agentLaunch struct {
-	Kind    string // implement, review, triage, plan, plan-review, discover, book-review, inspect, characterize
-	Profile Profile
-	PassEnv []string // host variable names the profile forwards into the container
+	Kind        string // implement, review, triage, plan, plan-review, discover, book-review, inspect, characterize
+	ProfileName string
+	Profile     Profile
+	PassEnv     []string // host variable names the profile forwards into the container
 	// Work is the tree at /work, read-only unless WorkRW. Nil: no /work.
 	Work   tarSource
 	WorkRW bool
@@ -165,6 +166,24 @@ func (s *sandbox) runAgent(ctx context.Context, a agentLaunch) (outPath string, 
 	if a.Memory != nil {
 		vols = append(vols, sandboxVolume{Target: sandboxMemory, ReadOnly: true, Fill: a.Memory})
 	}
+	// A profile with a session gets its stored files in a HOME volume, under the profile's
+	// lock until the write-back is done.
+	home, save, unlock, err := s.prepareSession(ctx, a.ProfileName, a.Profile)
+	if err != nil {
+		return infra(fmt.Errorf("session: %w", err))
+	}
+	defer unlock()
+	var saveSession func(string, LaunchResult)
+	if home != nil {
+		vols = append(vols, *home)
+		saveSession = func(cid string, _ LaunchResult) {
+			rep := save(cid)
+			_ = writePrivateJSON(filepath.Join(a.RunDir, a.LogName+".session.json"), rep)
+			for _, k := range rep.Kept {
+				fmt.Fprintf(os.Stderr, "warning: profile %s kept its previous session file %s\n", a.ProfileName, k)
+			}
+		}
+	}
 	timeout := time.Duration(a.Profile.TimeoutMinutes) * time.Minute
 	if timeout <= 0 {
 		timeout = 30 * time.Minute
@@ -192,7 +211,7 @@ func (s *sandbox) runAgent(ctx context.Context, a agentLaunch) (outPath string, 
 	}
 	res, err = s.run(ctx, sandboxLaunch{Kind: a.Kind, Argv: argv, Volumes: vols, Env: env, Workdir: workdir,
 		Pids: true, Timeout: timeout, Output: &cappedFile{f: out, left: agentOutputLimit},
-		Stderr: &cappedFile{f: errf, left: agentOutputLimit}, Agent: true}, after)
+		Stderr: &cappedFile{f: errf, left: agentOutputLimit}, Agent: true, SaveSession: saveSession}, after)
 	if err != nil {
 		return outPath, res, err
 	}

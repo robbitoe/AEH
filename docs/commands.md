@@ -206,11 +206,15 @@ Checks memory and its privacy settings: errors and warnings.
 
 `aeh memory record <ID>` retries a pending memory record of an accepted outcome.
 
-## Sandbox: gate commands in containers
+## Sandbox: gates and agents in containers
 
 ### `aeh sandbox check`
 
-`aeh sandbox check` verifies the optional `sandbox:` section of `aeh/config.yaml` without changing the project. It checks that the Docker client points at a local engine (`unix://` or `npipe://`, Linux containers, Docker 24 or later) and that the pinned image is present locally (aeh never pulls images). It then runs a throwaway preflight container with the same isolation as a gate: user `10001:10001`, a read-only root filesystem, no network besides loopback, empty proxy variables, an executable `100755` file that runs and a `100644` file that does not, a writable work view read back afterwards, and a read-only runner view. It also checks that the image has the first program of every configured command and warns when a command calls `git`, since sandboxed gates see no Git repository. With `sandbox.agent_image`, it runs a throwaway container from the agent image as user `10001` and warns about every profile whose program the agent image lacks.
+`aeh sandbox check` verifies the optional `sandbox:` section of `aeh/config.yaml` without changing the project. It checks that the Docker client points at a local engine (`unix://` or `npipe://`, Linux containers, Docker 24 or later) and that the pinned image is present locally (aeh never pulls images). It then runs a throwaway preflight container with the same isolation as a gate: user `10001:10001`, a read-only root filesystem, no network besides loopback, empty proxy variables, an executable `100755` file that runs and a `100644` file that does not, a writable work view read back afterwards, and a read-only runner view. It also checks that the image has the first program of every configured command and warns when a command calls `git`, since sandboxed gates see no Git repository. With `sandbox.agent_image`, it runs a throwaway container from the agent image as user `10001` and warns about every profile whose program the agent image lacks. It also warns about every profile with `sandbox.session` that has no saved session yet.
+
+### `aeh sandbox login`
+
+`aeh sandbox login <profile>` logs a profile's CLI in inside the agent image and keeps its session for later launches. The profile must declare `sandbox.session`, the files relative to `HOME` that its CLI needs to authenticate. The command runs the profile's `sandbox.login` (default: the profile's program followed by `login`) attached to your terminal, as user `10001` with an empty `HOME`, Docker's default network and no view of the project. When the login exits with code 0, aeh saves each declared file it left in `HOME` (a regular, non-empty file of at most 1 MiB) in a private store under `.aeh/sandbox/sessions/` of the main checkout; the command fails if it left none, and refuses to run unless the project ignores `.aeh/`. A login that times out (30 minutes) or is cancelled stops its container and saves nothing. Run it again whenever a session expires.
 
 ## Tracking
 

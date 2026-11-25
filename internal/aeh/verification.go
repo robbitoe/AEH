@@ -34,9 +34,11 @@ func sandboxContract(sb *sandbox) any {
 		AgentImage   string              `json:",omitempty"`
 		AgentNetwork string              `json:",omitempty"`
 		AgentEnv     map[string][]string `json:",omitempty"`
+		AgentSession map[string][]string `json:",omitempty"`
 	}{Policy: sandboxPolicyGates, Engine: sb.engine.ID, Image: sb.image.ID, Memory: sb.cfg.Memory, CPUs: sb.cfg.CPUs, GateEnv: sb.cfg.GateEnv}
 	if sb.agents() {
 		c.Policy, c.AgentImage, c.AgentNetwork, c.AgentEnv = sandboxPolicyAgents, sb.agent.ID, "bridge", sb.agentEnv
+		c.AgentSession = sb.agentSession
 	}
 	return c
 }
@@ -56,10 +58,13 @@ func openFlowSandbox(r Repo, cfg Config, flow string) (*sandbox, error) {
 		return nil, err
 	}
 	if sb.agents() {
-		sb.agentEnv = map[string][]string{}
+		sb.agentEnv, sb.agentSession = map[string][]string{}, map[string][]string{}
 		for name, p := range cfg.Profiles {
 			if env := p.sandboxPassEnv(); len(env) > 0 {
 				sb.agentEnv[name] = append([]string(nil), env...)
+			}
+			if files := p.sandboxSession(); len(files) > 0 {
+				sb.agentSession[name] = append([]string(nil), files...)
 			}
 		}
 	}

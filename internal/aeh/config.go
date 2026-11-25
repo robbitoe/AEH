@@ -38,19 +38,32 @@ func (p Profile) sandboxPassEnv() []string {
 	return p.Sandbox.PassEnv
 }
 
+// sandboxSession is the profile's sandbox.session, or none.
+func (p Profile) sandboxSession() []string {
+	if p.Sandbox == nil {
+		return nil
+	}
+	return p.Sandbox.Session
+}
+
 // ProfileSandbox lists the host variables a sandboxed agent receives. The project's
-// pass_env is never forwarded into a container: each profile names its own.
+// pass_env is never forwarded into a container: each profile names its own. Session
+// lists the files, relative to HOME, its CLI needs to authenticate: aeh keeps them
+// between launches (stage 6, section 6). Login is the command `aeh sandbox login` runs.
+// The new fields are omitted from JSON when unset, so plan digests do not change.
 type ProfileSandbox struct {
 	PassEnv []string `yaml:"pass_env"`
+	Session []string `yaml:"session" json:",omitempty"`
+	Login   []string `yaml:"login" json:",omitempty"`
 }
 
 // UnmarshalYAML rejects misspelled profile sandbox settings.
 func (s *ProfileSandbox) UnmarshalYAML(n *yaml.Node) error {
 	if n.Kind != yaml.MappingNode {
-		return errors.New("profile sandbox must be a mapping of pass_env")
+		return errors.New("profile sandbox must be a mapping of pass_env, session and login")
 	}
 	for i := 0; i+1 < len(n.Content); i += 2 {
-		if k := n.Content[i].Value; k != "pass_env" {
+		if k := n.Content[i].Value; k != "pass_env" && k != "session" && k != "login" {
 			return fmt.Errorf("profile sandbox: unknown key %q", k)
 		}
 	}
@@ -285,6 +298,19 @@ func (c *Config) validate() error {
 		for _, v := range p.sandboxPassEnv() {
 			if err := checkAgentEnvName(v); err != nil {
 				return fmt.Errorf("config: profile %q: sandbox.pass_env: %w", name, err)
+			}
+		}
+		if p.Sandbox != nil {
+			if err := checkSessionPaths(p.Sandbox.Session); err != nil {
+				return fmt.Errorf("config: profile %q: sandbox.session: %w", name, err)
+			}
+			for _, a := range p.Sandbox.Login {
+				if a == "" || strings.ContainsRune(a, 0) {
+					return fmt.Errorf("config: profile %q: sandbox.login: empty or invalid argument", name)
+				}
+			}
+			if len(p.Sandbox.Login) > 0 && len(p.Sandbox.Session) == 0 {
+				return fmt.Errorf("config: profile %q: sandbox.login needs sandbox.session: the files to keep after the login", name)
 			}
 		}
 	}
