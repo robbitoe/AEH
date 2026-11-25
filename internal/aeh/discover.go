@@ -715,10 +715,17 @@ func (d *discoverySession) attempt(ctx context.Context, a *DiscoveryAttempt, rou
 	var back agentOutput
 	var outPath string
 	if sb != nil {
+		// A failure of aeh or of the sandbox around the launch says nothing about the
+		// agent: it blocks, and running again after a block starts a new ladder round.
+		blocked := func(err error) (*discoveryOutput, string, error) {
+			a.Result, a.Feedback = "failed", discoveryDiagnostic(err.Error())
+			return nil, fmt.Sprintf("The discovery agent %q could not run in the sandbox:\n%s\nFix the cause (for example start Docker), then run again: aeh discover run %s",
+				a.Profile, discoveryDiagnostic(tail(err.Error(), 1500)), d.state.Slug), nil
+		}
 		// The agent writes to /out in its container; its files are read back into memory.
 		dir, mem, err := stepMemory(MemorySnapshot{Dir: d.memDir, Present: d.memDir != ""})
 		if err != nil {
-			return nil, "", err
+			return blocked(err)
 		}
 		limit := bookManifest(d.dcfg)
 		step, err := sb.agentStep(ctx, d.repo.Root, d.cfg, agentStep{Kind: "discover", Profile: a.Profile, Prompt: prompt,
@@ -728,7 +735,10 @@ func (d *discoverySession) attempt(ctx context.Context, a *DiscoveryAttempt, rou
 				return err
 			}})
 		if err != nil {
-			return nil, "", err
+			if ctx.Err() != nil {
+				return nil, "", err
+			}
+			return blocked(err)
 		}
 		outPath, err = step.OutPath, step.AgentErr
 	} else {

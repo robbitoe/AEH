@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +37,16 @@ func outTar(t *testing.T, entries ...tar.Header) []byte {
 	return b.Bytes()
 }
 
+// manyDirs is an archive of directory headers only: no file counts against the limits,
+// so only the cap on the raw stream stops it.
+func manyDirs(n int) []tar.Header {
+	h := make([]tar.Header, n)
+	for i := range h {
+		h[i] = tar.Header{Name: fmt.Sprintf("out/d%d/", i), Typeflag: tar.TypeDir, Mode: 0o755}
+	}
+	return h
+}
+
 func TestReadAgentOutput(t *testing.T) {
 	ok := outTar(t, tar.Header{Name: "out/features/", Typeflag: tar.TypeDir, Mode: 0o755},
 		tar.Header{Name: "out/features/cart.md", Typeflag: tar.TypeReg, Mode: 0o644, Size: 3})
@@ -49,7 +60,8 @@ func TestReadAgentOutput(t *testing.T) {
 		"too large":  outTar(t, tar.Header{Name: "out/a", Typeflag: tar.TypeReg, Size: 200}),
 		"escape":     outTar(t, tar.Header{Name: "elsewhere/a", Typeflag: tar.TypeReg, Size: 1}),
 		"device":     outTar(t, tar.Header{Name: "out/null", Typeflag: tar.TypeChar}),
-		"stream cap": outTar(t, tar.Header{Name: "out/a", Typeflag: tar.TypeReg, Size: 1 << 20}),
+		"file size":  outTar(t, tar.Header{Name: "out/a", Typeflag: tar.TypeReg, Size: 1 << 20}),
+		"stream cap": outTar(t, manyDirs(400)...),
 	} {
 		maxFiles := 1
 		if name == "link" || name == "escape" || name == "device" {

@@ -2,6 +2,8 @@ package aeh
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -66,5 +68,31 @@ func TestDockerSandboxedInspectionInfrastructureFailureBlocks(t *testing.T) {
 	st, err := AdoptInventory(context.Background(), f.repo, "", nil)
 	if err == nil || !strings.Contains(err.Error(), "sandbox infrastructure failure") || st.Status != StatusBlocked || len(st.Attempts) != 1 {
 		t.Fatalf("%v: %+v", err, st)
+	}
+}
+
+// A failure of aeh around the launch (here, the attempt's run directory cannot be
+// created) blocks discovery; running again starts a new ladder round and the agent runs.
+func TestDockerSandboxedDiscoveryLaunchErrorBlocks(t *testing.T) {
+	image := testImageID(t)
+	f := newDiscoveryFixture(t, askTwo)
+	sandboxedDiscoveryConfig(t, f, image, askTwo, "")
+	mustGit(t, f.dir, "add", "-A")
+	mustGit(t, f.dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "sandbox")
+	if _, err := DiscoverNew(f.repo, "shop", "A small online shop."); err != nil {
+		t.Fatal(err)
+	}
+	blocker := f.repo.RunDir("discover-shop", "a1")
+	write(t, filepath.Dir(blocker), filepath.Base(blocker), "not a directory\n")
+	st, err := DiscoverRun(context.Background(), f.repo, "shop", nil)
+	if err != nil || st.Status != StatusBlocked || len(st.Attempts) != 1 || !strings.Contains(st.Question, "could not run in the sandbox") {
+		t.Fatalf("%v: %+v", err, st)
+	}
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	st = f.run()
+	if len(st.Rounds) != 1 || len(st.Rounds[0].Questions) != 2 {
+		t.Fatalf("after the fix: %+v", st)
 	}
 }
