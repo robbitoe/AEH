@@ -31,7 +31,7 @@ func TestAgentSandboxConfig(t *testing.T) {
 	}
 	for name, body := range map[string]string{
 		"unpinned agent image": minimalConfig + "sandbox:\n  image: \"" + testDigest + "\"\n  agent_image: \"agents:latest\"\n",
-		"unknown profile key":  minimalConfig + "    sandbox:\n      session: [x]\n",
+		"unknown profile key":  minimalConfig + "    sandbox:\n      mounts: [x]\n",
 		"reserved name":        minimalConfig + "    sandbox:\n      pass_env: [HOME]\n",
 		"proxy name":           minimalConfig + "    sandbox:\n      pass_env: [https_proxy]\n",
 		"invalid name":         minimalConfig + "    sandbox:\n      pass_env: [\"A-B\"]\n",

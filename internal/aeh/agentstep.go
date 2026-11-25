@@ -80,7 +80,7 @@ func (s *sandbox) agentStep(ctx context.Context, root string, cfg Config, st age
 		r.AgentErr = fmt.Errorf("%w: %v", errSandboxInfrastructure, err)
 		return r, writeLaunchRecord(s, st, r)
 	}
-	a := agentLaunch{Kind: st.Kind, Profile: p, PassEnv: p.sandboxPassEnv(), Prompt: sandboxNote(st) + st.Prompt,
+	a := agentLaunch{Kind: st.Kind, ProfileName: st.Profile, Profile: p, PassEnv: p.sandboxPassEnv(), Prompt: sandboxNote(st) + st.Prompt,
 		RunDir: st.RunDir, LogName: st.LogName, Out: st.Out}
 	var reads []func(func(string, func(io.Reader) error) error) error
 	if st.Work != "" {

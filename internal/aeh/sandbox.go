@@ -180,6 +180,19 @@ func (d dockerCLI) run(ctx context.Context, stdin io.Reader, stdout io.Writer, a
 	return strings.TrimSpace(out.String()), nil
 }
 
+// attach runs one docker command on the terminal of an interactive launch. The process
+// gets the terminal's own file as stdin, so the client can put it in raw mode.
+func (d dockerCLI) attach(ctx context.Context, t *interactiveIO, args ...string) error {
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd.Env = d.env
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = t.In, t.Out, t.Err
+	cmd.WaitDelay = 5 * time.Second
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("docker %s: %w", args[0], err)
+	}
+	return nil
+}
+
 // stream runs one docker command and hands its standard output to fn as it arrives. The
 // reader is the process's own pipe, so a slow consumer (the capture hashes as it reads)
 // only slows the command down: no copy deadline runs after the process exits. When fn
@@ -348,9 +361,11 @@ type sandbox struct {
 	// agentEnv is each profile's sandbox.pass_env, pinned with the policy: which host
 	// values reach an agent is an isolation field.
 	agentEnv map[string][]string
-	project  string // label: first 12 hex digits of sha256(project root)
-	dir      string // runner-private directory: .aeh/sandbox
-	flow     string // intents of this flow live in dir/intents/<flow>
+	// agentSession is each profile's sandbox.session, pinned the same way.
+	agentSession map[string][]string
+	project      string // label: first 12 hex digits of sha256(project root)
+	dir          string // runner-private directory: .aeh/sandbox
+	flow         string // intents of this flow live in dir/intents/<flow>
 }
 
 func projectLabel(root string) string {
@@ -505,6 +520,16 @@ type sandboxVolume struct {
 	Target   string
 	ReadOnly bool
 	Fill     tarSource
+	// Private fills with directories 0700 and files 0600 (a HOME with session files).
+	Private bool
+}
+
+// interactiveIO attaches a launch to a terminal (aeh sandbox login): the container gets
+// stdin, and a TTY when the input is one.
+type interactiveIO struct {
+	In       *os.File
+	Out, Err io.Writer
+	TTY      bool
 }
 
 // sandboxLaunch describes one container. The caller decides every view; nothing is
@@ -523,6 +548,23 @@ type sandboxLaunch struct {
 	// decision Q3-A: the file system is isolated, the network only from S3 on). Gates run
 	// in the gate image with no network.
 	Agent bool
+	// Interactive attaches the launch to a terminal instead of collecting its output.
+	Interactive *interactiveIO
+	// SaveSession runs while the stopped container still exists, before after, when the
+	// process exited by itself: it reads the profile's session files back from HOME. It
+	// reports its own problems; it never changes the launch's result.
+	SaveSession func(container string, res LaunchResult)
+}
+
+// homeVolume reports whether the launch mounts a volume at HOME (a profile with a
+// session), which replaces the HOME tmpfs.
+func (l sandboxLaunch) homeVolume() bool {
+	for _, v := range l.Volumes {
+		if v.Target == sandboxHome {
+			return true
+		}
+	}
+	return false
 }
 
 // launchImage and launchNetwork are what a launch must run with.
@@ -682,7 +724,7 @@ func (s *sandbox) checkCreated(c containerState, l sandboxLaunch, vols []sandbox
 		}
 	}
 	for target := range c.HostConfig.Tmpfs {
-		if target != "/tmp" && target != sandboxHome {
+		if target != "/tmp" && (target != sandboxHome || l.homeVolume()) {
 			problems = append(problems, "unexpected tmpfs at "+target)
 		}
 	}
@@ -736,7 +778,7 @@ func (s *sandbox) fill(ctx context.Context, id, kind, image string, vols []sandb
 			continue
 		}
 		pr, pw := io.Pipe()
-		go func() { pw.CloseWithError(writeVolumeTar(pw, filepath.Base(v.Target), v.Fill)) }()
+		go func() { pw.CloseWithError(writeVolumeTarMode(pw, filepath.Base(v.Target), v.Fill, v.Private)) }()
 		_, err := s.d.run(ctx, pr, nil, "cp", "-a", "-", loader+":"+parentDir(v.Target))
 		pr.CloseWithError(err)
 		if err != nil {
@@ -813,11 +855,22 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 	args := append([]string{"create", "--pull=never"}, s.labels(in.ID, l.Kind, "consumer")...)
 	args = append(args, "--network", launchNetwork(l), "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
 		"--memory", s.cfg.Memory, "--memory-swap", s.cfg.Memory, "--cpus", s.cfg.CPUs, "--read-only",
-		"--tmpfs", "/tmp:mode=1777", "--tmpfs", sandboxHome+":uid=10001,gid=10001,mode=0700",
+		"--tmpfs", "/tmp:mode=1777",
 		"--user", sandboxUser, "--workdir", l.Workdir, "--env-file", envFile, "--entrypoint", l.Argv[0],
 		"--log-driver", "json-file", "--log-opt", "max-size="+sandboxLogKeep)
+	if !l.homeVolume() {
+		// HOME is disposable; a profile with a session gets a volume instead, read back
+		// after the process exits.
+		args = append(args, "--tmpfs", sandboxHome+":uid=10001,gid=10001,mode=0700")
+	}
 	if l.Pids {
 		args = append(args, "--pids-limit", "512")
+	}
+	if l.Interactive != nil {
+		args = append(args, "--interactive")
+		if l.Interactive.TTY {
+			args = append(args, "--tty")
+		}
 	}
 	for _, v := range vols {
 		// volume-nocopy: Docker would otherwise copy the image's directory at the mount
@@ -854,7 +907,15 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 	// No attach: the status comes from docker wait and inspect, the output from docker
 	// logs afterwards. Each has its own error, so a failure to stream or store the output
 	// can never pass for the container's result.
-	if _, err := s.d.run(runCtx, nil, nil, "start", cid); err != nil && runCtx.Err() == nil {
+	if l.Interactive != nil {
+		// The terminal is attached until the process exits; its status still comes from
+		// docker wait and inspect. A container that never started is a runtime failure.
+		if err := s.d.attach(runCtx, l.Interactive, "start", "--attach", "--interactive", cid); err != nil && runCtx.Err() == nil {
+			if st, ierr := s.inspect(cid); ierr != nil || st.State.Status == "created" {
+				return infra(err)
+			}
+		}
+	} else if _, err := s.d.run(runCtx, nil, nil, "start", cid); err != nil && runCtx.Err() == nil {
 		return infra(err)
 	}
 	waited, waitErr := s.d.run(runCtx, nil, nil, "wait", cid)
@@ -874,6 +935,9 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 	res = classify(st)
 	if msg := waitMismatch(waited, waitErr, res); msg != "" {
 		return LaunchResult{Class: ClassInfrastructure, ExitCode: -1, Reason: msg}, nil
+	}
+	if l.SaveSession != nil && res.Class == ClassProcess {
+		l.SaveSession(cid, res)
 	}
 	if l.Output != nil {
 		if err := s.logs(ctx, cid, l.Output, l.Stderr); err != nil {

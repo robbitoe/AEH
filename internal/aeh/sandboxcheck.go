@@ -263,5 +263,17 @@ echo AGENT-OK`
 			fmt.Fprintf(w, "warning   %s (profiles %s) was not found in the agent image\n", p, strings.Join(programs[p], ", "))
 		}
 	}
+	for _, name := range names {
+		paths := cfg.Profiles[name].sandboxSession()
+		if len(paths) == 0 {
+			continue
+		}
+		files, err := loadSession(s.sessionDir(name), paths)
+		if err != nil {
+			fmt.Fprintf(w, "warning   profile %s: %v\n", name, err)
+		} else if len(files) == 0 {
+			fmt.Fprintf(w, "warning   profile %s has no saved session; run: aeh sandbox login %s\n", name, name)
+		}
+	}
 	return nil
 }

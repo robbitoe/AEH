@@ -98,14 +98,40 @@ Each agent launch gets only what its step needs:
 - **Outputs** written to `/out` are read back into memory and checked exactly like a host output directory: only the expected files, portable names, size limits. Nothing is written to the host's file system. `{{output_dir}}` in a profile's command becomes `/out`, and adoption prompts name `/out`.
 - **Adoption inspectors** get the same filtered view as on the host: possible secrets (`.env*`, `*.pem`, `*.key`, `id_*`, `*.pfx`, `credentials*`, `secrets*`), `adopt.exclude` and links are left out, and the prompt lists them. The view is read-only, so the inspected code cannot change.
 - **Prompts** start with a short note naming `/work`, and `/memory` with its memory commit: the plan's pinned commit for a planned run, otherwise memory's commit when the first agent of the command starts. `{{prompt_file}}` becomes `/run/aeh/prompt.md`, and a profile with `stdin: true` reads that file.
-- **Environment.** The container gets `HOME` (empty and private to the launch), the profile's `env` map and the host values of the names in its `sandbox.pass_env`. The project's `pass_env` is never forwarded, and `env` may refer only to names the profile forwards. Host paths such as `CODEX_HOME` or `CLAUDE_CONFIG_DIR` are not forwarded.
+- **Environment.** The container gets `HOME` (private to the launch, empty or holding the profile's session files), the profile's `env` map and the host values of the names in its `sandbox.pass_env`. The project's `pass_env` is never forwarded, and `env` may refer only to names the profile forwards. Host paths such as `CODEX_HOME` or `CLAUDE_CONFIG_DIR` are not forwarded.
 - **Network.** Agents use Docker's default network so their CLIs can reach their providers; the network is not filtered yet. Gates keep no network.
-- **Sign-in.** Agents start with an empty home directory in this version, so a CLI must authenticate through variables in `sandbox.pass_env` (for example an API key). Keeping a CLI's login between launches is the next step.
+- **Sign-in.** A CLI authenticates through variables in `sandbox.pass_env` (for example an API key) or through a session kept by aeh (below).
 - **Sealed tests you approved by hand** (`aeh tests approve`) must be committed exactly as approved: every sealed file tracked, no untracked file under the acceptance paths, and the same bytes in the commit (line endings converted by `core.autocrlf` are accepted). Containers run the committed bytes, so a test Git ignores or a filter rewrites would otherwise not be the one that runs.
 - **Codex profiles** need `--skip-git-repo-check`, because `/work` is not a Git repository.
 - **Failures.** If Docker or the image fails during a launch, the step blocks with the reason without consuming a ladder attempt. A triage that cannot finish for such a reason is not replaced by the default route: the command stops and triages again next time.
 
-`aeh sandbox check` also runs a throwaway container from the agent image and warns about every profile whose program the image lacks. Each launch writes `<log>.launch.json` beside its output, with the class, exit code, image, network, the commit at `/work`, the memory commit and the captured candidate. The contracts of runs and plans pin policy 2, the agent image and every profile's `sandbox.pass_env`. Discovery sessions and adoption areas do not pin them: their outputs are documents you review, and each command uses the current configuration.
+`aeh sandbox check` also runs a throwaway container from the agent image and warns about every profile whose program the image lacks. Each launch writes `<log>.launch.json` beside its output, with the class, exit code, image, network, the commit at `/work`, the memory commit and the captured candidate. The contracts of runs and plans pin policy 2, the agent image and every profile's `sandbox.pass_env` and `sandbox.session`. Discovery sessions and adoption areas do not pin them: their outputs are documents you review, and each command uses the current configuration.
+
+### Sessions
+
+A profile that signs in with a subscription instead of an API key declares the files its CLI needs to authenticate, relative to `HOME`, and logs in once inside the agent image:
+
+```yaml
+profiles:
+  medio:
+    provider: openai
+    command: [codex, exec, --skip-git-repo-check, "{{prompt}}"]
+    sandbox:
+      session: [.codex/auth.json]
+      login: [codex, login, --device-auth]
+```
+
+```sh
+aeh sandbox login medio
+```
+
+- **Only these files persist.** Before each launch, aeh copies them into a new `HOME` volume (directories `0700`, files `0600`). After the process exits by itself, aeh reads back each declared file and replaces the stored copy only if it is a regular, non-empty file of at most 1 MiB read completely; any other result keeps the previous copy, and the launch writes `<log>.session.json` with what was saved and what was kept. Configuration, instructions, plugins and history never persist, so a profile that writes code in one step starts as a clean reviewer in the next.
+- **The store** is `.aeh/sandbox/sessions/`, private to your user and never mounted into a container. A per-profile lock serializes logins and launches of the same profile, from the copy into `HOME` to the write-back, so a refreshed token is never overwritten by an older one. The lock is the operating system's and ends with the process that holds it.
+- **The session files are credentials the agent can read during its launch**, as on the host. If a CLI cannot work from its authentication files alone, declare the extra files it needs (they persist too) or keep that profile out of the sandbox.
+- **A profile with `sandbox.session` and nothing saved** cannot launch: the step blocks with the command to run, without consuming a ladder attempt.
+- The contracts of runs and plans also pin every profile's `sandbox.session` list.
+
+The login runs with an empty `HOME` and no view of the project. Choose a login flow that works in a terminal without a local browser, such as a device code; the exact files and flags depend on each CLI and its version. `docs/sandbox/Dockerfile.agents` is an example agent image.
 
 ## A .NET example
 
