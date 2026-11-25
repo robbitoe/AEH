@@ -9,7 +9,7 @@ Without a sandbox, AEH runs your build, test and acceptance commands on your mac
 
 After every command, AEH reads the copy back and checks it. Tracked files must keep their bytes and modes. New files must be ignored by the commit's `.gitignore`. Links and devices are refused. A command that changes a sealed test, a tracked file or plants a link fails, exactly like "verification changed the checkout" on the host.
 
-With `sandbox.agent_image`, the agents of `aeh run` and `aeh do` (implementer, reviewers and triage) also run in containers: see [Agents in containers](#agents-in-containers). Test authors, plan reviewers, discovery and adoption agents are not sandboxed yet; with `agent_image` set, those commands stop instead of running an agent on the host.
+With `sandbox.agent_image`, the agents of `aeh run`, `aeh do` and `aeh plan` (implementer, reviewers, triage, test and characterization authors) also run in containers: see [Agents in containers](#agents-in-containers). Discovery and adoption agents are not sandboxed yet; with `agent_image` set, those commands stop instead of running an agent on the host.
 
 ## Requirements
 
@@ -66,7 +66,7 @@ Runs and plans pin the sandbox in their contract: the policy version, the Docker
 
 ## Agents in containers
 
-Set `sandbox.agent_image` to run the agents of `aeh run` and `aeh do` in containers too (sandbox policy version 2):
+Set `sandbox.agent_image` to run the agents of `aeh run`, `aeh do` and `aeh plan` in containers too (sandbox policy version 2):
 
 ```yaml
 sandbox:
@@ -88,8 +88,10 @@ Each agent launch gets only what its step needs:
 | implementer | a copy of the base commit, writable | product memory, read-only |
 | QA, security and DBA reviewers | a copy of the candidate, read-only | product memory, read-only |
 | triage | a copy of the base commit, read-only | product memory, read-only |
+| test or characterization author (`aeh plan`) | a copy of the plan's base, writable | the plan's pinned memory, read-only |
+| plan reviewers | a copy of the plan commit, read-only | the plan's pinned memory, read-only |
 
-- **Nothing an agent writes is checked out on the host.** AEH reads the implementer's `/work` back and records it as the candidate commit from Git objects, through a private index; no `git add`, filter, hook or attribute runs on agent content. New files ignored by the base commit's `.gitignore` are left out. A link, a device, a `.git` entry or an oversized file fails the attempt with the path, like any other agent failure. Reviewers and the final check read exports of the commit, so no host worktree is created at all.
+- **Nothing an agent writes is checked out on the host.** AEH reads the implementer's `/work` back and records it as the candidate commit from Git objects, through a private index; no `git add`, filter, hook or attribute runs on agent content. New files ignored by the base commit's `.gitignore` are left out. A link, a device, a `.git` entry or an oversized file fails the attempt with the path, like any other agent failure. Reviewers, plan checks and the final check read exports of the commit, so no host worktree holds agent content. A plan with no test to write (only retirements) is still written by aeh on a host checkout of its base.
 - **Prompts** start with a short note naming `/work`, and `/memory` with its memory commit: the plan's pinned commit for a planned run, otherwise memory's commit when the first agent of the command starts. `{{prompt_file}}` becomes `/run/aeh/prompt.md`, and a profile with `stdin: true` reads that file.
 - **Environment.** The container gets `HOME` (empty and private to the launch), the profile's `env` map and the host values of the names in its `sandbox.pass_env`. The project's `pass_env` is never forwarded, and `env` may refer only to names the profile forwards. Host paths such as `CODEX_HOME` or `CLAUDE_CONFIG_DIR` are not forwarded.
 - **Network.** Agents use Docker's default network so their CLIs can reach their providers; the network is not filtered yet. Gates keep no network.

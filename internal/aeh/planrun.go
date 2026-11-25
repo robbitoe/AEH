@@ -834,6 +834,9 @@ func (p *planner) preflight() error {
 		if err := p.cfg.checkProfile(n); err != nil {
 			return err
 		}
+		if p.cfg.agentsSandboxed() {
+			continue // the program lives in the agent image; aeh sandbox check looks for it
+		}
 		if _, err := exec.LookPath(p.cfg.Profiles[n].Command[0]); err != nil {
 			return fmt.Errorf("profile %q: %s is not installed or not on PATH", n, p.cfg.Profiles[n].Command[0])
 		}
@@ -1093,6 +1096,15 @@ func (p *planner) blockNow(question string) string {
 	return question
 }
 
+// agentMemory is the memory export of the plan's sandboxed agents: the commit the plan
+// was reserved at, or memory's HEAD for a plan reserved before memory was pinned.
+func (p *planner) agentMemory() (dir, commit string, err error) {
+	if p.state.MemoryCommit != "" {
+		return p.memDir, p.state.MemoryCommit, nil
+	}
+	return stepMemory(MemorySnapshot{Dir: p.memDir, Present: p.memDir != ""})
+}
+
 func (p *planner) planWorktree(n int) string {
 	return p.repo.WorktreePath(fmt.Sprintf("%s-plan-a%d", p.state.ID, n))
 }
@@ -1106,16 +1118,22 @@ func (p *planner) attempt(ctx context.Context, a *PlanAttempt, feedback string) 
 		a.FailedStep, a.Feedback = step, msg
 		return "", nil
 	}
-	wt := p.planWorktree(a.N)
-	if err := p.freshWorktree(wt, st.Base); err != nil {
-		return "", err
-	}
-	keep := false
-	defer func() {
-		if !keep {
-			removeWorktree(r.Root, wt)
+	// Under sandbox policy 2 the author works on an export of the base and its tests are
+	// captured from the container: nothing it wrote is checked out on the host. A plan
+	// without an author is written by the runner on a host checkout of the base.
+	sandboxed := p.sb.agents() && !p.authorless()
+	message := fmt.Sprintf("aeh: plan %s (attempt %d, %s)", st.ID, a.N, a.Profile)
+	wt, keep, captured := p.planWorktree(a.N), false, ""
+	if !sandboxed {
+		if err := p.freshWorktree(wt, st.Base); err != nil {
+			return "", err
 		}
-	}()
+		defer func() {
+			if !keep {
+				removeWorktree(r.Root, wt)
+			}
+		}()
+	}
 	in := p.input()
 	if p.authorless() {
 		// Only retirements: nothing for a test author to write. The runner writes the plan
@@ -1136,17 +1154,38 @@ func (p *planner) attempt(ctx context.Context, a *PlanAttempt, feedback string) 
 			return "", err
 		}
 		p.logf("  plan attempt %d with profile %q", a.N, a.Profile)
-		if err := p.cfg.hostAgents("plan"); err != nil {
-			return "", err
-		}
-		outPath, err := runAgent(ctx, p.cfg.Profiles[a.Profile], p.cfg.PassEnv, wt, prompt, runDir, "plan")
-		if err != nil {
-			if uncertainExit(err) {
-				keep = true
-				a.FailedStep, a.Feedback = "author", err.Error()
-				return p.blockNow(fmt.Sprintf("The plan author %q was interrupted or timed out (worktree kept at %s). Confirm all processes stopped and review possible effects before answering to retry.", a.Profile, wt)), nil
+		var outPath string
+		if sandboxed {
+			dir, mem, err := p.agentMemory()
+			if err != nil {
+				return "", err
 			}
-			return fail("author", err.Error())
+			step, err := p.sb.agentStep(ctx, r.Root, p.cfg, agentStep{Kind: "plan", Profile: a.Profile, Prompt: prompt,
+				RunDir: runDir, LogName: "plan", Work: st.Base, Capture: message, MemoryDir: dir, MemoryCommit: mem})
+			if err != nil {
+				return "", err
+			}
+			outPath, captured, err = step.OutPath, step.Candidate, step.AgentErr
+			if err != nil && uncertainExit(err) {
+				a.FailedStep, a.Feedback = "author", err.Error()
+				return p.blockNow(fmt.Sprintf("The plan author %q stopped without a result:\n%s\nFix the cause (for example start Docker), then answer to retry.", a.Profile, tail(err.Error(), 1500))), nil
+			}
+			if err != nil {
+				return fail("author", err.Error())
+			}
+		} else {
+			if err := p.cfg.hostAgents("plan"); err != nil {
+				return "", err
+			}
+			outPath, err = runAgent(ctx, p.cfg.Profiles[a.Profile], p.cfg.PassEnv, wt, prompt, runDir, "plan")
+			if err != nil {
+				if uncertainExit(err) {
+					keep = true
+					a.FailedStep, a.Feedback = "author", err.Error()
+					return p.blockNow(fmt.Sprintf("The plan author %q was interrupted or timed out (worktree kept at %s). Confirm all processes stopped and review possible effects before answering to retry.", a.Profile, wt)), nil
+				}
+				return fail("author", err.Error())
+			}
 		}
 		out, _ := os.ReadFile(outPath)
 		switch planVerdict(string(out)) {
@@ -1160,9 +1199,14 @@ func (p *planner) attempt(ctx context.Context, a *PlanAttempt, feedback string) 
 			return fail("author", `the author's output must end with "PLAN: READY" or "PLAN: TOO-LARGE"`)
 		}
 	}
-	candidate, err := candidateCommit(wt, st.Base, fmt.Sprintf("aeh: plan %s (attempt %d, %s)", st.ID, a.N, a.Profile))
-	if err != nil {
-		return fail("scope", err.Error())
+	candidate := captured
+	if !sandboxed {
+		var err error
+		if candidate, err = candidateCommit(wt, st.Base, message); err != nil {
+			return fail("scope", err.Error())
+		}
+	} else if candidate == "" {
+		return "", errors.New("the sandbox returned no candidate for a clean author exit")
 	}
 	a.Candidate = candidate
 	files, err := planCandidateFiles(r.Root, st.Base, candidate)
@@ -1251,25 +1295,36 @@ func (p *planner) verifyFrozen(ctx context.Context, a *PlanAttempt) (string, err
 			return "", err
 		}
 	}
-	vwt := p.planWorktree(a.N) + "-verify"
-	if err := p.freshWorktree(vwt, a.Frozen); err != nil {
-		return "", err
-	}
-	keep := false
-	defer func() {
-		if !keep {
-			removeWorktree(r.Root, vwt)
+	// Under sandbox policy 2 the frozen plan holds agent-written tests, so it is never
+	// checked out on the host: checks and reviewers read exports of the commit.
+	sandboxed := p.sb.agents()
+	vwt, keep := "", false
+	if !sandboxed {
+		vwt = p.planWorktree(a.N) + "-verify"
+		if err := p.freshWorktree(vwt, a.Frozen); err != nil {
+			return "", err
 		}
-	}()
+		defer func() {
+			if !keep {
+				removeWorktree(r.Root, vwt)
+			}
+		}()
+	}
+	kept := func() string {
+		if sandboxed {
+			return "its containers were removed"
+		}
+		return "worktree kept at " + vwt
+	}
 	if a.FailedStep == "checking" {
-		if a.Mapped != a.Frozen {
+		if a.Mapped != a.Frozen && !sandboxed {
 			if err := p.freshWorktree(vwt, a.Mapped); err != nil {
 				return "", err
 			}
 		}
 		v, verr := newVerification(ctx, p.sb, r.Root, vwt, a.Mapped, p.cfg)
 		if verr != nil {
-			keep = true
+			keep = !sandboxed
 			a.FailedStep, a.Feedback = "checking", verr.Error()
 			return p.blockNow(fmt.Sprintf("The sandbox could not prepare the plan checks of %s: %v\nFix it (aeh sandbox check), then answer to retry.", short(a.Mapped), verr)), nil
 		}
@@ -1282,9 +1337,9 @@ func (p *planner) verifyFrozen(ctx context.Context, a *PlanAttempt) (string, err
 		}
 		_ = writePrivateJSON(filepath.Join(runDir, "checks.json"), checks)
 		if uncertain {
-			keep = true
+			keep = !sandboxed
 			a.FailedStep, a.Feedback = step, msg
-			return p.blockNow(fmt.Sprintf("Plan check %s was interrupted or timed out (worktree kept at %s). Confirm all processes stopped, then answer to retry.", step, vwt)), nil
+			return p.blockNow(fmt.Sprintf("Plan check %s was interrupted or timed out (%s). Confirm all processes stopped, then answer to retry.", step, kept())), nil
 		}
 		if step != "" {
 			return fail(step, msg)
@@ -1293,7 +1348,7 @@ func (p *planner) verifyFrozen(ctx context.Context, a *PlanAttempt) (string, err
 		if err := p.save(); err != nil {
 			return "", err
 		}
-		if a.Mapped != a.Frozen {
+		if a.Mapped != a.Frozen && !sandboxed {
 			if err := p.freshWorktree(vwt, a.Frozen); err != nil {
 				return "", err
 			}
@@ -1314,9 +1369,9 @@ func (p *planner) verifyFrozen(ctx context.Context, a *PlanAttempt) (string, err
 		question := ""
 		switch {
 		case g.Uncertain:
-			keep = true
+			keep = !sandboxed
 			a.FailedStep, a.Feedback = "review", g.Output
-			question = p.blockNow(fmt.Sprintf("The %s review of the plan was interrupted or timed out (worktree kept at %s). Confirm all processes stopped, then answer to retry.", role, vwt))
+			question = p.blockNow(fmt.Sprintf("The %s review of the plan was interrupted or timed out (%s). Confirm all processes stopped, then answer to retry.", role, kept()))
 		case !g.Passed:
 			a.FailedStep, a.Feedback = "review", g.Output
 		}
@@ -1773,12 +1828,29 @@ func (p *planner) review(ctx context.Context, role, author, commit, mapped, wt, 
 	}
 	p.logf("    review %s with %q (%s) on %s", role, profile, v.Provider, short(commit))
 	start := time.Now()
-	if err := p.cfg.hostAgents("plan"); err != nil {
-		return v, g, err
+	var outPath string
+	var checkoutErr error
+	if p.sb.agents() {
+		// A read-only export of the plan commit: the reviewer cannot change what it reviews.
+		g.Sandboxed = true
+		dir, mem, merr := p.agentMemory()
+		if merr != nil {
+			return v, g, merr
+		}
+		step, serr := p.sb.agentStep(ctx, p.repo.Root, p.cfg, agentStep{Kind: "plan-review", Profile: profile, Prompt: prompt,
+			RunDir: runDir, LogName: "review-" + role, Work: commit, MemoryDir: dir, MemoryCommit: mem})
+		if serr != nil {
+			return v, g, serr
+		}
+		outPath, err = step.OutPath, step.AgentErr
+	} else {
+		if err := p.cfg.hostAgents("plan"); err != nil {
+			return v, g, err
+		}
+		outPath, err = runAgent(ctx, p.cfg.Profiles[profile], p.cfg.PassEnv, wt, prompt, runDir, "review-"+role)
+		checkoutErr = verifyCheckout(wt, commit)
 	}
-	outPath, err := runAgent(ctx, p.cfg.Profiles[profile], p.cfg.PassEnv, wt, prompt, runDir, "review-"+role)
 	g.Seconds = time.Since(start).Seconds()
-	checkoutErr := verifyCheckout(wt, commit)
 	if err != nil {
 		g.Output, g.Uncertain = err.Error(), uncertainExit(err)
 		if checkoutErr != nil {
