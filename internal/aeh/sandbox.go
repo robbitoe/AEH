@@ -275,10 +275,11 @@ type sandbox struct {
 	cfg     SandboxConfig
 	d       dockerCLI
 	engine  sandboxEngine
-	image   sandboxImage
-	project string // label: first 12 hex digits of sha256(project root)
-	dir     string // runner-private directory: .aeh/sandbox
-	flow    string // intents of this flow live in dir/intents/<flow>
+	image   sandboxImage // gates
+	agent   sandboxImage // agents (S2); empty until an agent image is configured
+	project string       // label: first 12 hex digits of sha256(project root)
+	dir     string       // runner-private directory: .aeh/sandbox
+	flow    string       // intents of this flow live in dir/intents/<flow>
 }
 
 func projectLabel(root string) string {
@@ -440,7 +441,27 @@ type sandboxLaunch struct {
 	Workdir string
 	Pids    bool // agents get a PIDs limit; gates do not
 	Timeout time.Duration
-	Output  io.Writer // combined stdout and stderr
+	Output  io.Writer // stdout, and stderr too unless Stderr is set
+	Stderr  io.Writer
+	// Agent selects the agent image and Docker's default bridge network (S2, owner
+	// decision Q3-A: the file system is isolated, the network only from S3 on). Gates run
+	// in the gate image with no network.
+	Agent bool
+}
+
+// launchImage and launchNetwork are what a launch must run with.
+func (s *sandbox) launchImage(l sandboxLaunch) sandboxImage {
+	if l.Agent {
+		return s.agent
+	}
+	return s.image
+}
+
+func launchNetwork(l sandboxLaunch) string {
+	if l.Agent {
+		return "bridge"
+	}
+	return "none"
 }
 
 // containerState is the part of docker inspect aeh checks.
@@ -506,9 +527,9 @@ const (
 
 // launchEnv is the environment a container must end up with: the image's, then
 // HOME, TMPDIR, empty proxy variables and the launch's own.
-func (s *sandbox) launchEnv(extra []string) ([]string, map[string]string, error) {
+func (s *sandbox) launchEnv(img sandboxImage, extra []string) ([]string, map[string]string, error) {
 	want := map[string]string{}
-	for _, kv := range s.image.Env {
+	for _, kv := range img.Env {
 		k, v, _ := strings.Cut(kv, "=")
 		want[k] = v
 	}
@@ -530,7 +551,7 @@ func (s *sandbox) launchEnv(extra []string) ([]string, map[string]string, error)
 // checkCreated compares the created container with the launch before it starts.
 func (s *sandbox) checkCreated(c containerState, l sandboxLaunch, vols []sandboxVolume, want map[string]string) error {
 	var problems []string
-	if c.Image != s.image.ID {
+	if c.Image != s.launchImage(l).ID {
 		problems = append(problems, "image "+c.Image)
 	}
 	if c.Config.WorkingDir != l.Workdir || len(c.Config.Entrypoint) != 1 || c.Config.Entrypoint[0] != l.Argv[0] {
@@ -539,7 +560,7 @@ func (s *sandbox) checkCreated(c containerState, l sandboxLaunch, vols []sandbox
 	if c.Config.User != sandboxUser {
 		problems = append(problems, "user "+c.Config.User)
 	}
-	if c.HostConfig.NetworkMode != "none" {
+	if c.HostConfig.NetworkMode != launchNetwork(l) {
 		problems = append(problems, "network "+c.HostConfig.NetworkMode)
 	}
 	if !c.HostConfig.ReadonlyRootfs || c.HostConfig.Privileged || len(c.HostConfig.CapAdd) > 0 || len(c.HostConfig.Binds) > 0 {
@@ -617,19 +638,19 @@ func (s *sandbox) createVolume(id, kind string, n int) (string, error) {
 
 // fill copies each volume's tree through a loader container that is created, never
 // started (no product code runs), then removed.
-func (s *sandbox) fill(ctx context.Context, id, kind string, vols []sandboxVolume) error {
+func (s *sandbox) fill(ctx context.Context, id, kind, image string, vols []sandboxVolume) error {
 	args := append([]string{"create", "--pull=never", "--network", "none"}, s.labels(id, kind, "loader")...)
 	n := 0
 	for _, v := range vols {
 		if v.Fill != nil {
-			args = append(args, "--mount", "type=volume,src="+v.Name+",dst="+v.Target)
+			args = append(args, "--mount", "type=volume,src="+v.Name+",dst="+v.Target+",volume-nocopy")
 			n++
 		}
 	}
 	if n == 0 {
 		return nil
 	}
-	loader, err := s.d.admin(append(args, "--entrypoint", "true", s.image.ID)...)
+	loader, err := s.d.admin(append(args, "--entrypoint", "true", image)...)
 	if err != nil {
 		return err
 	}
@@ -658,7 +679,7 @@ func parentDir(target string) string {
 }
 
 // prepare creates and fills the launch's own volumes. Volumes with a name are reused.
-func (s *sandbox) prepare(ctx context.Context, id, kind string, vols []sandboxVolume) ([]sandboxVolume, error) {
+func (s *sandbox) prepare(ctx context.Context, id, kind, image string, vols []sandboxVolume) ([]sandboxVolume, error) {
 	out := append([]sandboxVolume(nil), vols...)
 	for i := range out {
 		if !strings.HasPrefix(out[i].Target, "/") || strings.Contains(out[i].Target, "..") || strings.ContainsAny(out[i].Target, ",=") {
@@ -673,7 +694,7 @@ func (s *sandbox) prepare(ctx context.Context, id, kind string, vols []sandboxVo
 		}
 		out[i].Name = name
 	}
-	return out, s.fill(ctx, id, kind, out)
+	return out, s.fill(ctx, id, kind, image, out)
 }
 
 // run executes one launch: intent, volumes, create, check, start, inspect. after, when
@@ -693,11 +714,15 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 	infra := func(e error) (LaunchResult, error) {
 		return LaunchResult{Class: ClassInfrastructure, ExitCode: -1, Reason: e.Error()}, nil
 	}
-	vols, err := s.prepare(ctx, in.ID, l.Kind, l.Volumes)
+	img := s.launchImage(l)
+	if img.ID == "" {
+		return infra(errors.New("sandbox: no agent image is configured"))
+	}
+	vols, err := s.prepare(ctx, in.ID, l.Kind, img.ID, l.Volumes)
 	if err != nil {
 		return infra(err)
 	}
-	own, want, err := s.launchEnv(l.Env)
+	own, want, err := s.launchEnv(img, l.Env)
 	if err != nil {
 		return infra(err)
 	}
@@ -710,7 +735,7 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 		return infra(errors.New("sandbox: launch needs a program and a working directory"))
 	}
 	args := append([]string{"create", "--pull=never"}, s.labels(in.ID, l.Kind, "consumer")...)
-	args = append(args, "--network", "none", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+	args = append(args, "--network", launchNetwork(l), "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
 		"--memory", s.cfg.Memory, "--memory-swap", s.cfg.Memory, "--cpus", s.cfg.CPUs, "--read-only",
 		"--tmpfs", "/tmp:mode=1777", "--tmpfs", sandboxHome+":uid=10001,gid=10001,mode=0700",
 		"--user", sandboxUser, "--workdir", l.Workdir, "--env-file", envFile, "--entrypoint", l.Argv[0],
@@ -719,13 +744,16 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 		args = append(args, "--pids-limit", "512")
 	}
 	for _, v := range vols {
-		m := "type=volume,src=" + v.Name + ",dst=" + v.Target
+		// volume-nocopy: Docker would otherwise copy the image's directory at the mount
+		// point (content, owner and mode) into a volume that looks empty, such as an
+		// agent's /out that is also the working directory.
+		m := "type=volume,src=" + v.Name + ",dst=" + v.Target + ",volume-nocopy"
 		if v.ReadOnly {
 			m += ",readonly"
 		}
 		args = append(args, "--mount", m)
 	}
-	args = append(append(args, s.image.ID), l.Argv[1:]...)
+	args = append(append(args, img.ID), l.Argv[1:]...)
 	cid, err := s.d.admin(args...)
 	if err != nil {
 		return infra(err)
@@ -772,7 +800,7 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 		return LaunchResult{Class: ClassInfrastructure, ExitCode: -1, Reason: msg}, nil
 	}
 	if l.Output != nil {
-		if err := s.logs(ctx, cid, l.Output); err != nil {
+		if err := s.logs(ctx, cid, l.Output, l.Stderr); err != nil {
 			return LaunchResult{Class: ClassInfrastructure, ExitCode: -1, Reason: "could not read the container output: " + err.Error()}, nil
 		}
 	}
@@ -825,19 +853,27 @@ func (e *errWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// logs copies a stopped container's stdout and stderr to w. Any error of the client or
-// of w is returned; the caller then treats the launch as unproven.
-func (s *sandbox) logs(ctx context.Context, cid string, w io.Writer) error {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+// logs copies a stopped container's stdout to w and its stderr to errw, or to w too when
+// errw is nil. Any error of the client or of a writer is returned; the caller then treats
+// the launch as unproven.
+func (s *sandbox) logs(ctx context.Context, cid string, w, errw io.Writer) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
 	ew := &errWriter{w: w}
+	ee := ew
+	if errw != nil {
+		ee = &errWriter{w: errw}
+	}
 	cmd := exec.CommandContext(ctx, "docker", "logs", cid)
-	cmd.Env, cmd.Stdout, cmd.Stderr = s.d.env, ew, ew
+	cmd.Env, cmd.Stdout, cmd.Stderr = s.d.env, ew, ee
 	cmd.WaitDelay = 5 * time.Second
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("docker logs: %v: %s", err, redactSecrets(string(ew.last)))
+		return fmt.Errorf("docker logs: %v: %s", err, redactSecrets(string(ee.last)))
 	}
-	return ew.err
+	if ew.err != nil {
+		return ew.err
+	}
+	return ee.err
 }
 
 // unset reports a Docker timestamp that was never set.
@@ -920,7 +956,7 @@ func (s *sandbox) newSequence(ctx context.Context, kind, target string, tree tar
 		return seq, err
 	}
 	seq.Name = name
-	if err := s.fill(ctx, in.ID, kind, []sandboxVolume{{Name: name, Target: target, Fill: tree}}); err != nil {
+	if err := s.fill(ctx, in.ID, kind, s.image.ID, []sandboxVolume{{Name: name, Target: target, Fill: tree}}); err != nil {
 		return seq, err
 	}
 	return seq, nil

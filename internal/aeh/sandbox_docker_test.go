@@ -3,6 +3,7 @@ package aeh
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -241,4 +242,126 @@ func (t *tailOnly) Write(p []byte) (int, error) {
 		t.buf.Write(nb)
 	}
 	return len(p), nil
+}
+
+func TestDockerAgentEditsAreCapturedWithoutHostGit(t *testing.T) {
+	s, _ := dockerSandbox(t, SandboxConfig{})
+	s.agent = s.image
+	dir, base, e, rules := captureFixture(t)
+	script := `set -e
+cat /run/aeh/prompt.md
+echo diagnostics >&2
+test -r /memory/index.md && echo MEMORY-READ
+if (echo x > /memory/index.md) 2>/dev/null; then echo MEMORY-WRITABLE; fi
+if (echo x > /run/aeh/prompt.md) 2>/dev/null; then echo PROMPT-WRITABLE; fi
+test "$(id -u)" = 10001 && echo UID-OK
+printf 'edited\r\n' > a.txt
+rm v.sub
+mkdir -p out && echo ignored > out/x
+echo added > new.txt
+echo VERDICT: APPROVE`
+	p := Profile{Command: []string{"sh", "-c", script}, TimeoutMinutes: 2}
+	var commit string
+	runDir := t.TempDir()
+	outPath, res, err := s.runAgent(context.Background(), agentLaunch{Kind: "implement", Profile: p, Work: e.source(), WorkRW: true,
+		Memory: treeFiles(map[string][]byte{"index.md": []byte("# memory\n")}, nil), Prompt: "the task\n", RunDir: runDir, LogName: "agent",
+		ReadBack: func(read func(string, func(io.Reader) error) error) error {
+			return read(sandboxWork, func(r io.Reader) (err error) {
+				commit, err = captureCandidate(context.Background(), dir, base, e, rules, r, t.TempDir(), "candidate")
+				return err
+			})
+		}})
+	if err != nil || res.Class != ClassProcess || res.ExitCode != 0 {
+		t.Fatalf("%+v %v", res, err)
+	}
+	stdout, _ := os.ReadFile(outPath)
+	stderr, _ := os.ReadFile(filepath.Join(runDir, "agent.err"))
+	text := string(stdout)
+	for _, want := range []string{"the task", "MEMORY-READ", "UID-OK"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("stdout lacks %q:\n%s", want, text)
+		}
+	}
+	for _, bad := range []string{"MEMORY-WRITABLE", "PROMPT-WRITABLE", "diagnostics"} {
+		if strings.Contains(text, bad) {
+			t.Errorf("stdout has %s:\n%s", bad, text)
+		}
+	}
+	if string(stderr) != "diagnostics\n" {
+		t.Errorf("stderr %q", stderr)
+	}
+	if parseVerdict(text) != "APPROVE" {
+		t.Errorf("verdict not parsed from stdout:\n%s", text)
+	}
+	status := mustGit(t, dir, "diff", "--name-status", base, commit)
+	if status != "M\ta.txt\nA\tnew.txt\nD\tv.sub" {
+		t.Errorf("candidate:\n%s", status)
+	}
+	if blob, _ := gitBlob(dir, commit, "a.txt"); blob != "edited\r\n" {
+		t.Errorf("a.txt %q", blob)
+	}
+	assertNoLeftovers(t, s)
+}
+
+func TestDockerAgentReviewViewIsReadOnlyAndStdinWorks(t *testing.T) {
+	s, _ := dockerSandbox(t, SandboxConfig{})
+	s.agent = s.image
+	work := treeFiles(map[string][]byte{"a.txt": []byte("a\n")}, nil)
+	p := Profile{Command: []string{"sh", "-c", `cat; if (echo x > /work/a.txt) 2>/dev/null; then echo WORK-WRITABLE; fi; pwd`}, Stdin: true}
+	outPath, res, err := s.runAgent(context.Background(), agentLaunch{Kind: "review", Profile: p, Work: work, Prompt: "prompt via stdin\n",
+		RunDir: t.TempDir(), LogName: "review"})
+	if err != nil || res.Class != ClassProcess || res.ExitCode != 0 {
+		t.Fatalf("%+v %v", res, err)
+	}
+	out, _ := os.ReadFile(outPath)
+	if string(out) != "prompt via stdin\n/work\n" {
+		t.Fatalf("output %q", out)
+	}
+	p = Profile{Command: []string{"sh", "-c", `echo result > /out/r.md; pwd; ls -la /out`}}
+	var back map[string]treeEntry
+	outPath, res, err = s.runAgent(context.Background(), agentLaunch{Kind: "discover", Profile: p, Out: true, Prompt: "x", RunDir: t.TempDir(), LogName: "discover",
+		ReadBack: func(read func(string, func(io.Reader) error) error) error {
+			return read(sandboxOut, func(r io.Reader) (err error) {
+				back, err = readTree(r, "out", 1<<20)
+				return err
+			})
+		}})
+	if err != nil || res.Class != ClassProcess || res.ExitCode != 0 || back["r.md"].Size != 7 {
+		out, _ := os.ReadFile(outPath)
+		t.Fatalf("%+v %v %+v\n%s", res, err, back, out)
+	}
+	assertNoLeftovers(t, s)
+}
+
+func TestDockerAgentOutputLimitFailsTheAgent(t *testing.T) {
+	s, _ := dockerSandbox(t, SandboxConfig{})
+	s.agent = s.image
+	p := Profile{Command: []string{"sh", "-c", fmt.Sprintf("head -c %d /dev/zero", agentOutputLimit+1)}}
+	_, res, err := s.runAgent(context.Background(), agentLaunch{Kind: "review", Profile: p, Prompt: "x", RunDir: t.TempDir(), LogName: "big"})
+	if err != nil || res.Class != ClassProcess || agentError(p, res) == nil || !strings.Contains(res.Reason, "MiB") {
+		t.Fatalf("%+v %v", res, err)
+	}
+	assertNoLeftovers(t, s)
+}
+
+func TestDockerAgentContentRefusalIsTheAgentsFailure(t *testing.T) {
+	s, _ := dockerSandbox(t, SandboxConfig{})
+	s.agent = s.image
+	dir, base, e, rules := captureFixture(t)
+	p := Profile{Command: []string{"sh", "-c", "ln -s /etc/passwd leak"}}
+	_, res, err := s.runAgent(context.Background(), agentLaunch{Kind: "implement", Profile: p, Work: e.source(), WorkRW: true,
+		Prompt: "x", RunDir: t.TempDir(), LogName: "agent",
+		ReadBack: func(read func(string, func(io.Reader) error) error) error {
+			return read(sandboxWork, func(r io.Reader) error {
+				_, err := captureCandidate(context.Background(), dir, base, e, rules, r, t.TempDir(), "candidate")
+				return err
+			})
+		}})
+	if err != nil || res.Class != ClassProcess || !strings.Contains(res.Reason, "leak") {
+		t.Fatalf("%+v %v", res, err)
+	}
+	if aerr := agentError(p, res); aerr == nil || errors.Is(aerr, errSandboxInfrastructure) {
+		t.Fatalf("agent error %v", aerr)
+	}
+	assertNoLeftovers(t, s)
 }

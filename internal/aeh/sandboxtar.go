@@ -38,7 +38,9 @@ const sandboxUID = 10001
 
 // checkTreePath refuses names that would escape or be ambiguous inside the volume.
 func checkTreePath(name string) error {
-	if name == "" || strings.HasPrefix(name, "/") || strings.Contains(name, "\\") || strings.ContainsRune(name, 0) {
+	// A newline or carriage return cannot be named in Git's line-based inputs (ignore
+	// rules, path lists) without changing their meaning.
+	if name == "" || strings.HasPrefix(name, "/") || strings.ContainsAny(name, "\\\n\r\x00") {
 		return fmt.Errorf("invalid path %q", name)
 	}
 	for _, part := range strings.Split(name, "/") {
@@ -108,6 +110,9 @@ const (
 	maxTreePath    = 4096
 )
 
+// errReadBackLimit is returned once a read-back exceeds its byte limit.
+var errReadBackLimit = errors.New("more than the read-back limit")
+
 // cappedReader fails once more than left bytes were read.
 type cappedReader struct {
 	r    io.Reader
@@ -116,7 +121,7 @@ type cappedReader struct {
 
 func (c *cappedReader) Read(p []byte) (int, error) {
 	if c.left <= 0 {
-		return 0, fmt.Errorf("more than the read-back limit")
+		return 0, errReadBackLimit
 	}
 	if int64(len(p)) > c.left {
 		p = p[:c.left]
