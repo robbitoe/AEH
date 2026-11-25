@@ -38,7 +38,9 @@ const sandboxUID = 10001
 
 // checkTreePath refuses names that would escape or be ambiguous inside the volume.
 func checkTreePath(name string) error {
-	if name == "" || strings.HasPrefix(name, "/") || strings.Contains(name, "\\") || strings.ContainsRune(name, 0) {
+	// A newline or carriage return cannot be named in Git's line-based inputs (ignore
+	// rules, path lists) without changing their meaning.
+	if name == "" || strings.HasPrefix(name, "/") || strings.ContainsAny(name, "\\\n\r\x00") {
 		return fmt.Errorf("invalid path %q", name)
 	}
 	for _, part := range strings.Split(name, "/") {

@@ -84,6 +84,8 @@ func TestIgnoreCheckerMatchesGitOnARealCheckout(t *testing.T) {
 		"src/a/.gitignore":   "!*.o\nonly-here\n",
 		"we[ird]/.gitignore": "z\n",
 		"#hash/.gitignore":   "h\n",
+		"crlf/.gitignore":    "gen/\r\n*.secret\r\n/top\r\n",
+		"bom/.gitignore":     "\xef\xbb\xbf*.secret\n#c\n",
 	}
 	c, dir := caseRulesRepo(t, rules)
 	mustGit(t, dir, "-c", "core.autocrlf=false", "checkout", "-q", "-f", "HEAD") // the commit's bytes, as in the volume
@@ -91,7 +93,9 @@ func TestIgnoreCheckerMatchesGitOnARealCheckout(t *testing.T) {
 		"build/", "src/build/", "build/x", "docs/a.tmp", "docs/sub/a.tmp", "src/docs/a.tmp", "deep", "src/a/deep", "src/gen/",
 		"gen/", "src/gen/x", "src/local", "src/a/local", "local", "src/sub/x", "sub/x", "src/a/sub/x", "src/m.o", "src/a/m.o",
 		"src/a/b/m.o", "m.o", "src/a/only-here", "src/only-here", "we[ird]/z", "weid/z", "wei/z", "src/a/b/only-here",
-		"#hash/h", "#hash/x/h", "h", "trail", "trail "}
+		"#hash/h", "#hash/x/h", "h", "trail", "trail ",
+		"crlf/deep/gen/output", "crlf/gen/x", "crlf/a.secret", "crlf/x/a.secret", "crlf/top", "crlf/x/top",
+		"bom/a.secret", "bom/x/b.secret", "a.secret"}
 	// One process per path: with --stdin, Git keeps the per-directory rules of the previous
 	// path and can answer a later one with them (src/gen/ then gen/).
 	want := map[string]bool{}

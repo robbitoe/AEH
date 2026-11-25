@@ -187,23 +187,53 @@ func newIgnoreChecker(root, commit string, files []exportFile) (*ignoreChecker, 
 		}
 		return rules[i] < rules[j]
 	})
-	var excludes bytes.Buffer
+	if err := c.writeExcludes(root, commit, rules); err != nil {
+		c.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
+// maxIgnoreRules caps the translated rules of one commit, so a large .gitignore deep in
+// the tree cannot make the runner write, or Git read, without bound.
+const maxIgnoreRules = int64(64) << 20
+
+// utf8BOM is the byte order mark Git skips at the start of a .gitignore.
+const utf8BOM = "\xef\xbb\xbf"
+
+// writeExcludes translates the .gitignore files, streaming, into the excludes file.
+func (c *ignoreChecker) writeExcludes(root, commit string, rules []string) error {
+	f, err := os.OpenFile(filepath.Join(c.dir, "excludes"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("ignore rules: %w", err)
+	}
+	defer f.Close()
+	w := bufio.NewWriter(f)
+	var size int64
 	for _, p := range rules {
 		b, ok := gitBlob(root, commit, p)
 		if !ok {
-			c.Close()
-			return nil, fmt.Errorf("ignore rules: read %s at %s", p, short(commit))
+			return fmt.Errorf("ignore rules: read %s at %s", p, short(commit))
 		}
-		for _, line := range strings.SplitAfter(b, "\n") {
-			excludes.WriteString(anchorIgnoreLine(path.Dir(p), strings.TrimSuffix(line, "\n")))
-			excludes.WriteByte('\n')
+		// As Git reads a .gitignore: a UTF-8 byte order mark at the start is skipped, and
+		// each line loses one trailing carriage return.
+		b = strings.TrimPrefix(b, utf8BOM)
+		for _, line := range strings.Split(b, "\n") {
+			out := anchorIgnoreLine(path.Dir(p), strings.TrimSuffix(line, "\r"))
+			if size += int64(len(out)) + 1; size > maxIgnoreRules {
+				return fmt.Errorf("ignore rules: the .gitignore files of %s exceed %d MiB once anchored at their directories", short(commit), maxIgnoreRules>>20)
+			}
+			w.WriteString(out)
+			w.WriteByte('\n')
 		}
 	}
-	if err := os.WriteFile(filepath.Join(dir, "excludes"), excludes.Bytes(), 0o600); err != nil {
-		c.Close()
-		return nil, fmt.Errorf("ignore rules: %w", err)
+	if err := w.Flush(); err != nil {
+		return fmt.Errorf("ignore rules: %w", err)
 	}
-	return c, nil
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("ignore rules: %w", err)
+	}
+	return nil
 }
 
 // anchorIgnoreLine rewrites one line of the .gitignore in directory dir as a pattern of a
