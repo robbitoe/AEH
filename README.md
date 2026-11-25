@@ -10,7 +10,7 @@ The runner decides; models only propose.
 
 The whole cycle: discovery from an idea (or adoption of an existing system), owner approval of versioned specs, and the build stage. AEH turns an approved feature spec into a plan, sealed acceptance tests and verified code on its own branch. You approve the spec; AEH generates, checks, independently reviews and seals the tests. Manual outcomes remain supported with owner-approved tests. AEH runs agent CLIs (Codex, Claude Code, a local model) in separate git worktrees and accepts a change only when deterministic gates and independent reviews pass.
 
-> Worktrees separate Git changes. Build, test and acceptance commands, which run code an agent just wrote, can run in a local Docker container with no network, no forwarded host credentials and no Git metadata: see [Sandbox](docs/sandbox.md). Secrets committed to the repository or built into the image are not removed. With `sandbox.agent_image`, the agents of `aeh run`, `aeh do` and `aeh plan` run in containers too; other agent CLIs still run with your user's permissions, subject to any sandbox configured on the CLI itself, so use trusted repositories and profiles.
+> Worktrees separate Git changes. Build, test and acceptance commands, which run code an agent just wrote, can run in a local Docker container with no network, no forwarded host credentials and no Git metadata: see [Sandbox](docs/sandbox.md). Secrets committed to the repository or built into the image are not removed. With `sandbox.agent_image`, every agent runs in a container too, with Docker's default network until the egress proxy exists. Without it, agent CLIs run with your user's permissions, subject to any sandbox configured on the CLI itself, so use trusted repositories and profiles.
 
 ## Install
 
@@ -131,7 +131,7 @@ Initialize local memory with `aeh memory init`, then run `aeh adopt inventory` t
 the main checkout's HEAD in a disposable detached worktree. Use `--base <rev>` to inspect
 another commit. The runner pins its full SHA, removes possible secret files before the
 agent runs, and checks that the agent changed no checkout files, including ignored files.
-These checks detect changes; agent profiles remain cooperative until sandboxing is added.
+These checks detect changes on the host. With `sandbox.agent_image`, inspectors run in a container with a read-only view instead (see [Sandbox](docs/sandbox.md)).
 Secret filtering is best effort. Configure read-only agent profiles for adoption.
 
 ```yaml
@@ -464,7 +464,7 @@ The stages of the [vision](docs/vision.md), in order:
 4. **Specs to code (implemented).** An approved feature produces one task and independently reviewed, runner-sealed acceptance tests with `aeh plan`.
 5. **Discovery and adoption (implemented).** From a vague idea to a validated spec book with HTML mockups; adoption of an existing system area by area, up to sealed characterization tests.
 6. **Live review (implemented).** Specs keep evolving while features are built: immutable versions, changed and removed criteria, clarifications, queued approvals and path moves.
-7. **Sandbox (gates implemented).** Build, test and acceptance commands in local containers with no network, with an integrity check after every command (`aeh sandbox check`, [docs/sandbox.md](docs/sandbox.md)). Agents of `aeh run`, `aeh do` and `aeh plan` in containers with `sandbox.agent_image` (S2a). Next: discovery and adoption agents, kept CLI logins, and a per-launch egress proxy.
+7. **Sandbox (gates implemented).** Build, test and acceptance commands in local containers with no network, with an integrity check after every command (`aeh sandbox check`, [docs/sandbox.md](docs/sandbox.md)). Every agent in a container with `sandbox.agent_image` (S2a). Next: kept CLI logins and a per-launch egress proxy.
 
 ## Development
 

@@ -19,6 +19,10 @@ type agentStep struct {
 	LogName string
 	// Work is the commit exported at /work (read-only); "" for no /work.
 	Work string
+	// WorkTree, used when Work is empty, is another read-only tree at /work (a filtered
+	// export, a book), described for the evidence by WorkLabel.
+	WorkTree  tarSource
+	WorkLabel string
 	// Capture, when set, makes /work writable and records what the agent left as a
 	// candidate commit on Work with this message.
 	Capture string
@@ -49,6 +53,8 @@ func sandboxNote(st agentStep) string {
 		note += "- The project is at /work (writable): your changes there are the result.\n"
 	case st.Work != "":
 		note += "- The project is at /work (read-only).\n"
+	case st.WorkTree != nil:
+		note += "- Your input files are at /work (read-only).\n"
 	}
 	if st.Out {
 		note += "- Write output files to /out.\n"
@@ -102,6 +108,9 @@ func (s *sandbox) agentStep(ctx context.Context, root string, cfg Config, st age
 			})
 		}
 	}
+	if st.Work == "" && st.WorkTree != nil {
+		a.Work = st.WorkTree
+	}
 	if st.MemoryCommit != "" {
 		m, err := newCommitExport(st.MemoryDir, st.MemoryCommit)
 		if err != nil {
@@ -146,6 +155,7 @@ type launchRecord struct {
 	Image        string `json:"image"`
 	Network      string `json:"network"`
 	Work         string `json:"work,omitempty"`
+	WorkTree     string `json:"work_tree,omitempty"`
 	WorkWritable bool   `json:"work_writable,omitempty"`
 	Out          bool   `json:"out,omitempty"`
 	MemoryCommit string `json:"memory_commit,omitempty"`
@@ -155,7 +165,7 @@ type launchRecord struct {
 func writeLaunchRecord(s *sandbox, st agentStep, r agentStepResult) error {
 	return writePrivateJSON(filepath.Join(st.RunDir, st.LogName+".launch.json"), launchRecord{
 		Kind: st.Kind, Profile: st.Profile, Class: r.Launch.Class, ExitCode: r.Launch.ExitCode, Reason: r.Launch.Reason,
-		Image: s.agent.ID, Network: "bridge", Work: st.Work, WorkWritable: st.Capture != "", Out: st.Out,
+		Image: s.agent.ID, Network: "bridge", Work: st.Work, WorkTree: st.WorkLabel, WorkWritable: st.Capture != "", Out: st.Out,
 		MemoryCommit: st.MemoryCommit, Candidate: r.Candidate})
 }
 
@@ -178,11 +188,12 @@ func stepMemory(m MemorySnapshot) (dir, commit string, err error) {
 // agentsSandboxed reports a configuration whose agents run in containers (policy 2).
 func (c Config) agentsSandboxed() bool { return c.Sandbox != nil && c.Sandbox.AgentImage != "" }
 
-// hostAgents refuses to launch an agent on the host when the configuration runs agents
-// in the sandbox: a flow whose agents are not sandboxed yet stops instead of falling back.
+// hostAgents is the last check before an agent runs on the host: with
+// sandbox.agent_image set, every flow launches its agents in containers, so reaching a
+// host launch is a defect and stops the flow instead of falling back to the host.
 func (c Config) hostAgents(flow string) error {
 	if c.agentsSandboxed() {
-		return fmt.Errorf("%s agents do not run in the sandbox yet, and sandbox.agent_image forbids running them on the host; remove sandbox.agent_image to use %s", flow, flow)
+		return fmt.Errorf("internal error: a %s agent was about to run on the host although sandbox.agent_image is set", flow)
 	}
 	return nil
 }

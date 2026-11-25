@@ -491,6 +491,7 @@ type adoptSession struct {
 	path               string
 	state              adoptState
 	resumedInspections map[string]bool
+	sb                 *sandbox // opened at the first sandboxed inspection of the command
 }
 
 func (a *adoptSession) session() string {

@@ -82,7 +82,7 @@ func TestFlowsNotSandboxedRefuseHostAgents(t *testing.T) {
 		t.Fatalf("policy 1 refused host agents: %v", err)
 	}
 	c.Sandbox.AgentImage = testDigest
-	if err := c.hostAgents("plan"); err == nil || !strings.Contains(err.Error(), "agent_image") {
+	if err := c.hostAgents("plan"); err == nil || !strings.Contains(err.Error(), "internal error") {
 		t.Fatalf("got %v", err)
 	}
 }

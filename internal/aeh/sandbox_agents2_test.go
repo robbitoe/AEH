@@ -114,15 +114,20 @@ func TestDockerSandboxedTriageInfrastructureFailureIsRetried(t *testing.T) {
 	}
 }
 
-// slowReader pauses once, after its first read, longer than the Docker client's wait delay.
+// slowReader pauses once, longer than the Docker client's wait delay, when fewer bytes
+// than a pipe holds are left: docker cp can then finish writing and exit while the
+// consumer still has the end of the archive to read.
 type slowReader struct {
 	r      io.Reader
+	read   int64
+	at     int64
 	paused bool
 }
 
 func (s *slowReader) Read(p []byte) (int, error) {
 	n, err := s.r.Read(p)
-	if !s.paused {
+	s.read += int64(n)
+	if !s.paused && s.read >= s.at {
 		s.paused = true
 		time.Sleep(7 * time.Second)
 	}
@@ -139,7 +144,7 @@ func TestDockerReadBackToleratesASlowConsumer(t *testing.T) {
 	_, res, err := s.runAgent(context.Background(), agentLaunch{Kind: "discover", Profile: p, Out: true, Prompt: "x", RunDir: t.TempDir(), LogName: "slow",
 		ReadBack: func(read func(string, func(io.Reader) error) error) error {
 			return read(sandboxOut, func(r io.Reader) (err error) {
-				back, err = readTree(&slowReader{r: r}, "out", 4<<20)
+				back, err = readTree(&slowReader{r: r, at: 1<<20 - 16<<10}, "out", 4<<20)
 				return err
 			})
 		}})

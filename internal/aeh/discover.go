@@ -276,6 +276,21 @@ type discoverySession struct {
 	state  *DiscoveryState
 	log    io.Writer
 	stack  *projectStack // detected when the round's prompt is rendered
+	sb     *sandbox      // opened at the first sandboxed agent of the command
+}
+
+// agentSandbox opens the project's sandbox for this session's agents under policy 2, or
+// returns nil when agents run on the host.
+func (d *discoverySession) agentSandbox() (*sandbox, error) {
+	if d.sb != nil || !d.cfg.agentsSandboxed() {
+		return d.sb, nil
+	}
+	sb, err := openFlowSandbox(d.repo, d.cfg, "discover-"+d.state.Slug)
+	if err != nil {
+		return nil, err
+	}
+	d.sb = sb
+	return sb, nil
 }
 
 func (d *discoverySession) logf(format string, args ...any) {
@@ -681,32 +696,60 @@ func (d *discoverySession) attempt(ctx context.Context, a *DiscoveryAttempt, rou
 		a.Result, a.Feedback = "failed", discoveryDiagnostic(msg)
 		return nil, "", nil
 	}
-	outDir := d.repo.WorktreePath(fmt.Sprintf("discover-%s-a%d", d.state.Slug, a.N))
-	_ = os.RemoveAll(outDir) // a leftover of an interrupted attempt with this number
-	root, err := openOutputDir(outDir)
+	sb, err := d.agentSandbox()
 	if err != nil {
 		return nil, "", err
 	}
-	defer func() {
-		root.Close()
-		_ = os.RemoveAll(outDir)
-	}()
 	prompt, err := d.prompt(round, feedback)
 	if err != nil {
 		return nil, "", err
 	}
 	runDir := filepath.Join(d.repo.Root, filepath.FromSlash(a.RunDir))
 	d.logf("  discovery round %d, attempt %d with profile %q", round, a.N, a.Profile)
-	if err := d.cfg.hostAgents("discovery"); err != nil {
-		return nil, "", err
+	var root *os.Root // the host output directory; nil under the sandbox
+	var back agentOutput
+	var outPath string
+	if sb != nil {
+		// The agent writes to /out in its container; its files are read back into memory.
+		dir, mem, err := stepMemory(MemorySnapshot{Dir: d.memDir, Present: d.memDir != ""})
+		if err != nil {
+			return nil, "", err
+		}
+		limit := bookManifest(d.dcfg)
+		step, err := sb.agentStep(ctx, d.repo.Root, d.cfg, agentStep{Kind: "discover", Profile: a.Profile, Prompt: prompt,
+			RunDir: runDir, LogName: "discover", Out: true, MemoryDir: dir, MemoryCommit: mem,
+			ReadOut: func(r io.Reader) (err error) {
+				back, err = readAgentOutput(r, limit.MaxFiles, limit.MaxTotal)
+				return err
+			}})
+		if err != nil {
+			return nil, "", err
+		}
+		outPath, err = step.OutPath, step.AgentErr
+	} else {
+		outDir := d.repo.WorktreePath(fmt.Sprintf("discover-%s-a%d", d.state.Slug, a.N))
+		_ = os.RemoveAll(outDir) // a leftover of an interrupted attempt with this number
+		if root, err = openOutputDir(outDir); err != nil {
+			return nil, "", err
+		}
+		defer func() {
+			root.Close()
+			_ = os.RemoveAll(outDir)
+		}()
+		if err := d.cfg.hostAgents("discovery"); err != nil {
+			return nil, "", err
+		}
+		outPath, err = runAgent(ctx, d.cfg.Profiles[a.Profile], d.cfg.PassEnv, outDir, prompt, runDir, "discover")
 	}
-	outPath, err := runAgent(ctx, d.cfg.Profiles[a.Profile], d.cfg.PassEnv, outDir, prompt, runDir, "discover")
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, "", err
 		}
 		if uncertainExit(err) {
 			a.Result, a.Feedback = "failed", discoveryDiagnostic(err.Error())
+			if sb != nil {
+				return nil, fmt.Sprintf("The discovery agent %q stopped without a result:\n%s\nFix the cause (for example start Docker), then run again: aeh discover run %s", a.Profile, discoveryDiagnostic(tail(err.Error(), 1500)), d.state.Slug), nil
+			}
 			return nil, fmt.Sprintf("The discovery agent %q was interrupted or timed out. Confirm its processes stopped, then run again: aeh discover run %s", a.Profile, d.state.Slug), nil
 		}
 		return fail(err.Error())
@@ -721,7 +764,12 @@ func (d *discoverySession) attempt(ctx context.Context, a *DiscoveryAttempt, rou
 	default:
 		return fail(fmt.Sprintf("the output must end with a line %q or %q", discoveryQuestions, discoveryBook))
 	}
-	frozen, err := freezeOutput(root, m)
+	var frozen frozenOutput
+	if root != nil {
+		frozen, err = freezeOutput(root, m)
+	} else {
+		frozen, err = back.freeze(m)
+	}
 	if err != nil {
 		return fail(err.Error())
 	}

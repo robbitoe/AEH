@@ -681,6 +681,9 @@ func (a *adoptSession) runInspection(ctx context.Context, base string, cfg Confi
 func (a *adoptSession) inspectAttempt(ctx context.Context, n int, base, profile string, cfg Config, data promptData,
 	manifest outputManifest, feedback string) (frozenOutput, AdoptInspection, bool, error) {
 	info := AdoptInspection{Base: base, Profile: profile, Date: memoryNow().UTC().Format("2006-01-02")}
+	if cfg.agentsSandboxed() {
+		return a.inspectSandboxed(ctx, n, base, profile, cfg, data, manifest, feedback, info)
+	}
 	w, err := newInspectionWorktree(a.repo, base, cfg.Adopt.Exclude, true, a.inspectionName(n))
 	if err != nil {
 		return frozenOutput{}, info, false, err
@@ -729,6 +732,71 @@ func (a *adoptSession) inspectAttempt(ctx context.Context, n int, base, profile 
 		return frozenOutput{}, info, false, fmt.Errorf("agent output must end with %q", verdict)
 	}
 	frozen, err := freezeOutput(root, manifest)
+	if err != nil {
+		return frozenOutput{}, info, false, err
+	}
+	if err := gateBatchFiles(frozen.Files); err != nil {
+		return frozenOutput{}, info, false, err
+	}
+	return frozen, info, false, nil
+}
+
+// inspectSandboxed runs one inspection under sandbox policy 2: the agent reads a filtered,
+// read-only export of the base at /work and writes its output to /out, which is read
+// back into memory. The read-only view replaces the host integrity check.
+func (a *adoptSession) inspectSandboxed(ctx context.Context, n int, base, profile string, cfg Config, data promptData,
+	manifest outputManifest, feedback string, info AdoptInspection) (frozenOutput, AdoptInspection, bool, error) {
+	if a.sb == nil {
+		sb, err := openFlowSandbox(a.repo, cfg, a.runName())
+		if err != nil {
+			return frozenOutput{}, info, false, err
+		}
+		a.sb = sb
+	}
+	e, excluded, err := newInspectionExport(a.repo.Root, base, cfg.Adopt.Exclude)
+	if err != nil {
+		return frozenOutput{}, info, false, err
+	}
+	info.Excluded = len(excluded)
+	data.BaseSHA, data.OutputDir, data.Excluded, data.Feedback = base, sandboxOut, strings.Join(excluded, "\n"), feedback
+	name, verdict := "adopt-inventory.md", "INVENTORY: READY"
+	if manifest.Name == "adopt-area" {
+		name, verdict = "adopt-area.md", "AREA: READY"
+	}
+	template, err := loadPrompt(a.repo, name)
+	if err != nil {
+		return frozenOutput{}, info, false, err
+	}
+	prompt, err := renderPrompt(name, template, data)
+	if err != nil {
+		return frozenOutput{}, info, false, err
+	}
+	var back agentOutput
+	step, err := a.sb.agentStep(ctx, a.repo.Root, cfg, agentStep{Kind: "inspect", Profile: profile, Prompt: prompt,
+		RunDir: a.repo.RunDir(a.runName(), fmt.Sprintf("a%d", n)), LogName: "adopt", WorkTree: e.source(),
+		WorkLabel: "filtered export of " + base, Out: true,
+		ReadOut: func(r io.Reader) (err error) {
+			back, err = readAgentOutput(r, manifest.MaxFiles, manifest.MaxTotal)
+			return err
+		}})
+	if err != nil {
+		return frozenOutput{}, info, false, err
+	}
+	if step.AgentErr != nil {
+		// Unknown outcomes (the runtime failed, the launch stopped) block like an
+		// interrupted host inspection; a failed agent is feedback for the next one. A
+		// read-only view cannot be written, so the code is never changed.
+		return frozenOutput{}, info, false, step.AgentErr
+	}
+	output, err := os.ReadFile(step.OutPath)
+	if err != nil {
+		return frozenOutput{}, info, false, err
+	}
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if strings.TrimSpace(lines[len(lines)-1]) != verdict {
+		return frozenOutput{}, info, false, fmt.Errorf("agent output must end with %q", verdict)
+	}
+	frozen, err := back.freeze(manifest)
 	if err != nil {
 		return frozenOutput{}, info, false, err
 	}

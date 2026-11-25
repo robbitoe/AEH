@@ -695,6 +695,9 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 			}
 			outPath, captured, runErr = step.OutPath, step.Candidate, step.AgentErr
 		} else {
+			if err := ru.cfg.hostAgents("implementation"); err != nil {
+				return res, err
+			}
 			outPath, runErr = runAgent(ctx, ru.cfg.Profiles[profile], ru.cfg.PassEnv, wt, prompt, runDir, "agent")
 		}
 		if runErr != nil {
@@ -950,6 +953,9 @@ func (ru *runner) review(ctx context.Context, t Task, role, author, commit, wt, 
 		}
 		outPath, err = step.OutPath, step.AgentErr
 	} else {
+		if err := ru.cfg.hostAgents("review"); err != nil {
+			return g, v, err
+		}
 		outPath, err = runAgent(ctx, ru.cfg.Profiles[profile], ru.cfg.PassEnv, wt, prompt, runDir, "review-"+role)
 		// Check even a rejected or failed reviewer: all reviewers are read-only.
 		checkoutErr = verifyCheckout(wt, commit)
@@ -1493,6 +1499,9 @@ func (ru *runner) triage(ctx context.Context) error {
 			}
 		}()
 		if err := verifyCheckout(wt, base); err != nil {
+			return err
+		}
+		if err := ru.cfg.hostAgents("triage"); err != nil {
 			return err
 		}
 		outPath, runErr = runAgent(ctx, ru.cfg.Profiles[ru.cfg.Triage.Profile], ru.cfg.PassEnv, wt, prompt, runDir, "triage")
