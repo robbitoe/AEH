@@ -15,6 +15,7 @@ var (
 	convertSDDL          = sessionAdvapi32.NewProc("ConvertStringSecurityDescriptorToSecurityDescriptorW")
 	getSecurityDescDacl  = sessionAdvapi32.NewProc("GetSecurityDescriptorDacl")
 	setNamedSecurityInfo = sessionAdvapi32.NewProc("SetNamedSecurityInfoW")
+	getNamedSecurityInfo = sessionAdvapi32.NewProc("GetNamedSecurityInfoW")
 )
 
 const (
@@ -24,6 +25,7 @@ const (
 
 	sddlRevision1             = 1
 	seFileObject              = 1
+	ownerSecurityInformation  = 0x1
 	daclSecurityInformation   = 0x4
 	protectedDaclSecurityInfo = 0x80000000
 )
@@ -47,7 +49,9 @@ func tryLockFile(f *os.File) (bool, error) {
 // by what a directory holds): Unix modes do not restrict access on Windows, a checkout's
 // inherited permissions may include other users, and an entry that existed before may
 // carry explicit grants or a protected list of its own. Each directory and file is
-// protected individually before use, so no entry keeps access of its own.
+// protected individually before use, so no entry keeps access of its own. The current
+// user also becomes the owner, and the owner is read back: an owner can always change
+// the access list again, so an entry whose ownership cannot be taken is refused.
 func protectPrivate(p string, dir bool) error {
 	tok, err := syscall.OpenCurrentProcessToken()
 	if err != nil {
@@ -84,8 +88,32 @@ func protectPrivate(p string, dir bool) error {
 	if err != nil {
 		return err
 	}
-	if r, _, _ := setNamedSecurityInfo.Call(uintptr(unsafe.Pointer(name)), seFileObject, daclSecurityInformation|protectedDaclSecurityInfo, 0, 0, dacl, 0); r != 0 {
+	if r, _, _ := setNamedSecurityInfo.Call(uintptr(unsafe.Pointer(name)), seFileObject,
+		ownerSecurityInformation|daclSecurityInformation|protectedDaclSecurityInfo, uintptr(unsafe.Pointer(user.User.Sid)), 0, dacl, 0); r != 0 {
 		return fmt.Errorf("protect %s: %w", p, syscall.Errno(r))
 	}
+	owner, err := fileOwner(p)
+	if err != nil {
+		return fmt.Errorf("protect %s: %w", p, err)
+	}
+	if owner != sid {
+		return fmt.Errorf("protect %s: owned by %s, not by the current user", p, owner)
+	}
 	return nil
+}
+
+// fileOwner is the SID of the owner of p, as a string.
+func fileOwner(p string) (string, error) {
+	name, err := syscall.UTF16PtrFromString(p)
+	if err != nil {
+		return "", err
+	}
+	var owner *syscall.SID
+	var sd uintptr
+	if r, _, _ := getNamedSecurityInfo.Call(uintptr(unsafe.Pointer(name)), seFileObject, ownerSecurityInformation,
+		uintptr(unsafe.Pointer(&owner)), 0, 0, 0, uintptr(unsafe.Pointer(&sd))); r != 0 {
+		return "", syscall.Errno(r)
+	}
+	defer syscall.LocalFree(syscall.Handle(sd))
+	return owner.String()
 }
