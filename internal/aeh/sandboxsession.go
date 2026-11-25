@@ -90,8 +90,8 @@ func sessionStore(main, profile string, create bool) (string, error) {
 		if err != nil || !ok {
 			return dir, err
 		}
-		if part == "sessions" {
-			if err := protectPrivateDir(dir); err != nil {
+		if part == "sessions" || part == sessionKey(profile) {
+			if err := protectPrivate(dir, true); err != nil {
 				return "", fmt.Errorf("session store: %w", err)
 			}
 		}
@@ -122,7 +122,8 @@ func plainDir(dir string, create bool) (bool, error) {
 }
 
 // storePath is the host path of declared file p inside store, after checking that each
-// directory between them is plain (created when create is set). ok is false when a
+// directory between them is plain (created when create is set) and making it private:
+// a directory that existed before keeps no access of its own. ok is false when a
 // directory is missing and was not created.
 func storePath(store, p string, create bool) (full string, ok bool, err error) {
 	parts := strings.Split(p, "/")
@@ -131,6 +132,9 @@ func storePath(store, p string, create bool) (full string, ok bool, err error) {
 		dir = filepath.Join(dir, part)
 		if ok, err := plainDir(dir, create); err != nil || !ok {
 			return "", false, err
+		}
+		if err := protectPrivate(dir, true); err != nil {
+			return "", false, fmt.Errorf("session store: %w", err)
 		}
 	}
 	return filepath.Join(dir, parts[len(parts)-1]), true, nil
@@ -186,6 +190,9 @@ func loadSession(dir string, paths []string) (map[string][]byte, error) {
 		if !fi.Mode().IsRegular() || fi.Size() > sessionFileLimit {
 			return nil, fmt.Errorf("session file %s: not a regular file of at most %d bytes", p, sessionFileLimit)
 		}
+		if err := protectPrivate(full, false); err != nil {
+			return nil, fmt.Errorf("session file %s: %w", p, err)
+		}
 		b, err := os.ReadFile(full)
 		if err != nil {
 			return nil, fmt.Errorf("session file %s: %w", p, err)
@@ -209,6 +216,11 @@ func storeSessionFile(dir, p string, data []byte) error {
 		return err
 	}
 	defer os.Remove(tmp.Name())
+	// The file is private before it holds anything.
+	if err := protectPrivate(tmp.Name(), false); err != nil {
+		tmp.Close()
+		return err
+	}
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		return err
@@ -218,9 +230,6 @@ func storeSessionFile(dir, p string, data []byte) error {
 		return err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp.Name(), full)

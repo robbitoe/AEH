@@ -220,17 +220,43 @@ func TestSessionStoreIsPrivate(t *testing.T) {
 		t.Fatal(err)
 	}
 	sessions := filepath.Dir(store)
+	// Entries that existed before, with access of their own: a directory and a file open
+	// to everyone, explicitly and through a protected list of their own.
+	cfgDir, tok, old := filepath.Join(store, ".cfg"), filepath.Join(store, ".cfg", "tok"), filepath.Join(store, ".old")
+	if err := os.Mkdir(cfgDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	write(t, store, ".old", "o")
 	if runtime.GOOS != "windows" {
-		fi, err := os.Stat(sessions)
-		if err != nil || fi.Mode().Perm() != 0o700 {
-			t.Fatalf("sessions mode %v (%v)", fi.Mode(), err)
+		if err := os.Chmod(cfgDir, 0o777); err != nil {
+			t.Fatal(err)
 		}
-		return
+		if err := os.Chmod(old, 0o666); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		for _, args := range [][]string{{cfgDir, "/inheritance:r", "/grant", "*S-1-1-0:(OI)(CI)F"}, {old, "/inheritance:r", "/grant", "*S-1-1-0:F"}} {
+			if out, err := exec.Command("icacls", args...).CombinedOutput(); err != nil {
+				t.Fatalf("icacls %v: %v %s", args, err, out)
+			}
+		}
 	}
 	if err := storeSessionFile(store, ".cfg/tok", []byte("v")); err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range []string{sessions, store, filepath.Join(store, ".cfg", "tok")} {
+	if files, err := loadSession(store, []string{".cfg/tok", ".old"}); err != nil || len(files) != 2 {
+		t.Fatalf("load %v %v", files, err)
+	}
+	if runtime.GOOS != "windows" {
+		for p, want := range map[string]os.FileMode{sessions: 0o700, store: 0o700, cfgDir: 0o700, tok: 0o600, old: 0o600} {
+			fi, err := os.Stat(p)
+			if err != nil || fi.Mode().Perm() != want {
+				t.Errorf("%s mode %v, want %v (%v)", p, fi.Mode().Perm(), want, err)
+			}
+		}
+		return
+	}
+	for _, p := range []string{sessions, store, cfgDir, tok, old} {
 		out, err := exec.Command("icacls", p).Output()
 		if err != nil {
 			t.Fatal(err)
@@ -389,6 +415,25 @@ func TestDockerSandboxLogin(t *testing.T) {
 	}
 	if err := SandboxLogin(context.Background(), r, "a", in, &out, &errw); err == nil || !strings.Contains(err.Error(), "declares no sandbox.session") {
 		t.Fatalf("profile without session: %v", err)
+	}
+	// From a linked worktree, the check and the login use the main checkout's store.
+	write(t, r.Root, "aeh/config.yaml", cfg(`mkdir "$HOME/.cfg"; echo w > "$HOME/.cfg/tok"`))
+	mustGit(t, r.Root, "add", "-A")
+	mustGit(t, r.Root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "config")
+	wt := filepath.Join(t.TempDir(), "wt")
+	mustGit(t, r.Root, "worktree", "add", "-q", wt)
+	var check bytes.Buffer
+	if err := SandboxCheck(context.Background(), Repo{Root: wt}, &check); err != nil {
+		t.Fatalf("check from a worktree: %v\n%s", err, check.String())
+	}
+	if strings.Contains(check.String(), "no saved session") {
+		t.Fatalf("the check looked outside the main checkout:\n%s", check.String())
+	}
+	if err := SandboxLogin(context.Background(), Repo{Root: wt}, "b", in, &out, &errw); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(store, ".cfg", "tok")); got != "w\n" {
+		t.Fatalf("a login from a worktree stored %q in the main checkout", got)
 	}
 	assertNoLeftovers(t, sb)
 }

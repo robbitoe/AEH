@@ -198,7 +198,13 @@ func (d dockerCLI) attach(ctx context.Context, t *interactiveIO, cid string) err
 		select {
 		case <-done:
 		case <-ctx.Done():
-			_, _ = d.admin("kill", cid)
+			// The kill has its own deadline and runs beside the watchdog, so a stalled
+			// daemon delays the client's exit by 15 seconds at most.
+			go func() {
+				kctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				_, _ = d.run(kctx, nil, nil, "kill", cid)
+			}()
 			select {
 			case <-done:
 			case <-time.After(15 * time.Second):

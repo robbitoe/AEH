@@ -19,15 +19,20 @@ func tryLockFile(f *os.File) (bool, error) {
 	return err == nil, err
 }
 
-// protectPrivateDir makes dir accessible to its owner only and checks that the owner is
-// the current user, so a store created by someone else is never trusted.
-func protectPrivateDir(dir string) error {
-	fi, err := os.Lstat(dir)
+// protectPrivate makes a directory (0700) or file (0600) of the session store accessible
+// to its owner only and checks that the owner is the current user, so a store created by
+// someone else is never trusted.
+func protectPrivate(p string, dir bool) error {
+	fi, err := os.Lstat(p)
 	if err != nil {
 		return err
 	}
 	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Getuid() {
-		return fmt.Errorf("%s belongs to another user (uid %d)", dir, st.Uid)
+		return fmt.Errorf("%s belongs to another user (uid %d)", p, st.Uid)
 	}
-	return os.Chmod(dir, 0o700)
+	mode := os.FileMode(0o600)
+	if dir {
+		mode = 0o700
+	}
+	return os.Chmod(p, mode)
 }

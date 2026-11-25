@@ -42,44 +42,50 @@ func tryLockFile(f *os.File) (bool, error) {
 	return false, err
 }
 
-// protectPrivateDir replaces dir's access list with a protected one that grants access
-// to the current user and SYSTEM only, inherited by everything inside: Unix modes do not
-// restrict access on Windows, and a checkout's inherited permissions may include other
-// users. Windows applies the inheritable entries to existing children too.
-func protectPrivateDir(dir string) error {
+// protectPrivate replaces the access list of a directory or file of the session store
+// with a protected one that grants access to the current user and SYSTEM only (inherited
+// by what a directory holds): Unix modes do not restrict access on Windows, a checkout's
+// inherited permissions may include other users, and an entry that existed before may
+// carry explicit grants or a protected list of its own. Each directory and file is
+// protected individually before use, so no entry keeps access of its own.
+func protectPrivate(p string, dir bool) error {
 	tok, err := syscall.OpenCurrentProcessToken()
 	if err != nil {
-		return fmt.Errorf("protect %s: %w", dir, err)
+		return fmt.Errorf("protect %s: %w", p, err)
 	}
 	defer tok.Close()
 	user, err := tok.GetTokenUser()
 	if err != nil {
-		return fmt.Errorf("protect %s: %w", dir, err)
+		return fmt.Errorf("protect %s: %w", p, err)
 	}
 	sid, err := user.User.Sid.String()
 	if err != nil {
-		return fmt.Errorf("protect %s: %w", dir, err)
+		return fmt.Errorf("protect %s: %w", p, err)
 	}
-	sddl, err := syscall.UTF16PtrFromString("D:P(A;OICI;FA;;;" + sid + ")(A;OICI;FA;;;SY)")
+	inherit := ""
+	if dir {
+		inherit = "OICI"
+	}
+	sddl, err := syscall.UTF16PtrFromString("D:P(A;" + inherit + ";FA;;;" + sid + ")(A;" + inherit + ";FA;;;SY)")
 	if err != nil {
 		return err
 	}
 	var sd uintptr
 	if r, _, err := convertSDDL.Call(uintptr(unsafe.Pointer(sddl)), sddlRevision1, uintptr(unsafe.Pointer(&sd)), 0); r == 0 {
-		return fmt.Errorf("protect %s: %w", dir, err)
+		return fmt.Errorf("protect %s: %w", p, err)
 	}
 	defer syscall.LocalFree(syscall.Handle(sd))
 	var present, defaulted int32
 	var dacl uintptr
 	if r, _, err := getSecurityDescDacl.Call(sd, uintptr(unsafe.Pointer(&present)), uintptr(unsafe.Pointer(&dacl)), uintptr(unsafe.Pointer(&defaulted))); r == 0 {
-		return fmt.Errorf("protect %s: %w", dir, err)
+		return fmt.Errorf("protect %s: %w", p, err)
 	}
-	name, err := syscall.UTF16PtrFromString(dir)
+	name, err := syscall.UTF16PtrFromString(p)
 	if err != nil {
 		return err
 	}
 	if r, _, _ := setNamedSecurityInfo.Call(uintptr(unsafe.Pointer(name)), seFileObject, daclSecurityInformation|protectedDaclSecurityInfo, 0, 0, dacl, 0); r != 0 {
-		return fmt.Errorf("protect %s: %w", dir, syscall.Errno(r))
+		return fmt.Errorf("protect %s: %w", p, syscall.Errno(r))
 	}
 	return nil
 }
