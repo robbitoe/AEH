@@ -58,8 +58,8 @@ func openFlowSandbox(r Repo, cfg Config, flow string) (*sandbox, error) {
 	if sb.agents() {
 		sb.agentEnv = map[string][]string{}
 		for name, p := range cfg.Profiles {
-			if len(p.Sandbox.PassEnv) > 0 {
-				sb.agentEnv[name] = append([]string(nil), p.Sandbox.PassEnv...)
+			if env := p.sandboxPassEnv(); len(env) > 0 {
+				sb.agentEnv[name] = append([]string(nil), env...)
 			}
 		}
 	}

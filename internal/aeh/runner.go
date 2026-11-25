@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -315,6 +316,15 @@ func run(ctx context.Context, r Repo, cfg Config, o Outcome, log io.Writer, gen 
 	}
 	if sealErr != nil {
 		return st, sealErr
+	}
+	if ru.sb.agents() && gen == nil && ru.seal != nil {
+		head, err := headCommit(r.Root)
+		if err != nil {
+			return st, err
+		}
+		if g := sealTracked(r.Root, head, *ru.seal, o.Acceptance); !g.Passed {
+			return st, errors.New(g.Output)
+		}
 	}
 	if o.Feature != "" {
 		if !memory.Present {
@@ -1205,6 +1215,9 @@ func (ru *runner) finalCheck(ctx context.Context) (_ bool, _ string, err error) 
 	if ru.seal != nil {
 		if sandboxed {
 			gates = append(gates, ru.sealedGate(ru.state.Base, head))
+			if ru.generated == nil && gates[len(gates)-1].Passed {
+				gates = append(gates, sealTracked(r.Root, head, *ru.seal, o.Acceptance))
+			}
 		} else if ru.generated != nil {
 			gates = append(gates, ru.sealedGate(ru.state.Base, head))
 			if gates[len(gates)-1].Passed {
@@ -1349,6 +1362,9 @@ func preflight(cfg Config, o Outcome, route string, added ...string) error {
 			return err
 		}
 		p := cfg.Profiles[n]
+		if cfg.agentsSandboxed() {
+			continue // the program lives in the agent image; aeh sandbox check looks for it
+		}
 		if _, err := exec.LookPath(p.Command[0]); err != nil {
 			return fmt.Errorf("profile %q: %s is not installed or not on PATH", n, p.Command[0])
 		}
@@ -1392,6 +1408,23 @@ func (ru *runner) triage(ctx context.Context) error {
 		}
 		return nil
 	}
+	// A sandboxed triage that could not run leaves the state as it was, so the next
+	// invocation triages again: its view is read-only, so a retry has no effect to undo.
+	before, err := json.Marshal(s)
+	if err != nil {
+		return err
+	}
+	rollback := func(cause error) error {
+		var prev State
+		if err := json.Unmarshal(before, &prev); err != nil {
+			return err
+		}
+		*s = prev
+		if err := saveState(ru.repo, s); err != nil {
+			return errors.Join(cause, err)
+		}
+		return fmt.Errorf("triage could not run in the sandbox; fix the cause (for example start Docker) and run the command again: %w", cause)
+	}
 	s.InitialRoute, s.TriageSource = o.Route, "declared"
 	if o.Route == "" {
 		if ru.cfg.Triage.Profile == "" {
@@ -1425,12 +1458,15 @@ func (ru *runner) triage(ctx context.Context) error {
 	if sandboxed {
 		dir, mem, err := ru.agentMemory()
 		if err != nil {
-			return err
+			return rollback(err)
 		}
 		step, err := ru.sb.agentStep(ctx, ru.repo.Root, ru.cfg, agentStep{Kind: "triage", Profile: ru.cfg.Triage.Profile, Prompt: prompt,
 			RunDir: runDir, LogName: "triage", Work: base, MemoryDir: dir, MemoryCommit: mem})
 		if err != nil {
-			return err
+			return rollback(err)
+		}
+		if errors.Is(step.AgentErr, errSandboxInfrastructure) {
+			return rollback(step.AgentErr)
 		}
 		outPath, runErr = step.OutPath, step.AgentErr
 	} else {
@@ -1771,6 +1807,39 @@ func (ru *runner) sealedGate(base, commit string) GateResult {
 		return gateSealedManifest(ru.repo.Root, commit, g.Manifest, g.Paths)
 	}
 	return gateSealedTree(ru.repo.Root, base, commit, ru.outcome.Acceptance)
+}
+
+// sealTracked passes when the files of a manual seal are exactly the tracked files under
+// the acceptance paths at commit. Sandboxed gates see only tracked files, so an approved
+// test that Git ignores or never tracked would otherwise silently not run.
+func sealTracked(root, commit string, s Seal, paths []string) GateResult {
+	g := GateResult{Name: "hash"}
+	tracked, err := sealedGitContents(root, commit, paths)
+	if err != nil {
+		g.Output = "acceptance tests unreadable: " + err.Error()
+		return g
+	}
+	sealed := map[string]bool{}
+	var problems []string
+	for _, f := range s.Files {
+		sealed[f.Path] = true
+		if _, ok := tracked[f.Path]; !ok {
+			problems = append(problems, "sealed but not tracked: "+f.Path)
+		}
+	}
+	for p := range tracked {
+		if !sealed[p] {
+			problems = append(problems, "tracked but not sealed: "+p)
+		}
+	}
+	if len(problems) > 0 {
+		slices.Sort(problems)
+		g.Output = "the sandbox runs only tracked acceptance files, and they differ from the approved ones (commit them, or approve the tests again):\n" +
+			strings.Join(problems, "\n")
+		return g
+	}
+	g.Passed = true
+	return g
 }
 
 // acceptanceGate runs the new and unchanged criteria through the configured manifest

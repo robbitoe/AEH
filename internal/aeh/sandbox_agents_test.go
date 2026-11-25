@@ -26,7 +26,7 @@ func TestAgentSandboxConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Sandbox.AgentImage != testDigest || len(c.Profiles["b"].Sandbox.PassEnv) != 1 {
+	if c.Sandbox.AgentImage != testDigest || len(c.Profiles["b"].sandboxPassEnv()) != 1 {
 		t.Fatalf("parsed %+v %+v", c.Sandbox, c.Profiles["b"])
 	}
 	for name, body := range map[string]string{
@@ -101,15 +101,17 @@ func TestSandboxNoteNamesTheViews(t *testing.T) {
 
 // agentsFixture runs the standard outcome with gates and agents in containers. Profiles
 // are inline shell scripts, since no host path exists inside the container.
-func agentsFixture(t *testing.T, agent, reviewer string) *fixture {
+// extra, when given, is more profiles and then more top-level settings.
+func agentsFixture(t *testing.T, agent, reviewer string, extra ...string) *fixture {
 	t.Helper()
 	image := testImageID(t)
+	extra = append(extra, "", "")
 	f := newFixture(t, map[string]string{"medio": agentNoop}, []string{"medio"}, "")
 	cfg := "project: test\ncommands:\n  build: \"test ! -e .git\"\n  test: \"sh tests/acceptance/check.sh\"\n  timeout_minutes: 1\n" +
 		"limits:\n  max_diff_lines: 50\nladder: [medio]\nreviewer: qa\nprofiles:\n" +
 		"  medio:\n    provider: medio\n    command: [\"sh\", \"-c\", " + strconvQuote(agent) + "]\n    timeout_minutes: 2\n" +
 		"  qa:\n    provider: qa\n    command: [\"sh\", \"-c\", " + strconvQuote(reviewer) + "]\n    timeout_minutes: 2\n" +
-		"sandbox:\n  image: \"" + image + "\"\n  agent_image: \"" + image + "\"\n  memory: 256m\n"
+		extra[0] + "sandbox:\n  image: \"" + image + "\"\n  agent_image: \"" + image + "\"\n  memory: 256m\n" + extra[1]
 	write(t, f.dir, "aeh/config.yaml", cfg)
 	mustGit(t, f.dir, "add", "-A")
 	mustGit(t, f.dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "sandboxed agents")

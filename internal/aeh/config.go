@@ -24,8 +24,18 @@ type Profile struct {
 	Stdin          bool              `yaml:"stdin"`
 	TimeoutMinutes int               `yaml:"timeout_minutes"`
 	QuotaExitCodes []int             `yaml:"quota_exit_codes"`
-	// Sandbox holds what the profile needs inside an agent container (stage 6, S2).
-	Sandbox ProfileSandbox `yaml:"sandbox"`
+	// Sandbox holds what the profile needs inside an agent container (stage 6, S2). It
+	// is a pointer omitted from JSON when unset, so digests of existing plans that
+	// serialize whole profiles do not change.
+	Sandbox *ProfileSandbox `yaml:"sandbox" json:",omitempty"`
+}
+
+// sandboxPassEnv is the profile's sandbox.pass_env, or none.
+func (p Profile) sandboxPassEnv() []string {
+	if p.Sandbox == nil {
+		return nil
+	}
+	return p.Sandbox.PassEnv
 }
 
 // ProfileSandbox lists the host variables a sandboxed agent receives. The project's
@@ -272,7 +282,7 @@ func (c *Config) validate() error {
 		}
 	}
 	for name, p := range c.Profiles {
-		for _, v := range p.Sandbox.PassEnv {
+		for _, v := range p.sandboxPassEnv() {
 			if err := checkAgentEnvName(v); err != nil {
 				return fmt.Errorf("config: profile %q: sandbox.pass_env: %w", name, err)
 			}

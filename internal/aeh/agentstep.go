@@ -74,7 +74,7 @@ func (s *sandbox) agentStep(ctx context.Context, root string, cfg Config, st age
 		r.AgentErr = fmt.Errorf("%w: %v", errSandboxInfrastructure, err)
 		return r, writeLaunchRecord(s, st, r)
 	}
-	a := agentLaunch{Kind: st.Kind, Profile: p, PassEnv: p.Sandbox.PassEnv, Prompt: sandboxNote(st) + st.Prompt,
+	a := agentLaunch{Kind: st.Kind, Profile: p, PassEnv: p.sandboxPassEnv(), Prompt: sandboxNote(st) + st.Prompt,
 		RunDir: st.RunDir, LogName: st.LogName, Out: st.Out}
 	var reads []func(func(string, func(io.Reader) error) error) error
 	if st.Work != "" {
@@ -175,10 +175,13 @@ func stepMemory(m MemorySnapshot) (dir, commit string, err error) {
 	return m.Dir, head, nil
 }
 
+// agentsSandboxed reports a configuration whose agents run in containers (policy 2).
+func (c Config) agentsSandboxed() bool { return c.Sandbox != nil && c.Sandbox.AgentImage != "" }
+
 // hostAgents refuses to launch an agent on the host when the configuration runs agents
 // in the sandbox: a flow whose agents are not sandboxed yet stops instead of falling back.
 func (c Config) hostAgents(flow string) error {
-	if c.Sandbox != nil && c.Sandbox.AgentImage != "" {
+	if c.agentsSandboxed() {
 		return fmt.Errorf("%s agents do not run in the sandbox yet, and sandbox.agent_image forbids running them on the host; remove sandbox.agent_image to use %s", flow, flow)
 	}
 	return nil
