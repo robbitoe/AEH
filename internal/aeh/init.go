@@ -79,6 +79,8 @@ notify:
 #   memory: 4g
 #   cpus: 2
 #   gate_env: {}                 # literal, non-secret variables for gate commands
+#   agent_image: "sha256:<id>"   # optional: run every agent in a container
+#                                # too; each profile then lists its variables in sandbox.pass_env
 
 # How each agent is launched. provider is a free name used to keep reviewers independent
 # from authors; transport is "cli" (an "api" transport is planned, not available yet).

@@ -30,16 +30,19 @@ type SandboxConfig struct {
 	Memory  string            `yaml:"memory"`
 	CPUs    string            `yaml:"cpus"`
 	GateEnv map[string]string `yaml:"gate_env"`
+	// AgentImage, when set, runs every agent in a container from this image (stage 6,
+	// S2, sandbox policy version 2). Without it, only gate commands are sandboxed.
+	AgentImage string `yaml:"agent_image"`
 }
 
 // UnmarshalYAML rejects misspelled sandbox settings.
 func (s *SandboxConfig) UnmarshalYAML(n *yaml.Node) error {
 	if n.Kind != yaml.MappingNode {
-		return errors.New("sandbox must be a mapping of image, memory, cpus and gate_env")
+		return errors.New("sandbox must be a mapping of image, agent_image, memory, cpus and gate_env")
 	}
 	for i := 0; i+1 < len(n.Content); i += 2 {
 		switch k := n.Content[i].Value; k {
-		case "image", "memory", "cpus", "gate_env":
+		case "image", "agent_image", "memory", "cpus", "gate_env":
 		default:
 			return fmt.Errorf("sandbox: unknown key %q", k)
 		}
@@ -79,6 +82,8 @@ func (s SandboxConfig) validate() error {
 	switch {
 	case !pinnedImage.MatchString(s.Image):
 		return errors.New("config: sandbox.image must be pinned: name@sha256:<digest> or sha256:<image id>")
+	case s.AgentImage != "" && !pinnedImage.MatchString(s.AgentImage):
+		return errors.New("config: sandbox.agent_image must be pinned: name@sha256:<digest> or sha256:<image id>")
 	case !memoryLimit.MatchString(s.Memory):
 		return errors.New("config: sandbox.memory must be a number with an optional k, m or g suffix, for example 4g")
 	case !cpuLimit.MatchString(s.CPUs) || strings.Trim(s.CPUs, "0.") == "":
@@ -96,6 +101,18 @@ func (s SandboxConfig) validate() error {
 		case strings.ContainsAny(value, "\x00\r\n"):
 			return fmt.Errorf("config: sandbox.gate_env: %s contains a newline or NUL", name)
 		}
+	}
+	return nil
+}
+
+// checkAgentEnvName refuses a variable an agent profile cannot set or forward inside the
+// sandbox: aeh sets HOME, TMPDIR and the proxy variables itself.
+func checkAgentEnvName(name string) error {
+	switch {
+	case !envNamePlain.MatchString(name):
+		return fmt.Errorf("invalid variable name %q", name)
+	case reservedSandboxEnv[strings.ToUpper(name)] || isProxyVar(name):
+		return fmt.Errorf("%s is set by aeh inside the sandbox", name)
 	}
 	return nil
 }
@@ -161,6 +178,57 @@ func (d dockerCLI) run(ctx context.Context, stdin io.Reader, stdout io.Writer, a
 		return "", fmt.Errorf("docker %s: %v: %s", args[0], err, msg)
 	}
 	return strings.TrimSpace(out.String()), nil
+}
+
+// stream runs one docker command and hands its standard output to fn as it arrives. The
+// reader is the process's own pipe, so a slow consumer (the capture hashes as it reads)
+// only slows the command down: no copy deadline runs after the process exits. When fn
+// fails, the command is stopped; when it succeeds, the rest of the output is drained
+// before the exit status is read.
+func (d dockerCLI) stream(ctx context.Context, fn func(io.Reader) error, args ...string) error {
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "docker", args...)
+	cmd.Env = d.env
+	cmd.WaitDelay = 5 * time.Second
+	var errb bytes.Buffer
+	cmd.Stderr = &errb
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("docker %s: %w", args[0], err)
+	}
+	ferr := fn(out)
+	if ferr == nil {
+		// What follows the parsed archive is its padding; anything large is not.
+		const tailLimit = 1 << 20
+		n, err := io.Copy(io.Discard, io.LimitReader(out, tailLimit+1))
+		switch {
+		case err != nil:
+			ferr = err
+		case n > tailLimit:
+			ferr = errors.New("unexpected output after the archive")
+		}
+	}
+	if ferr != nil {
+		cancel()
+	}
+	werr := cmd.Wait()
+	switch {
+	case ferr != nil:
+		return ferr
+	case ctx.Err() != nil:
+		return fmt.Errorf("docker %s: %w", args[0], ctx.Err())
+	case werr != nil:
+		msg := strings.TrimSpace(errb.String())
+		if len(msg) > 2000 {
+			msg = msg[:2000] + "..."
+		}
+		return fmt.Errorf("docker %s: %v: %s", args[0], werr, msg)
+	}
+	return nil
 }
 
 // isolatedDockerCLI talks to the resolved local endpoint with a runner-private, empty
@@ -272,14 +340,17 @@ func resolveImage(d dockerCLI, ref string) (sandboxImage, error) {
 
 // sandbox runs launches for one flow of one project.
 type sandbox struct {
-	cfg     SandboxConfig
-	d       dockerCLI
-	engine  sandboxEngine
-	image   sandboxImage // gates
-	agent   sandboxImage // agents (S2); empty until an agent image is configured
-	project string       // label: first 12 hex digits of sha256(project root)
-	dir     string       // runner-private directory: .aeh/sandbox
-	flow    string       // intents of this flow live in dir/intents/<flow>
+	cfg    SandboxConfig
+	d      dockerCLI
+	engine sandboxEngine
+	image  sandboxImage // gates
+	agent  sandboxImage // agents (S2); empty until an agent image is configured
+	// agentEnv is each profile's sandbox.pass_env, pinned with the policy: which host
+	// values reach an agent is an isolation field.
+	agentEnv map[string][]string
+	project  string // label: first 12 hex digits of sha256(project root)
+	dir      string // runner-private directory: .aeh/sandbox
+	flow     string // intents of this flow live in dir/intents/<flow>
 }
 
 func projectLabel(root string) string {
@@ -310,6 +381,11 @@ func openSandbox(r Repo, cfg SandboxConfig, flow string) (*sandbox, error) {
 	}
 	if s.image, err = resolveImage(s.d, s.cfg.Image); err != nil {
 		return nil, err
+	}
+	if s.cfg.AgentImage != "" {
+		if s.agent, err = resolveImage(s.d, s.cfg.AgentImage); err != nil {
+			return nil, err
+		}
 	}
 	if err := s.recover(); err != nil {
 		return nil, err
@@ -917,21 +993,8 @@ func (s *sandbox) writeEnvFile(id string, env []string) (string, error) {
 
 // readBack streams a directory of a stopped container as a tar to fn.
 func (s *sandbox) readBack(ctx context.Context, container, target string, fn func(io.Reader) error) error {
-	pr, pw := io.Pipe()
-	done := make(chan error, 1)
-	go func() {
-		_, err := s.d.run(ctx, nil, pw, "cp", container+":"+target, "-")
-		pw.CloseWithError(err)
-		done <- err
-	}()
-	ferr := fn(pr)
-	pr.CloseWithError(errors.New("read back stopped"))
-	cerr := <-done
-	if ferr != nil {
-		return ferr
-	}
-	if cerr != nil {
-		return fmt.Errorf("read back %s: %w", target, cerr)
+	if err := s.d.stream(ctx, fn, "cp", container+":"+target, "-"); err != nil {
+		return fmt.Errorf("read back %s: %w", target, err)
 	}
 	return nil
 }

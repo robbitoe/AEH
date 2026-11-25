@@ -24,6 +24,38 @@ type Profile struct {
 	Stdin          bool              `yaml:"stdin"`
 	TimeoutMinutes int               `yaml:"timeout_minutes"`
 	QuotaExitCodes []int             `yaml:"quota_exit_codes"`
+	// Sandbox holds what the profile needs inside an agent container (stage 6, S2). It
+	// is a pointer omitted from JSON when unset, so digests of existing plans that
+	// serialize whole profiles do not change.
+	Sandbox *ProfileSandbox `yaml:"sandbox" json:",omitempty"`
+}
+
+// sandboxPassEnv is the profile's sandbox.pass_env, or none.
+func (p Profile) sandboxPassEnv() []string {
+	if p.Sandbox == nil {
+		return nil
+	}
+	return p.Sandbox.PassEnv
+}
+
+// ProfileSandbox lists the host variables a sandboxed agent receives. The project's
+// pass_env is never forwarded into a container: each profile names its own.
+type ProfileSandbox struct {
+	PassEnv []string `yaml:"pass_env"`
+}
+
+// UnmarshalYAML rejects misspelled profile sandbox settings.
+func (s *ProfileSandbox) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind != yaml.MappingNode {
+		return errors.New("profile sandbox must be a mapping of pass_env")
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if k := n.Content[i].Value; k != "pass_env" {
+			return fmt.Errorf("profile sandbox: unknown key %q", k)
+		}
+	}
+	type plain ProfileSandbox
+	return n.Decode((*plain)(s))
 }
 
 // Config is the project's constitution: commands, limits, protected paths and agent profiles.
@@ -247,6 +279,13 @@ func (c *Config) validate() error {
 	if c.Sandbox != nil {
 		if err := c.Sandbox.validate(); err != nil {
 			return err
+		}
+	}
+	for name, p := range c.Profiles {
+		for _, v := range p.sandboxPassEnv() {
+			if err := checkAgentEnvName(v); err != nil {
+				return fmt.Errorf("config: profile %q: sandbox.pass_env: %w", name, err)
+			}
 		}
 	}
 	if err := c.validateDiscoveryConfig(); err != nil {
