@@ -41,3 +41,30 @@ func TestIgnoreRulesTranslationIsCapped(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+// Lines of only spaces, "!", "/" or "!/" leave an empty pattern: git add -A keeps every
+// path they would seem to touch (checked against real Git), so new directories stay in.
+func TestIgnoreDegenerateLinesHaveNoEffect(t *testing.T) {
+	c, _ := caseRulesRepo(t, map[string]string{".gitignore": "   \n!\nneg/private/\n", "neg/.gitignore": "!\n/\n!/\n   \n"})
+	expectIgnored(t, c, map[string]bool{
+		"newdir/": false, "newdir/f": false, "neg/sub/": false, "neg/sub/f": false,
+		"neg/private/": true, "neg/private/s.txt": true,
+	})
+}
+
+// A .gitignore over the per-file cap is refused before it is read.
+func TestIgnoreRulesFileIsCapped(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q")
+	blob := mustGitInput(t, dir, strings.Repeat("\n", int(maxIgnoreFile)+1), "hash-object", "-w", "--stdin")
+	mustGit(t, dir, "update-index", "--add", "--cacheinfo", "100644,"+blob+",.gitignore")
+	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "large rules file")
+	commit := mustGit(t, dir, "rev-parse", "HEAD")
+	e, err := newCommitExport(dir, commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newIgnoreChecker(dir, commit, e.Files); err == nil || !strings.Contains(err.Error(), "up to") {
+		t.Fatalf("got %v", err)
+	}
+}

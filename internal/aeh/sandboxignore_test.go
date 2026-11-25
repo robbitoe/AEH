@@ -79,7 +79,8 @@ func TestIgnoreCheckerKeepsCaseDistinctRules(t *testing.T) {
 // The translated rules answer as Git does with the real .gitignore files on a checkout.
 func TestIgnoreCheckerMatchesGitOnARealCheckout(t *testing.T) {
 	rules := map[string]string{
-		".gitignore":         "*.log\n!keep.log\n/root-only\nbuild/\ndocs/*.tmp\n**/deep\n# comment\n\ntrail \n",
+		".gitignore":         "*.log\n!keep.log\n/root-only\nbuild/\ndocs/*.tmp\n**/deep\n# comment\n\ntrail \nneg/private/\n",
+		"neg/.gitignore":     "!\n/\n!/\n   \n",
 		"src/.gitignore":     "gen/\n/local\n!important.log\nsub/x\n*.o\n",
 		"src/a/.gitignore":   "!*.o\nonly-here\n",
 		"we[ird]/.gitignore": "z\n",
@@ -95,7 +96,11 @@ func TestIgnoreCheckerMatchesGitOnARealCheckout(t *testing.T) {
 		"src/a/b/m.o", "m.o", "src/a/only-here", "src/only-here", "we[ird]/z", "weid/z", "wei/z", "src/a/b/only-here",
 		"#hash/h", "#hash/x/h", "h", "trail", "trail ",
 		"crlf/deep/gen/output", "crlf/gen/x", "crlf/a.secret", "crlf/x/a.secret", "crlf/top", "crlf/x/top",
-		"bom/a.secret", "bom/x/b.secret", "a.secret"}
+		"bom/a.secret", "bom/x/b.secret", "a.secret",
+		// neg/.gitignore holds only degenerate lines; directories asked with a trailing
+		// slash are left to TestIgnoreDegenerateLinesHaveNoEffect (Git's answer there
+		// differs from git add -A).
+		"neg/private/secret.txt", "neg/private/", "neg/x", "neg/sub/y"}
 	// One process per path: with --stdin, Git keeps the per-directory rules of the previous
 	// path and can answer a later one with them (src/gen/ then gen/).
 	want := map[string]bool{}

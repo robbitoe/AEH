@@ -172,20 +172,20 @@ func newIgnoreChecker(root, commit string, files []exportFile) (*ignoreChecker, 
 		c.Close()
 		return nil, fmt.Errorf("ignore rules: %w", err)
 	}
-	var rules []string
+	var rules []exportFile
 	for _, f := range files {
 		if path.Base(f.Path) == ".gitignore" {
-			rules = append(rules, f.Path)
+			rules = append(rules, f)
 		}
 	}
 	// Shallower files first: a deeper .gitignore overrides its ancestors, and in one
 	// excludes file the last matching pattern decides.
 	sort.Slice(rules, func(i, j int) bool {
-		di, dj := strings.Count(rules[i], "/"), strings.Count(rules[j], "/")
+		di, dj := strings.Count(rules[i].Path, "/"), strings.Count(rules[j].Path, "/")
 		if di != dj {
 			return di < dj
 		}
-		return rules[i] < rules[j]
+		return rules[i].Path < rules[j].Path
 	})
 	if err := c.writeExcludes(root, commit, rules); err != nil {
 		c.Close()
@@ -198,11 +198,14 @@ func newIgnoreChecker(root, commit string, files []exportFile) (*ignoreChecker, 
 // the tree cannot make the runner write, or Git read, without bound.
 const maxIgnoreRules = int64(64) << 20
 
+// maxIgnoreFile caps one .gitignore read into memory.
+const maxIgnoreFile = int64(8) << 20
+
 // utf8BOM is the byte order mark Git skips at the start of a .gitignore.
 const utf8BOM = "\xef\xbb\xbf"
 
 // writeExcludes translates the .gitignore files, streaming, into the excludes file.
-func (c *ignoreChecker) writeExcludes(root, commit string, rules []string) error {
+func (c *ignoreChecker) writeExcludes(root, commit string, rules []exportFile) error {
 	f, err := os.OpenFile(filepath.Join(c.dir, "excludes"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("ignore rules: %w", err)
@@ -210,16 +213,27 @@ func (c *ignoreChecker) writeExcludes(root, commit string, rules []string) error
 	defer f.Close()
 	w := bufio.NewWriter(f)
 	var size int64
-	for _, p := range rules {
-		b, ok := gitBlob(root, commit, p)
+	for _, rule := range rules {
+		if rule.Size > maxIgnoreFile {
+			return fmt.Errorf("ignore rules: %s has %d bytes; the sandbox reads .gitignore files up to %d MiB", rule.Path, rule.Size, maxIgnoreFile>>20)
+		}
+		b, ok := gitBlob(root, commit, rule.Path)
 		if !ok {
-			return fmt.Errorf("ignore rules: read %s at %s", p, short(commit))
+			return fmt.Errorf("ignore rules: read %s at %s", rule.Path, short(commit))
 		}
 		// As Git reads a .gitignore: a UTF-8 byte order mark at the start is skipped, and
-		// each line loses one trailing carriage return.
+		// each line loses one trailing carriage return. Lines are walked in place, with no
+		// slice of all of them.
 		b = strings.TrimPrefix(b, utf8BOM)
-		for _, line := range strings.Split(b, "\n") {
-			out := anchorIgnoreLine(path.Dir(p), strings.TrimSuffix(line, "\r"))
+		dir := path.Dir(rule.Path)
+		for len(b) > 0 {
+			line := b
+			if i := strings.IndexByte(b, '\n'); i >= 0 {
+				line, b = b[:i], b[i+1:]
+			} else {
+				b = ""
+			}
+			out := anchorIgnoreLine(dir, strings.TrimSuffix(line, "\r"))
 			if size += int64(len(out)) + 1; size > maxIgnoreRules {
 				return fmt.Errorf("ignore rules: the .gitignore files of %s exceed %d MiB once anchored at their directories", short(commit), maxIgnoreRules>>20)
 			}
@@ -241,15 +255,24 @@ func (c *ignoreChecker) writeExcludes(root, commit string, rules []string) error
 // other than a trailing one is relative to dir; any other pattern matches at any depth
 // below dir. Comments, blank lines and the root's own lines stay as they are.
 func anchorIgnoreLine(dir, line string) string {
-	if dir == "." || strings.TrimSpace(line) == "" || strings.HasPrefix(line, "#") {
+	if line == "" || strings.HasPrefix(line, "#") {
 		return line
 	}
 	neg, pat := "", line
 	if strings.HasPrefix(pat, "!") {
 		neg, pat = "!", pat[1:]
 	}
-	prefix := escapeIgnoreDir(dir)
 	body := strings.TrimRight(strings.TrimRight(pat, " "), "/")
+	if body == "" {
+		// A line of only spaces, "!", "/" or "!/" leaves an empty pattern. It has no
+		// effect on git add -A, but git check-ignore matches it against a directory asked
+		// as "name/" (an empty base name), at any level. It is dropped everywhere.
+		return ""
+	}
+	if dir == "." {
+		return line
+	}
+	prefix := escapeIgnoreDir(dir)
 	if strings.Contains(body, "/") {
 		return neg + prefix + "/" + strings.TrimPrefix(pat, "/")
 	}
