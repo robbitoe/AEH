@@ -128,6 +128,9 @@ func captureCandidate(ctx context.Context, root, base string, e *commitExport, r
 		if underIgnored(rel) {
 			continue // never read, never committed
 		}
+		if gitLikePath(rel) {
+			return "", agentContent("the agent created %s: Git reserves that name (.git and its aliases)", rel)
+		}
 		f, isTracked := tracked[rel]
 		// A tracked directory is never ignored (it holds tracked files); anything else
 		// new, including a file that replaced a tracked directory, is evaluated.
@@ -145,11 +148,6 @@ func captureCandidate(ctx context.Context, root, base string, e *commitExport, r
 					ignoredDirs[rel] = true
 				}
 				continue
-			}
-		}
-		for _, part := range strings.Split(rel, "/") {
-			if strings.EqualFold(part, ".git") {
-				return "", agentContent("the agent created %s: .git paths are not allowed in the sandbox work directory", rel)
 			}
 		}
 		switch h.Typeflag {
@@ -199,7 +197,20 @@ func captureCandidate(ctx context.Context, root, base string, e *commitExport, r
 	if err := storeBlobs(root, write); err != nil {
 		return "", err
 	}
-	return commitCaptured(root, base, spool, removed, write, format, msg)
+	return commitCaptured(root, base, spool, e, removed, write, format, msg)
+}
+
+// gitLikePath reports a path with a component Git treats as .git on some host: any case,
+// trailing dots or spaces (Windows drops them) and the NTFS short name GIT~1. Git refuses
+// such paths in an index, sometimes silently.
+func gitLikePath(p string) bool {
+	for _, part := range strings.Split(p, "/") {
+		t := strings.ToLower(strings.TrimRight(part, ". "))
+		if t == ".git" || strings.HasPrefix(t, "git~") {
+			return true
+		}
+	}
+	return false
 }
 
 // spoolBlob copies size bytes to a host file and returns their Git blob object ID.
@@ -262,7 +273,7 @@ func storeBlobs(root string, all []captured) error {
 
 // commitCaptured builds the candidate's tree in a runner-private index, starting from the
 // base: removals first, so a file replaced by a directory of the same name can be added.
-func commitCaptured(root, base, spool string, removed []string, write []captured, format, msg string) (string, error) {
+func commitCaptured(root, base, spool string, e *commitExport, removed []string, write []captured, format, msg string) (string, error) {
 	env := []string{"GIT_INDEX_FILE=" + filepath.Join(spool, "index")}
 	if _, err := gitInput(root, env, "", "read-tree", base); err != nil {
 		return "", fmt.Errorf("capture: %w", err)
@@ -291,6 +302,9 @@ func commitCaptured(root, base, spool string, removed []string, write []captured
 	if err != nil {
 		return "", fmt.Errorf("capture: %w", err)
 	}
+	if err := checkCapturedTree(root, tree, e, removed, write); err != nil {
+		return "", err
+	}
 	commit, err := gitInput(root, nil, "", "-c", "user.name=aeh", "-c", "user.email=aeh@localhost", "-c", "commit.gpgsign=false",
 		"commit-tree", tree, "-p", base, "-m", msg)
 	if err != nil {
@@ -312,4 +326,63 @@ func gitInput(dir string, env []string, stdin string, args ...string) (string, e
 		return "", fmt.Errorf("git %s: %v: %s", args[0], err, strings.TrimSpace(errb.String()))
 	}
 	return strings.TrimSpace(out.String()), nil
+}
+
+// checkCapturedTree confirms that the tree holds exactly the base minus the removals plus
+// the written entries. Git skips some paths with only a warning (update-index prints
+// "Ignoring path" and succeeds); a skipped path must fail the capture, not vanish.
+func checkCapturedTree(root, tree string, e *commitExport, removed []string, write []captured) error {
+	want := map[string]string{}
+	for _, f := range e.Files {
+		mode := "100644"
+		if f.Executable {
+			mode = "100755"
+		}
+		want[f.Path] = mode + " " + f.Blob
+	}
+	for _, p := range removed {
+		delete(want, p)
+	}
+	for _, c := range write {
+		mode := "100644"
+		if c.Executable {
+			mode = "100755"
+		}
+		want[c.Path] = mode + " " + c.Blob
+	}
+	out, err := gitRaw(root, "ls-tree", "-r", "-z", "--full-tree", tree) // untrimmed: names may end in spaces
+	if err != nil {
+		return fmt.Errorf("capture: %w", err)
+	}
+	got := map[string]string{}
+	for _, entry := range strings.Split(out, "\x00") {
+		if entry == "" {
+			continue
+		}
+		meta, name, ok := strings.Cut(entry, "	")
+		fields := strings.Fields(meta)
+		if !ok || len(fields) != 3 {
+			return fmt.Errorf("capture: unexpected ls-tree entry %q", entry)
+		}
+		got[name] = fields[0] + " " + fields[2]
+	}
+	var diff []string
+	for p, w := range want {
+		if got[p] != w {
+			diff = append(diff, p)
+		}
+	}
+	for p := range got {
+		if _, ok := want[p]; !ok {
+			diff = append(diff, p)
+		}
+	}
+	if len(diff) > 0 {
+		sort.Strings(diff)
+		if len(diff) > 20 {
+			diff = append(diff[:20], "...")
+		}
+		return agentContent("Git could not record these paths the agent left: %s", strings.Join(diff, ", "))
+	}
+	return nil
 }
