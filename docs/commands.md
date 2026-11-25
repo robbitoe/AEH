@@ -214,7 +214,7 @@ Checks memory and its privacy settings: errors and warnings.
 
 ### `aeh sandbox login`
 
-`aeh sandbox login <profile>` logs a profile's CLI in inside the agent image and keeps its session for later launches. The profile must declare `sandbox.session`, the files relative to `HOME` that its CLI needs to authenticate. The command runs the profile's `sandbox.login` (default: the profile's program followed by `login`) attached to your terminal, as user `10001` with an empty `HOME`, Docker's default network and no view of the project. When the login exits with code 0, aeh saves each declared file it left in `HOME` (a regular, non-empty file of at most 1 MiB) in a private store under `.aeh/sandbox/sessions/`; the command fails if it left none. Run it again whenever a session expires.
+`aeh sandbox login <profile>` logs a profile's CLI in inside the agent image and keeps its session for later launches. The profile must declare `sandbox.session`, the files relative to `HOME` that its CLI needs to authenticate. The command runs the profile's `sandbox.login` (default: the profile's program followed by `login`) attached to your terminal, as user `10001` with an empty `HOME`, Docker's default network and no view of the project. When the login exits with code 0, aeh saves each declared file it left in `HOME` (a regular, non-empty file of at most 1 MiB) in a private store under `.aeh/sandbox/sessions/` of the main checkout; the command fails if it left none, and refuses to run unless the project ignores `.aeh/`. A login that times out (30 minutes) or is cancelled stops its container and saves nothing. Run it again whenever a session expires.
 
 ## Tracking
 

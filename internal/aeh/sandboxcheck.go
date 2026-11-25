@@ -268,7 +268,11 @@ echo AGENT-OK`
 		if len(paths) == 0 {
 			continue
 		}
-		files, err := loadSession(s.sessionDir(name), paths)
+		store, err := sessionStore(s.root(), name, false)
+		var files map[string][]byte
+		if err == nil {
+			files, err = loadSession(store, paths)
+		}
 		if err != nil {
 			fmt.Fprintf(w, "warning   profile %s: %v\n", name, err)
 		} else if len(files) == 0 {

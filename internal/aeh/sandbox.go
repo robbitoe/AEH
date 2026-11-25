@@ -182,13 +182,34 @@ func (d dockerCLI) run(ctx context.Context, stdin io.Reader, stdout io.Writer, a
 
 // attach runs one docker command on the terminal of an interactive launch. The process
 // gets the terminal's own file as stdin, so the client can put it in raw mode.
-func (d dockerCLI) attach(ctx context.Context, t *interactiveIO, args ...string) error {
-	cmd := exec.CommandContext(ctx, "docker", args...)
+//
+// When ctx ends, the container is killed rather than the client: the attachment then
+// ends normally and the client restores the terminal it put in raw mode. The client is
+// killed only if it does not exit after that.
+func (d dockerCLI) attach(ctx context.Context, t *interactiveIO, cid string) error {
+	cmd := exec.Command("docker", "start", "--attach", "--interactive", cid)
 	cmd.Env = d.env
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = t.In, t.Out, t.Err
-	cmd.WaitDelay = 5 * time.Second
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("docker %s: %w", args[0], err)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("docker start: %w", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			_, _ = d.admin("kill", cid)
+			select {
+			case <-done:
+			case <-time.After(15 * time.Second):
+				_ = cmd.Process.Kill()
+			}
+		}
+	}()
+	err := cmd.Wait()
+	close(done)
+	if err != nil {
+		return fmt.Errorf("docker start: %w", err)
 	}
 	return nil
 }
@@ -367,6 +388,9 @@ type sandbox struct {
 	dir          string // runner-private directory: .aeh/sandbox
 	flow         string // intents of this flow live in dir/intents/<flow>
 }
+
+// root is the project checkout whose .aeh/sandbox the sandbox uses.
+func (s *sandbox) root() string { return filepath.Dir(filepath.Dir(s.dir)) }
 
 func projectLabel(root string) string {
 	sum := sha256.Sum256([]byte(filepath.Clean(root)))
@@ -910,7 +934,7 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 	if l.Interactive != nil {
 		// The terminal is attached until the process exits; its status still comes from
 		// docker wait and inspect. A container that never started is a runtime failure.
-		if err := s.d.attach(runCtx, l.Interactive, "start", "--attach", "--interactive", cid); err != nil && runCtx.Err() == nil {
+		if err := s.d.attach(runCtx, l.Interactive, cid); err != nil && runCtx.Err() == nil {
 			if st, ierr := s.inspect(cid); ierr != nil || st.State.Status == "created" {
 				return infra(err)
 			}

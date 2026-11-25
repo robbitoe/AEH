@@ -67,21 +67,81 @@ func checkSessionPaths(paths []string) error {
 	return nil
 }
 
-// sessionDir is a profile's store. The name keeps the profile readable and a digest
+// sessionKey names a profile's store. The name keeps the profile readable and a digest
 // keeps two profiles apart whatever their names.
-func (s *sandbox) sessionDir(profile string) string {
+func sessionKey(profile string) string {
 	sum := sha256.Sum256([]byte(profile))
-	return filepath.Join(s.dir, "sessions", flowKeyUnsafe.ReplaceAllString(profile, "_")+"-"+hex.EncodeToString(sum[:6]))
+	return flowKeyUnsafe.ReplaceAllString(profile, "_") + "-" + hex.EncodeToString(sum[:6])
+}
+
+// sessionStore returns a profile's store, <main>/.aeh/sandbox/sessions/<key>. The
+// project must keep .aeh/ ignored and untracked, so credentials can never be committed.
+// Every directory on the way must be a plain directory, not a link, junction or other
+// reparse point that would send credentials elsewhere; sessions/ is made private to the
+// current user. With create false nothing is created and a missing store is empty.
+func sessionStore(main, profile string, create bool) (string, error) {
+	if err := checkProjectPrivacy(main); err != nil {
+		return "", fmt.Errorf("session store: %w", err)
+	}
+	dir := main
+	for _, part := range []string{".aeh", "sandbox", "sessions", sessionKey(profile)} {
+		dir = filepath.Join(dir, part)
+		ok, err := plainDir(dir, create)
+		if err != nil || !ok {
+			return dir, err
+		}
+		if part == "sessions" {
+			if err := protectPrivateDir(dir); err != nil {
+				return "", fmt.Errorf("session store: %w", err)
+			}
+		}
+	}
+	return dir, nil
+}
+
+// plainDir checks that dir is a plain directory, creating it (0700) when create is set.
+// It reports false when dir is missing and was not created.
+func plainDir(dir string, create bool) (bool, error) {
+	fi, err := os.Lstat(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		if !create {
+			return false, nil
+		}
+		if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+			return false, fmt.Errorf("session store: %w", err)
+		}
+		fi, err = os.Lstat(dir)
+	}
+	if err != nil {
+		return false, fmt.Errorf("session store: %w", err)
+	}
+	if fi.Mode().Type() != fs.ModeDir {
+		return false, fmt.Errorf("session store: %s is not a plain directory (a link, junction or file)", dir)
+	}
+	return true, nil
+}
+
+// storePath is the host path of declared file p inside store, after checking that each
+// directory between them is plain (created when create is set). ok is false when a
+// directory is missing and was not created.
+func storePath(store, p string, create bool) (full string, ok bool, err error) {
+	parts := strings.Split(p, "/")
+	dir := store
+	for _, part := range parts[:len(parts)-1] {
+		dir = filepath.Join(dir, part)
+		if ok, err := plainDir(dir, create); err != nil || !ok {
+			return "", false, err
+		}
+	}
+	return filepath.Join(dir, parts[len(parts)-1]), true, nil
 }
 
 // lockSession serializes everything that reads or writes a profile's store: launches
 // from copy-in to write-back, and logins. The lock is the operating system's, so a
-// process that dies releases it. It waits until ctx ends.
-func lockSession(ctx context.Context, dir string) (unlock func(), err error) {
-	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
-		return nil, fmt.Errorf("session lock: %w", err)
-	}
-	f, err := os.OpenFile(dir+".lock", os.O_RDWR|os.O_CREATE, 0o600)
+// process that dies releases it. It waits until ctx ends. The lock file sits beside the
+// verified store, inside the private sessions/ directory.
+func lockSession(ctx context.Context, store string) (unlock func(), err error) {
+	f, err := os.OpenFile(store+".lock", os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("session lock: %w", err)
 	}
@@ -109,7 +169,13 @@ func lockSession(ctx context.Context, dir string) (unlock func(), err error) {
 func loadSession(dir string, paths []string) (map[string][]byte, error) {
 	files := map[string][]byte{}
 	for _, p := range paths {
-		full := filepath.Join(dir, filepath.FromSlash(p))
+		full, ok, err := storePath(dir, p, false)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
 		fi, err := os.Lstat(full)
 		if errors.Is(err, fs.ErrNotExist) {
 			continue
@@ -131,9 +197,12 @@ func loadSession(dir string, paths []string) (map[string][]byte, error) {
 
 // storeSessionFile replaces one stored file atomically, mode 0600.
 func storeSessionFile(dir, p string, data []byte) error {
-	full := filepath.Join(dir, filepath.FromSlash(p))
-	if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+	full, _, err := storePath(dir, p, true)
+	if err != nil {
 		return err
+	}
+	if fi, err := os.Lstat(full); err == nil && !fi.Mode().IsRegular() {
+		return fmt.Errorf("session store: %s is not a regular file", full)
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(full), ".session-*")
 	if err != nil {
@@ -240,7 +309,10 @@ func (s *sandbox) prepareSession(ctx context.Context, name string, p Profile) (v
 	if len(paths) == 0 {
 		return nil, nil, func() {}, nil
 	}
-	dir := s.sessionDir(name)
+	dir, err := sessionStore(s.root(), name, true)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	unlock, err = lockSession(ctx, dir)
 	if err != nil {
 		return nil, nil, nil, err
@@ -263,6 +335,12 @@ func (s *sandbox) prepareSession(ctx context.Context, name string, p Profile) (v
 // with a fresh HOME volume, and saves the declared session files it leaves there. The
 // login never sees the project: no /work, no /memory.
 func SandboxLogin(ctx context.Context, r Repo, name string, in *os.File, out, errw io.Writer) error {
+	// Runs and plans use the main checkout's store; a login from a linked worktree saves there too.
+	main, err := MainCheckout(r)
+	if err != nil {
+		return err
+	}
+	r = Repo{Root: main}
 	cfg, err := r.LoadConfig()
 	if err != nil {
 		return err
@@ -289,16 +367,21 @@ func SandboxLogin(ctx context.Context, r Repo, name string, in *os.File, out, er
 	if err != nil {
 		return fmt.Errorf("profile environment: %w", err)
 	}
-	sb, err := openSandbox(r, *cfg.Sandbox, "login")
+	// The lock comes first: opening the sandbox recovers the flow's leftover launches, and
+	// each profile has its own login flow, so a login never removes another one's container.
+	dir, err := sessionStore(main, name, true)
 	if err != nil {
 		return err
 	}
-	dir := sb.sessionDir(name)
 	unlock, err := lockSession(ctx, dir)
 	if err != nil {
 		return err
 	}
 	defer unlock()
+	sb, err := openSandbox(r, *cfg.Sandbox, "login-"+sessionKey(name))
+	if err != nil {
+		return err
+	}
 	tty := false
 	if fi, err := in.Stat(); err == nil {
 		tty = fi.Mode()&os.ModeCharDevice != 0
