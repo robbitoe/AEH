@@ -1,8 +1,10 @@
 package aeh
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1374,6 +1376,13 @@ func preflight(cfg Config, o Outcome, route string, added ...string) error {
 
 const changeDefaultWarning = "warning: no triage profile configured; defaulting to change"
 
+// triageRetry reports a sandboxed triage launch whose model gave no usable answer for a
+// reason outside the model: the runtime failed, the container state was lost, or the
+// launch was stopped. Such a triage runs again next time instead of falling back to new.
+func triageRetry(res LaunchResult) bool {
+	return res.Class == ClassInfrastructure || res.Class == ClassTerminated
+}
+
 // observeRules persists the maximum policy seen across all candidates and tasks.
 func (ru *runner) observeRules(hit []TriageRule) {
 	s := ru.state
@@ -1465,7 +1474,7 @@ func (ru *runner) triage(ctx context.Context) error {
 		if err != nil {
 			return rollback(err)
 		}
-		if errors.Is(step.AgentErr, errSandboxInfrastructure) {
+		if triageRetry(step.Launch) {
 			return rollback(step.AgentErr)
 		}
 		outPath, runErr = step.OutPath, step.AgentErr
@@ -1810,8 +1819,9 @@ func (ru *runner) sealedGate(base, commit string) GateResult {
 }
 
 // sealTracked passes when the files of a manual seal are exactly the tracked files under
-// the acceptance paths at commit. Sandboxed gates see only tracked files, so an approved
-// test that Git ignores or never tracked would otherwise silently not run.
+// the acceptance paths at commit, with the approved bytes. Sandboxed gates see only the
+// committed blobs, so an approved test that Git ignores, never tracked, or stores with
+// other bytes (a clean filter) would otherwise not be the test that runs.
 func sealTracked(root, commit string, s Seal, paths []string) GateResult {
 	g := GateResult{Name: "hash"}
 	tracked, err := sealedGitContents(root, commit, paths)
@@ -1823,8 +1833,12 @@ func sealTracked(root, commit string, s Seal, paths []string) GateResult {
 	var problems []string
 	for _, f := range s.Files {
 		sealed[f.Path] = true
-		if _, ok := tracked[f.Path]; !ok {
+		blob, ok := tracked[f.Path]
+		switch {
+		case !ok:
 			problems = append(problems, "sealed but not tracked: "+f.Path)
+		case !sealedBytes(blob, f.SHA256):
+			problems = append(problems, "committed bytes differ from the approved ones: "+f.Path)
 		}
 	}
 	for p := range tracked {
@@ -1840,6 +1854,21 @@ func sealTracked(root, commit string, s Seal, paths []string) GateResult {
 	}
 	g.Passed = true
 	return g
+}
+
+// sealedBytes reports whether a committed blob is the approved file. The only accepted
+// difference is the one core.autocrlf makes on checkout: a blob without carriage returns
+// whose LF line endings became CRLF in the approved file. The text is the same.
+func sealedBytes(blob []byte, approved string) bool {
+	sum := sha256.Sum256(blob)
+	if hex.EncodeToString(sum[:]) == approved {
+		return true
+	}
+	if bytes.IndexByte(blob, '\r') >= 0 {
+		return false
+	}
+	sum = sha256.Sum256(bytes.ReplaceAll(blob, []byte("\n"), []byte("\r\n")))
+	return hex.EncodeToString(sum[:]) == approved
 }
 
 // acceptanceGate runs the new and unchanged criteria through the configured manifest

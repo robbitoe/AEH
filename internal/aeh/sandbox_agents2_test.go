@@ -2,6 +2,8 @@ package aeh
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -51,16 +53,41 @@ func TestSealTrackedNeedsEverySealedFileTracked(t *testing.T) {
 	mustGit(t, dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "tests")
 	head := mustGit(t, dir, "rev-parse", "HEAD")
 	paths := []string{"tests/acceptance/"}
-	one := Seal{Files: []SealFile{{Path: "tests/acceptance/a.sh"}}}
+	one := Seal{Files: []SealFile{{Path: "tests/acceptance/a.sh", SHA256: sha256Hex("a\n")}}}
 	if g := sealTracked(dir, head, one, paths); !g.Passed {
 		t.Fatalf("exact seal refused: %s", g.Output)
 	}
-	two := Seal{Files: []SealFile{{Path: "tests/acceptance/a.sh"}, {Path: "tests/acceptance/ignored.sh"}}}
+	// The approved checkout had CRLF (core.autocrlf): the same text.
+	crlf := Seal{Files: []SealFile{{Path: "tests/acceptance/a.sh", SHA256: sha256Hex("a\r\n")}}}
+	if g := sealTracked(dir, head, crlf, paths); !g.Passed {
+		t.Fatalf("autocrlf seal refused: %s", g.Output)
+	}
+	// A clean filter stored other bytes than the approved checkout shows.
+	other := Seal{Files: []SealFile{{Path: "tests/acceptance/a.sh", SHA256: sha256Hex("assert\n")}}}
+	if g := sealTracked(dir, head, other, paths); g.Passed || !strings.Contains(g.Output, "committed bytes differ from the approved ones: tests/acceptance/a.sh") {
+		t.Fatalf("got %+v", g)
+	}
+	two := Seal{Files: []SealFile{{Path: "tests/acceptance/a.sh", SHA256: sha256Hex("a\n")}, {Path: "tests/acceptance/ignored.sh"}}}
 	if g := sealTracked(dir, head, two, paths); g.Passed || !strings.Contains(g.Output, "sealed but not tracked: tests/acceptance/ignored.sh") {
 		t.Fatalf("got %+v", g)
 	}
 	if g := sealTracked(dir, head, Seal{}, paths); g.Passed || !strings.Contains(g.Output, "tracked but not sealed") {
 		t.Fatalf("got %+v", g)
+	}
+}
+
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+// A triage that ended outside the model (runtime failure, lost container state, stop or
+// timeout) runs again; an answer the model gave, or an out-of-memory kill, does not.
+func TestTriageRetryClasses(t *testing.T) {
+	for class, want := range map[string]bool{ClassInfrastructure: true, ClassTerminated: true, ClassProcess: false, ClassResource: false} {
+		if got := triageRetry(LaunchResult{Class: class}); got != want {
+			t.Errorf("%s: %v", class, got)
+		}
 	}
 }
 
