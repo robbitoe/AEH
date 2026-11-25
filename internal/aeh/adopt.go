@@ -706,6 +706,9 @@ func (a *adoptSession) inspectAttempt(ctx context.Context, n int, base, profile 
 	if err != nil {
 		return frozenOutput{}, info, false, err
 	}
+	if err := cfg.hostAgents("adoption"); err != nil {
+		return frozenOutput{}, info, false, err
+	}
 	outPath, runErr := runAgentWithOutput(ctx, cfg.Profiles[profile], cfg.PassEnv, w.dir, outDir, prompt,
 		a.repo.RunDir(a.runName(), fmt.Sprintf("a%d", n)), "adopt")
 	if err := w.integrity(false); err != nil {

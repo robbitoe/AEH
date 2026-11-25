@@ -697,6 +697,9 @@ func (d *discoverySession) attempt(ctx context.Context, a *DiscoveryAttempt, rou
 	}
 	runDir := filepath.Join(d.repo.Root, filepath.FromSlash(a.RunDir))
 	d.logf("  discovery round %d, attempt %d with profile %q", round, a.N, a.Profile)
+	if err := d.cfg.hostAgents("discovery"); err != nil {
+		return nil, "", err
+	}
 	outPath, err := runAgent(ctx, d.cfg.Profiles[a.Profile], d.cfg.PassEnv, outDir, prompt, runDir, "discover")
 	if err != nil {
 		if ctx.Err() != nil {

@@ -1136,6 +1136,9 @@ func (p *planner) attempt(ctx context.Context, a *PlanAttempt, feedback string) 
 			return "", err
 		}
 		p.logf("  plan attempt %d with profile %q", a.N, a.Profile)
+		if err := p.cfg.hostAgents("plan"); err != nil {
+			return "", err
+		}
 		outPath, err := runAgent(ctx, p.cfg.Profiles[a.Profile], p.cfg.PassEnv, wt, prompt, runDir, "plan")
 		if err != nil {
 			if uncertainExit(err) {
@@ -1770,6 +1773,9 @@ func (p *planner) review(ctx context.Context, role, author, commit, mapped, wt, 
 	}
 	p.logf("    review %s with %q (%s) on %s", role, profile, v.Provider, short(commit))
 	start := time.Now()
+	if err := p.cfg.hostAgents("plan"); err != nil {
+		return v, g, err
+	}
 	outPath, err := runAgent(ctx, p.cfg.Profiles[profile], p.cfg.PassEnv, wt, prompt, runDir, "review-"+role)
 	g.Seconds = time.Since(start).Seconds()
 	checkoutErr := verifyCheckout(wt, commit)

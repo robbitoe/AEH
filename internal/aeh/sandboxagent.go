@@ -75,15 +75,7 @@ func agentArgv(p Profile, prompt string, out bool) ([]string, error) {
 func agentEnv(p Profile, passEnv []string) ([]string, error) {
 	var env []string
 	forwarded := map[string]bool{}
-	check := func(name string) error {
-		if !envNamePlain.MatchString(name) {
-			return fmt.Errorf("invalid variable name %q", name)
-		}
-		if reservedSandboxEnv[strings.ToUpper(name)] || isProxyVar(name) {
-			return fmt.Errorf("%s is set by aeh inside the sandbox", name)
-		}
-		return nil
-	}
+	check := checkAgentEnvName
 	for _, name := range passEnv {
 		if err := check(name); err != nil {
 			return nil, err

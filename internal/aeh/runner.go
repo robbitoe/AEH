@@ -36,6 +36,22 @@ type runner struct {
 	memory          MemorySnapshot
 	generated       *generatedRun
 	sb              *sandbox // nil when gate commands run on the host
+	// memoryMount is the memory commit sandboxed agents of this invocation see, fixed
+	// at its first agent launch.
+	memoryMount *[2]string
+}
+
+// agentMemory is the memory export of this run's sandboxed agents: the plan's pinned
+// memory commit for a planned run, otherwise memory's HEAD when the first agent starts.
+func (ru *runner) agentMemory() (dir, commit string, err error) {
+	if ru.memoryMount == nil {
+		dir, commit, err := stepMemory(ru.memory)
+		if err != nil {
+			return "", "", err
+		}
+		ru.memoryMount = &[2]string{dir, commit}
+	}
+	return ru.memoryMount[0], ru.memoryMount[1], nil
 }
 
 // generatedRun is an immutable snapshot of the plan provenance and its Git manifests.
@@ -566,6 +582,11 @@ func (ru *runner) runTask(ctx context.Context, t Task, ts *TaskState) (bool, str
 		}
 		if res.Uncertain {
 			ts.Status = StatusBlocked
+			if ru.sb.agents() {
+				// Every container of the attempt was removed; nothing is left running.
+				return false, fmt.Sprintf("Task %s stopped at %s without a result:\n%s\nFix the cause (for example start Docker), then answer to retry. See the attempt artifacts.",
+					t.ID, res.FailedGate, tail(strings.TrimSpace(res.Feedback), 1500)), nil
+			}
 			return false, fmt.Sprintf("Task %s stopped at %s. Confirm all processes stopped and review possible effects before answering to retry. See the attempt artifacts.", t.ID, res.FailedGate), nil
 		}
 		last = res
@@ -595,17 +616,23 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 	if current, _ := branchCommit(r.Root, IntegrationBranch(o.ID)); current != base {
 		return res, fmt.Errorf("integration branch %s changed", IntegrationBranch(o.ID))
 	}
+	// Under sandbox policy 2 nothing of an attempt is checked out on the host: the agent
+	// works on an export of the base and its result is captured from the container.
+	sandboxed := ru.sb.agents()
 	branch := AttemptBranch(o.ID, t.ID, n)
 	wt := r.WorktreePath(o.ID + "-" + name)
-	if err := addWorktree(r.Root, wt, branch, base); err != nil {
-		return res, err
-	}
-	defer func() {
-		if res.Worktree != wt {
-			removeWorktree(r.Root, wt)
-			deleteBranch(r.Root, branch)
+	if !sandboxed {
+		if err := addWorktree(r.Root, wt, branch, base); err != nil {
+			return res, err
 		}
-	}()
+		defer func() {
+			if res.Worktree != wt {
+				removeWorktree(r.Root, wt)
+				deleteBranch(r.Root, branch)
+			}
+		}()
+	}
+	message := fmt.Sprintf("aeh: %s %s %s (attempt %d, %s)", o.ID, t.ID, firstLine(t.Goal), n, profile)
 
 	prompt, err := renderPrompt("implement.md", ru.implementPrompt, promptData{
 		Outcome: o, Task: t, Protected: ru.protected, MaxLines: maxLines,
@@ -629,7 +656,7 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 	record := func() error {
 		return writePrivateJSON(filepath.Join(runDir, "gates.json"), gates)
 	}
-	var output string
+	var output, commit string
 	var resume *Attempt
 	if c := ru.state.Cursor; c != nil && c.Task == t.ID && c.Phase == "review" {
 		for _, a := range ru.state.task(t.ID).Attempts {
@@ -642,15 +669,30 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 			return res, fmt.Errorf("task %s: cursor candidate does not match recorded attempt", t.ID)
 		}
 	} else {
-		outPath, runErr := runAgent(ctx, ru.cfg.Profiles[profile], ru.cfg.PassEnv, wt, prompt, runDir, "agent")
+		var outPath, captured string
+		var runErr error
+		if sandboxed {
+			dir, mem, merr := ru.agentMemory()
+			if merr != nil {
+				return res, merr
+			}
+			step, serr := ru.sb.agentStep(ctx, r.Root, ru.cfg, agentStep{Kind: "implement", Profile: profile, Prompt: prompt,
+				RunDir: runDir, LogName: "agent", Work: base, Capture: message, MemoryDir: dir, MemoryCommit: mem})
+			if serr != nil {
+				return res, serr
+			}
+			outPath, captured, runErr = step.OutPath, step.Candidate, step.AgentErr
+		} else {
+			outPath, runErr = runAgent(ctx, ru.cfg.Profiles[profile], ru.cfg.PassEnv, wt, prompt, runDir, "agent")
+		}
 		if runErr != nil {
 			err := runErr
 			res.FailedGate, res.Feedback = "agent", err.Error()
 			res.Uncertain = uncertainExit(err)
-			if res.Uncertain {
+			if res.Uncertain && !sandboxed {
 				res.Worktree = wt
 			}
-			check(GateResult{Name: res.FailedGate, Output: res.Feedback, Uncertain: res.Uncertain})
+			check(GateResult{Name: res.FailedGate, Output: res.Feedback, Uncertain: res.Uncertain, Sandboxed: sandboxed})
 			return res, record()
 		}
 		out, err := os.ReadFile(outPath)
@@ -658,9 +700,14 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 			return res, fmt.Errorf("read implementer output: %w", err)
 		}
 		output = string(out)
+		if sandboxed {
+			if captured == "" {
+				return res, errors.New("the sandbox returned no candidate for a clean agent exit")
+			}
+			commit = captured
+		}
 	}
 
-	var commit string
 	if resume != nil {
 		commit = resume.Commit
 		for _, v := range resume.Reviews {
@@ -668,8 +715,8 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 				res.Reviews = append(res.Reviews, v)
 			}
 		}
-	} else {
-		commit, err = candidateCommit(wt, base, fmt.Sprintf("aeh: %s %s %s (attempt %d, %s)", o.ID, t.ID, firstLine(t.Goal), n, profile))
+	} else if !sandboxed {
+		commit, err = candidateCommit(wt, base, message)
 	}
 	if err != nil {
 		res.FailedGate, res.Feedback = "scope", err.Error()
@@ -712,8 +759,10 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 	// A clean question with no candidate changes needs no verification run. It
 	// approves nothing. When changes exist, failed gates take precedence below.
 	if len(changes) == 0 && question != "" {
-		if err := verifyCheckout(wt, base); err != nil {
-			return res, fmt.Errorf("question checkout: %w", err)
+		if !sandboxed {
+			if err := verifyCheckout(wt, base); err != nil {
+				return res, fmt.Errorf("question checkout: %w", err)
+			}
 		}
 		res.SpecQuestion = &SpecCursor{Phase: "implementation", Role: "implementer", Profile: profile, Provider: ru.cfg.Profiles[profile].Provider, Question: question}
 		return res, record()
@@ -731,7 +780,10 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 		}
 	}
 	verified := wt + "-verify"
-	if passed {
+	if sandboxed {
+		verified = "" // gates and reviewers read exports of the candidate
+	}
+	if passed && !sandboxed {
 		if err := addWorktreeDetached(r.Root, verified, commit); err != nil {
 			return res, err
 		}
@@ -864,10 +916,28 @@ func (ru *runner) review(ctx context.Context, t Task, role, author, commit, wt, 
 		return g, v, err
 	}
 	ru.logf("    review %s with %q (%s) on %s", role, profile, v.Provider, commit)
-	outPath, err := runAgent(ctx, ru.cfg.Profiles[profile], ru.cfg.PassEnv, wt, prompt, runDir, "review-"+role)
+	var outPath string
+	var checkoutErr error
+	if ru.sb.agents() {
+		// The reviewer reads a read-only export of the candidate: it cannot change what
+		// it reviews, so there is no checkout to verify afterwards.
+		g.Sandboxed = true
+		dir, mem, merr := ru.agentMemory()
+		if merr != nil {
+			return g, v, merr
+		}
+		step, serr := ru.sb.agentStep(ctx, ru.repo.Root, ru.cfg, agentStep{Kind: "review", Profile: profile, Prompt: prompt,
+			RunDir: runDir, LogName: "review-" + role, Work: commit, MemoryDir: dir, MemoryCommit: mem})
+		if serr != nil {
+			return g, v, serr
+		}
+		outPath, err = step.OutPath, step.AgentErr
+	} else {
+		outPath, err = runAgent(ctx, ru.cfg.Profiles[profile], ru.cfg.PassEnv, wt, prompt, runDir, "review-"+role)
+		// Check even a rejected or failed reviewer: all reviewers are read-only.
+		checkoutErr = verifyCheckout(wt, commit)
+	}
 	g.Seconds = time.Since(start).Seconds()
-	// Check even a rejected or failed reviewer: all reviewers are read-only.
-	checkoutErr := verifyCheckout(wt, commit)
 	if err != nil {
 		g.Output, g.Uncertain = err.Error(), uncertainExit(err)
 		if checkoutErr != nil {
@@ -1000,26 +1070,29 @@ func (ru *runner) completeTaskReviews(ctx context.Context, t Task, a *Attempt, m
 	if err != nil {
 		return false, "", err
 	}
-	wtRoot := filepath.Dir(r.WorktreePath(ru.outcome.ID + "-reviews"))
-	if err := os.MkdirAll(wtRoot, 0o700); err != nil {
-		return false, "", err
-	}
-	wt, err := os.MkdirTemp(wtRoot, ru.outcome.ID+"-"+t.ID+"-reviews-")
-	if err != nil {
-		return false, "", err
-	}
-	if err := addWorktreeDetached(r.Root, wt, a.Commit); err != nil {
-		_ = os.Remove(wt)
-		return false, "", err
-	}
-	keep := false
-	defer func() {
-		if !keep {
-			removeWorktree(r.Root, wt)
+	// Sandboxed reviewers read an export of the accepted commit; nothing is checked out.
+	sandboxed := ru.sb.agents()
+	wt, keep := "", false
+	if !sandboxed {
+		wtRoot := filepath.Dir(r.WorktreePath(ru.outcome.ID + "-reviews"))
+		if err := os.MkdirAll(wtRoot, 0o700); err != nil {
+			return false, "", err
 		}
-	}()
-	if err := verifyCheckout(wt, a.Commit); err != nil {
-		return false, "", err
+		if wt, err = os.MkdirTemp(wtRoot, ru.outcome.ID+"-"+t.ID+"-reviews-"); err != nil {
+			return false, "", err
+		}
+		if err := addWorktreeDetached(r.Root, wt, a.Commit); err != nil {
+			_ = os.Remove(wt)
+			return false, "", err
+		}
+		defer func() {
+			if !keep {
+				removeWorktree(r.Root, wt)
+			}
+		}()
+		if err := verifyCheckout(wt, a.Commit); err != nil {
+			return false, "", err
+		}
 	}
 	gates := readGateResults(r.Root, a.RunDir)
 	for i, role := range missing {
@@ -1033,7 +1106,7 @@ func (ru *runner) completeTaskReviews(ctx context.Context, t Task, a *Attempt, m
 		ru.logf("    added %s review for %s: %s", role, t.ID, gateStatus(g))
 		question := ""
 		if !g.Passed {
-			keep = g.Uncertain
+			keep = g.Uncertain && !sandboxed
 			if keep {
 				a.Worktree = wt
 			}
@@ -1101,31 +1174,38 @@ func (ru *runner) finalCheck(ctx context.Context) (_ bool, _ string, err error) 
 	if err != nil {
 		return false, "", err
 	}
-	wtRoot := filepath.Dir(r.WorktreePath(o.ID + "-final"))
-	if err := os.MkdirAll(wtRoot, 0o700); err != nil {
-		return false, "", err
-	}
-	wt, err := os.MkdirTemp(wtRoot, o.ID+"-final-")
-	if err != nil {
-		return false, "", err
-	}
-	if err := addWorktreeDetached(r.Root, wt, head); err != nil {
-		_ = os.Remove(wt)
-		return false, "", err
-	}
-	keep := false
-	defer func() {
-		if !keep {
-			removeWorktree(r.Root, wt)
+	// Under sandbox policy 2 the integrated branch holds agent-written content, so it is
+	// never checked out on the host: the gates run on an export and the sealed tests are
+	// compared as Git objects.
+	sandboxed := ru.sb.agents()
+	wt, keep := "", false
+	if !sandboxed {
+		wtRoot := filepath.Dir(r.WorktreePath(o.ID + "-final"))
+		if err := os.MkdirAll(wtRoot, 0o700); err != nil {
+			return false, "", err
 		}
-	}()
-	if err := verifyCheckout(wt, head); err != nil {
-		return false, "", err
+		if wt, err = os.MkdirTemp(wtRoot, o.ID+"-final-"); err != nil {
+			return false, "", err
+		}
+		if err := addWorktreeDetached(r.Root, wt, head); err != nil {
+			_ = os.Remove(wt)
+			return false, "", err
+		}
+		defer func() {
+			if !keep {
+				removeWorktree(r.Root, wt)
+			}
+		}()
+		if err := verifyCheckout(wt, head); err != nil {
+			return false, "", err
+		}
 	}
 	ru.logf("  final check on %s", IntegrationBranch(o.ID))
 	gates := []GateResult{}
 	if ru.seal != nil {
-		if ru.generated != nil {
+		if sandboxed {
+			gates = append(gates, ru.sealedGate(ru.state.Base, head))
+		} else if ru.generated != nil {
 			gates = append(gates, ru.sealedGate(ru.state.Base, head))
 			if gates[len(gates)-1].Passed {
 				gates = append(gates, gateSealedCheckout(r.Root, wt, head, ru.generated.Manifest.Retired, ru.generated.Paths))
@@ -1163,7 +1243,7 @@ func (ru *runner) finalCheck(ctx context.Context) (_ bool, _ string, err error) 
 	if gates[len(gates)-1].Passed && ru.generated != nil {
 		gates = append(gates, ru.acceptanceGate(ctx, v))
 	}
-	keep = gates[len(gates)-1].Uncertain
+	keep = gates[len(gates)-1].Uncertain && !sandboxed
 	evidence := map[string]string{"commit": head, "contract": ru.state.Contract}
 	if keep {
 		evidence["retained_worktree"] = wt
@@ -1337,24 +1417,41 @@ func (ru *runner) triage(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	wt := ru.repo.WorktreePath(o.ID + "-triage")
-	if err := addWorktreeDetached(ru.repo.Root, wt, base); err != nil {
-		return err
-	}
-	keep := false
-	defer func() {
-		if !keep {
-			removeWorktree(ru.repo.Root, wt)
-		}
-	}()
-	if err := verifyCheckout(wt, base); err != nil {
-		return err
-	}
 	runDir := ru.repo.RunDir(o.ID, "triage")
-	outPath, runErr := runAgent(ctx, ru.cfg.Profiles[ru.cfg.Triage.Profile], ru.cfg.PassEnv, wt, prompt, runDir, "triage")
+	var outPath string
+	var runErr, checkoutErr error
+	keep, sandboxed := false, ru.sb.agents()
+	wt := ru.repo.WorktreePath(o.ID + "-triage")
+	if sandboxed {
+		dir, mem, err := ru.agentMemory()
+		if err != nil {
+			return err
+		}
+		step, err := ru.sb.agentStep(ctx, ru.repo.Root, ru.cfg, agentStep{Kind: "triage", Profile: ru.cfg.Triage.Profile, Prompt: prompt,
+			RunDir: runDir, LogName: "triage", Work: base, MemoryDir: dir, MemoryCommit: mem})
+		if err != nil {
+			return err
+		}
+		outPath, runErr = step.OutPath, step.AgentErr
+	} else {
+		if err := addWorktreeDetached(ru.repo.Root, wt, base); err != nil {
+			return err
+		}
+		defer func() {
+			if !keep {
+				removeWorktree(ru.repo.Root, wt)
+			}
+		}()
+		if err := verifyCheckout(wt, base); err != nil {
+			return err
+		}
+		outPath, runErr = runAgent(ctx, ru.cfg.Profiles[ru.cfg.Triage.Profile], ru.cfg.PassEnv, wt, prompt, runDir, "triage")
+	}
 	out, readErr := os.ReadFile(outPath)
 	s.TriageOutput = string(out)
-	checkoutErr := verifyCheckout(wt, base)
+	if !sandboxed {
+		checkoutErr = verifyCheckout(wt, base)
+	}
 	parsed := parseRoute(string(out))
 	if runErr == nil && readErr == nil && checkoutErr == nil && parsed != "" {
 		s.InitialRoute, s.TriageSource = parsed, "model"
@@ -1362,7 +1459,7 @@ func (ru *runner) triage(ctx context.Context) error {
 		s.EffectiveRoute, s.Roles = parsed, nil
 		ru.observeTaskRules()
 	}
-	if uncertainExit(runErr) {
+	if uncertainExit(runErr) && !sandboxed {
 		keep = true
 		s.TriageWorktree = wt
 	}

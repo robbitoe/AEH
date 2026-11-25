@@ -374,6 +374,9 @@ func (d *discoverySession) reviewBook(ctx context.Context, p *pendingBook, files
 		return nil
 	}
 	defer func() { root.Close(); _ = os.RemoveAll(outDir) }()
+	if err := d.cfg.hostAgents("discovery"); err != nil {
+		return err
+	}
 	p.Running = true
 	if err := d.save(); err != nil {
 		return err
