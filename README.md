@@ -464,7 +464,7 @@ The stages of the [vision](docs/vision.md), in order:
 4. **Specs to code (implemented).** An approved feature produces one task and independently reviewed, runner-sealed acceptance tests with `aeh plan`.
 5. **Discovery and adoption (implemented).** From a vague idea to a validated spec book with HTML mockups; adoption of an existing system area by area, up to sealed characterization tests.
 6. **Live review (implemented).** Specs keep evolving while features are built: immutable versions, changed and removed criteria, clarifications, queued approvals and path moves.
-7. **Sandbox (gates implemented).** Build, test and acceptance commands in local containers with no network, with an integrity check after every command (`aeh sandbox check`, [docs/sandbox.md](docs/sandbox.md)). Every agent in a container with `sandbox.agent_image`, with kept CLI logins (`aeh sandbox login`) and a per-launch egress proxy that allows only declared hosts. Next: measurement.
+7. **Sandbox (implemented).** Build, test and acceptance commands in local containers with no network, with an integrity check after every command (`aeh sandbox check`, [docs/sandbox.md](docs/sandbox.md)). Every agent in a container with `sandbox.agent_image`, with kept CLI logins (`aeh sandbox login`) and a per-launch egress proxy that allows only declared hosts. Measured with real agents in 1.1.0.
 
 ## Development
 
