@@ -17,7 +17,7 @@ import (
 )
 
 // version is set at release time with -ldflags "-X main.version=<tag>".
-var version = "1.0.0"
+var version = "1.1.0"
 
 var usage = `aeh — Autonomous Engineering Harness ` + version + `
 
