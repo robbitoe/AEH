@@ -172,8 +172,18 @@ func TestQuotaOfADamagingReviewerIsItsDamage(t *testing.T) {
 	f := newFixture(t, map[string]string{"medio": agentGood, "rev": `echo tampered > src/fees.txt; ` + agentQuota}, []string{"medio"}, "rev")
 	f.quotaProfile("rev")
 	st, log := f.run()
-	if strings.Contains(st.Question, "provider quota") {
-		t.Fatalf("damage reported as quota: %q\n%s", st.Question, log)
+	if st.Status != StatusBlocked || st.Head != st.Base || strings.Contains(st.Question, "provider quota") {
+		t.Fatalf("damage reported as quota or accepted: %+v\n%s", st, log)
+	}
+	for _, a := range st.Tasks[0].Attempts {
+		if a.Passed || len(a.Reviews) == 0 || a.Reviews[0].Verdict != "INVALID" {
+			t.Fatalf("want an invalid review: %+v", a)
+		}
+		gates := readGateResults(f.dir, a.RunDir)
+		g := gates[len(gates)-1]
+		if g.Passed || g.Uncertain || g.Quota != "" || !strings.Contains(g.Output, "verification changed the checkout") {
+			t.Fatalf("want the integrity verdict: %+v", g)
+		}
 	}
 }
 
@@ -380,12 +390,13 @@ func TestQuotaOfADamagingPlanReviewerIsItsDamage(t *testing.T) {
 	addQuota(t, f.repo, "qa", "qa")
 	f.commitAll("quota")
 	st := f.plan()
-	if strings.Contains(st.Question, "provider quota") {
-		t.Fatalf("damage reported as quota: %q", st.Question)
+	if st.Status != StatusBlocked || st.Phase == PlanLogged || strings.Contains(st.Question, "provider quota") || len(st.Attempts) == 0 {
+		t.Fatalf("damage reported as quota or published: %+v", st)
 	}
 	for _, a := range st.Attempts {
-		if strings.Contains(a.Feedback, "provider quota") {
-			t.Fatalf("damage reported as quota: %+v", a)
+		if a.FailedStep != "review" || !strings.Contains(a.Feedback, "verification changed the checkout") || strings.Contains(a.Feedback, "provider quota") ||
+			len(a.Reviews) == 0 || a.Reviews[0].Verdict != "INVALID" {
+			t.Fatalf("want the integrity verdict: %+v", a)
 		}
 	}
 }
@@ -424,5 +435,24 @@ func TestQuotaIgnoresAKilledProcess(t *testing.T) {
 	st, log := f.run()
 	if strings.Contains(st.Question, "provider quota") {
 		t.Fatalf("a killed process read as quota: %q\n%s", st.Question, log)
+	}
+}
+
+// A plan's input digest, captured from commit 4e6a2a8 before quota_messages existed: a
+// plan reserved then keeps its digest while the rules stay unset, and setting them
+// changes it (the plan then restarts as for any configuration change).
+func TestQuotaMessagesKeepThePlanDigest(t *testing.T) {
+	planner := func(msgs []string) *planner {
+		return &planner{cfg: Config{Ladder: []string{"a"}, Profiles: map[string]Profile{"a": {Provider: "x", Command: []string{"x"}, QuotaExitCodes: []int{75}, QuotaMessages: msgs}}},
+			pcfg: PlanConfig{Ladder: []string{"a"}}, owners: "o", prompts: map[string]string{"p": "t"}}
+	}
+	const before = "ab8d81f3fa24fd986932d19a5bc89f3054c9c29bfaa8c82d0c49ab087721ff66"
+	for _, msgs := range [][]string{nil, {}} {
+		if d, err := planner(msgs).inputsDigestFor(&PlanState{Base: "b", SpecDigest: "s"}); err != nil || d != before {
+			t.Fatalf("unset rules changed the digest: %s %v", d, err)
+		}
+	}
+	if d, _ := planner([]string{"hit your 5-hour limit"}).inputsDigestFor(&PlanState{Base: "b", SpecDigest: "s"}); d == before {
+		t.Fatal("set rules did not reach the digest")
 	}
 }
