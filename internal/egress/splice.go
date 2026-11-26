@@ -25,11 +25,12 @@ func splice(a, b net.Conn, pending []byte, idle time.Duration, count func(int64)
 			return 0, 0
 		}
 		_ = b.SetWriteDeadline(time.Now().Add(idle))
-		if _, err := b.Write(pending); err != nil {
-			return 0, 0
+		n, err := b.Write(pending)
+		aToB = int64(n)
+		if err != nil {
+			return aToB, 0
 		}
 		_ = b.SetWriteDeadline(time.Time{})
-		aToB = int64(len(pending))
 	}
 	var last atomic.Int64
 	last.Store(time.Now().UnixNano())
@@ -66,11 +67,12 @@ func splice(a, b net.Conn, pending []byte, idle time.Duration, count func(int64)
 					closeBoth()
 					return
 				}
-				if _, werr := dst.Write(buf[:k]); werr != nil {
+				w, werr := dst.Write(buf[:k])
+				*n += int64(w)
+				if werr != nil {
 					closeBoth()
 					return
 				}
-				*n += int64(k)
 			}
 			if err == io.EOF {
 				closeWrite(dst)

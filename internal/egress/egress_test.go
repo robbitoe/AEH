@@ -429,3 +429,32 @@ func TestShutdownCancelsPendingResolution(t *testing.T) {
 		t.Fatalf("after %s, log:\n%s", time.Since(start), logs.String())
 	}
 }
+
+// Refusals cannot use up the log: every tunnel reserves its line, and once the launch's
+// tunnel lines are spent, tunnels are refused instead of opened without a record.
+func TestEveryTunnelIsLogged(t *testing.T) {
+	oldLog, oldTunnels := logLimit, tunnelLimit
+	logLimit, tunnelLimit = 3, 2
+	defer func() { logLimit, tunnelLimit = oldLog, oldTunnels }()
+	target := echoServer(t)
+	_, port, _ := net.SplitHostPort(target)
+	socket, logs := startProxy(t, DefaultPolicy([]string{"api.example.com:" + port}), target)
+	for i := 0; i < 10; i++ {
+		connect(t, socket, "NONSENSE\r\n\r\n")
+	}
+	req := "CONNECT api.example.com:" + port + " HTTP/1.1\r\n\r\n"
+	for i := 0; i < 2; i++ {
+		c, _, code := connect(t, socket, req)
+		if code != 200 {
+			t.Fatalf("tunnel %d: %d", i, code)
+		}
+		c.Close()
+	}
+	if _, _, code := connect(t, socket, req); code != 403 {
+		t.Fatalf("tunnel beyond the limit: %d", code)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := strings.Count(logs.String(), `"verdict":"allow"`); n != 2 {
+		t.Fatalf("%d tunnel lines, want 2:\n%s", n, logs.String())
+	}
+}

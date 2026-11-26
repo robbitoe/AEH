@@ -3,6 +3,7 @@ package aeh
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -116,24 +117,26 @@ func (s *sandbox) startEgress(ctx context.Context, id, kind string, pairs []stri
 func (s *sandbox) endEgress(cid string, w io.Writer) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	st, err := s.inspect(cid)
-	if err != nil {
-		return err
+	// Each step is tried even when an earlier one failed: the log is evidence.
+	var errs []error
+	st, ierr := s.inspect(cid)
+	if ierr != nil {
+		errs = append(errs, fmt.Errorf("inspect the proxy: %w", ierr))
 	}
-	running := st.State.Status == "running"
+	running := ierr == nil && st.State.Status == "running"
 	// A stop sends SIGTERM first: the proxy closes its tunnels and logs each one's bytes.
-	if _, err := s.d.admin("stop", "--time", "10", cid); err != nil && running {
-		return err
+	if _, err := s.d.admin("stop", "--time", "10", cid); err != nil && (running || ierr != nil) {
+		errs = append(errs, fmt.Errorf("stop the proxy: %w", err))
 	}
 	if w != nil {
 		if err := s.logs(ctx, cid, w, nil); err != nil {
-			return fmt.Errorf("read the proxy log: %w", err)
+			errs = append(errs, fmt.Errorf("read the proxy log: %w", err))
 		}
 	}
-	if !running {
-		return fmt.Errorf("the proxy stopped during the launch (state %s, exit %d%s)", st.State.Status, st.State.ExitCode, stateError(st))
+	if ierr == nil && !running {
+		errs = append(errs, fmt.Errorf("the proxy stopped during the launch (state %s, exit %d%s)", st.State.Status, st.State.ExitCode, stateError(st)))
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // agentNetworkName is what an agent launch's evidence records as its network.

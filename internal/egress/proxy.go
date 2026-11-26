@@ -17,8 +17,15 @@ import (
 const (
 	// requestLimit bounds a CONNECT request line and headers.
 	requestLimit = 16 << 10
-	// logLimit bounds the proxy's log lines; the last one says that logging stopped.
-	logLimit = 10000
+)
+
+// Limits of the proxy's log (variables so tests can lower them). Refusals are logged up
+// to logLimit lines; the last one says that logging of refusals stopped. A launch opens
+// at most tunnelLimit tunnels, each of which reserves its line before it is admitted, so
+// every tunnel is recorded; beyond the limit tunnels are refused.
+var (
+	logLimit    = 10000
+	tunnelLimit = 10000
 )
 
 // Proxy serves CONNECT requests on a listener (a Unix socket in the sandbox). It resolves
@@ -38,6 +45,7 @@ type Proxy struct {
 	bytes    atomic.Int64
 	logMu    sync.Mutex
 	logged   int
+	tunnels  int
 	mu       sync.Mutex
 	open     map[net.Conn]bool
 	listener net.Listener
@@ -58,6 +66,30 @@ type logEntry struct {
 	Down    int64  `json:"down,omitempty"`
 }
 
+// reserveTunnel takes one of the launch's tunnel log lines, or reports none is left.
+func (p *Proxy) reserveTunnel() bool {
+	p.logMu.Lock()
+	defer p.logMu.Unlock()
+	if p.tunnels >= tunnelLimit {
+		return false
+	}
+	p.tunnels++
+	return true
+}
+
+// logTunnel writes the line a tunnel reserved; it is never dropped.
+func (p *Proxy) logTunnel(e logEntry) {
+	if p.Log == nil {
+		return
+	}
+	p.logMu.Lock()
+	defer p.logMu.Unlock()
+	e.Time = time.Now().UTC().Format(time.RFC3339)
+	b, _ := json.Marshal(e)
+	_, _ = p.Log.Write(append(b, '\n'))
+}
+
+// log writes a refusal, within logLimit.
 func (p *Proxy) log(e logEntry) {
 	if p.Log == nil {
 		return
@@ -238,11 +270,21 @@ func (p *Proxy) handle(c net.Conn) {
 		deny(http.StatusForbidden, "byte limit reached")
 		return
 	}
+	if !p.reserveTunnel() {
+		deny(http.StatusForbidden, "tunnel limit reached")
+		return
+	}
+	// The tunnel's line is reserved: from here every path writes it once.
+	defer func() { p.logTunnel(entry) }()
+	refuse := func(code int, reason string) {
+		entry.Verdict, entry.Reason = "deny", reason
+		reply(c, code)
+	}
 	ctx, cancel := context.WithDeadline(p.ctx, deadline)
 	defer cancel()
 	addrs, err := p.resolve(ctx, host)
 	if err != nil {
-		deny(http.StatusBadGateway, "name not resolved")
+		refuse(http.StatusBadGateway, "name not resolved")
 		return
 	}
 	allowed := p.Allowed
@@ -266,16 +308,14 @@ func (p *Proxy) handle(c net.Conn) {
 	}
 	if up == nil {
 		if refused && !tried {
-			deny(http.StatusForbidden, "no public address")
+			refuse(http.StatusForbidden, "no public address")
 		} else {
-			deny(http.StatusBadGateway, "connection failed")
+			refuse(http.StatusBadGateway, "connection failed")
 		}
 		return
 	}
 	defer up.Close()
-	// From here on the connection was made: every path logs it once.
 	entry.Verdict = "allow"
-	defer func() { p.log(entry) }()
 	if !p.track(up) {
 		entry.Reason = "proxy shut down before the tunnel opened"
 		return
