@@ -66,7 +66,7 @@ Runs and plans pin the sandbox in their contract: the policy version, the Docker
 
 ## Agents in containers
 
-Set `sandbox.agent_image` to run every agent in a container too (sandbox policy version 2):
+Set `sandbox.agent_image` to run every agent in a container too (sandbox policy version 3):
 
 ```yaml
 sandbox:
@@ -79,6 +79,7 @@ profiles:
     stdin: true
     sandbox:
       pass_env: [ANTHROPIC_API_KEY]   # host variables this profile receives in its container
+      egress: [api.anthropic.com:443] # the only hosts its CLI may reach (see Network)
 ```
 
 Each agent launch gets only what its step needs:
@@ -99,13 +100,37 @@ Each agent launch gets only what its step needs:
 - **Adoption inspectors** get the same filtered view as on the host: possible secrets (`.env*`, `*.pem`, `*.key`, `id_*`, `*.pfx`, `credentials*`, `secrets*`), `adopt.exclude` and links are left out, and the prompt lists them. The view is read-only, so the inspected code cannot change.
 - **Prompts** start with a short note naming `/work`, and `/memory` with its memory commit: the plan's pinned commit for a planned run, otherwise memory's commit when the first agent of the command starts. `{{prompt_file}}` becomes `/run/aeh/prompt.md`, and a profile with `stdin: true` reads that file.
 - **Environment.** The container gets `HOME` (private to the launch, empty or holding the profile's session files), the profile's `env` map and the host values of the names in its `sandbox.pass_env`. The project's `pass_env` is never forwarded, and `env` may refer only to names the profile forwards. Host paths such as `CODEX_HOME` or `CLAUDE_CONFIG_DIR` are not forwarded.
-- **Network.** Agents use Docker's default network so their CLIs can reach their providers; the network is not filtered yet. Gates keep no network.
+- **Network.** An agent container has no network. A profile's `sandbox.egress` pairs are reachable only through a proxy started for that launch (see [Network](#network)). Gates keep no network.
 - **Sign-in.** A CLI authenticates through variables in `sandbox.pass_env` (for example an API key) or through a session kept by aeh (below).
 - **Sealed tests you approved by hand** (`aeh tests approve`) must be committed exactly as approved: every sealed file tracked, no untracked file under the acceptance paths, and the same bytes in the commit (line endings converted by `core.autocrlf` are accepted). Containers run the committed bytes, so a test Git ignores or a filter rewrites would otherwise not be the one that runs.
 - **Codex profiles** need `--skip-git-repo-check`, because `/work` is not a Git repository.
 - **Failures.** If Docker or the image fails during a launch, the step blocks with the reason without consuming a ladder attempt. A triage that cannot finish for such a reason is not replaced by the default route: the command stops and triages again next time.
 
-`aeh sandbox check` also runs a throwaway container from the agent image and warns about every profile whose program the image lacks. Each launch writes `<log>.launch.json` beside its output, with the class, exit code, image, network, the commit at `/work`, the memory commit and the captured candidate. The contracts of runs and plans pin policy 2, the agent image and every profile's `sandbox.pass_env` and `sandbox.session`. Discovery sessions and adoption areas do not pin them: their outputs are documents you review, and each command uses the current configuration.
+`aeh sandbox check` also runs a throwaway container from the agent image and warns about every profile whose program the image lacks, about `aeh-egress` when a profile declares egress, and about every profile without `sandbox.egress`. Each launch writes `<log>.launch.json` beside its output, with the class, exit code, image, network, the commit at `/work`, the memory commit and the captured candidate. The contracts of runs and plans pin policy 3, the agent image and every profile's `sandbox.pass_env`, `sandbox.session` and `sandbox.egress`; a run or plan started under policy 2 (agents on Docker's default network) does not resume and needs a new outcome or plan. Discovery sessions and adoption areas do not pin them: their outputs are documents you review, and each command uses the current configuration.
+
+### Network
+
+An agent container never has a network of its own: Docker's `none` mode leaves only loopback, so there is no gateway, host service or DNS to reach. Each profile lists the `host:port` pairs its CLI needs:
+
+```yaml
+profiles:
+  medio:
+    provider: openai
+    command: [codex, exec, --skip-git-repo-check, "{{prompt}}"]
+    sandbox:
+      egress: [api.openai.com:443, chatgpt.com:443, auth.openai.com:443]
+```
+
+For each launch of a profile with egress, aeh starts a second container from the agent image, the only one with a network, running `aeh-egress proxy`. The two containers share nothing but a volume holding the proxy's Unix socket. The agent's entrypoint is `aeh-egress launch`: it relays `127.0.0.1:3128` to that socket, waits until the proxy answers, then runs the CLI. `HTTP_PROXY` and `HTTPS_PROXY` (and their lowercase forms) name `http://127.0.0.1:3128`; `NO_PROXY` holds only loopback names.
+
+- **Only `CONNECT` to a declared pair.** Hosts are exact, lowercase names or IP addresses, with a port; there are no wildcards. Plain HTTP requests through the proxy are refused, so CLIs reach their providers over TLS end to end.
+- **The proxy resolves names itself** and connects only to a public address it validated: loopback, private, link-local (cloud metadata), shared, reserved, multicast and NAT64 or 6to4 addresses are refused, even for a declared name.
+- **Limits per launch:** 64 tunnels at once, 4 GiB in both directions, 15 minutes without traffic closes a tunnel, 15 seconds to read the request, resolve and connect.
+- **Log.** `<log>.egress.log` beside the agent's output has one line per request with host, port, bytes and verdict, never paths, headers or content.
+- **Failures.** A proxy that stops during the launch, or a launcher that cannot reach it or start the CLI (exit code 251), blocks the step as an infrastructure failure, without consuming a ladder attempt.
+- **A profile without `sandbox.egress`** has no network at all; `aeh sandbox check` warns about it. Local HTTP providers on the host (LM Studio) are not supported inside the sandbox.
+
+`aeh-egress` is built into the agent image from this repository (see `docs/sandbox/Dockerfile.agents`). The exact pairs a CLI needs depend on its version and sign-in method; the proxy log shows what it tried to reach.
 
 ### Sessions
 
@@ -131,7 +156,7 @@ aeh sandbox login medio
 - **A profile with `sandbox.session` and nothing saved** cannot launch: the step blocks with the command to run, without consuming a ladder attempt.
 - The contracts of runs and plans also pin every profile's `sandbox.session` list.
 
-The login runs with an empty `HOME` and no view of the project. Choose a login flow that works in a terminal without a local browser, such as a device code; the exact files and flags depend on each CLI and its version. `docs/sandbox/Dockerfile.agents` is an example agent image.
+The login runs with an empty `HOME`, the profile's egress and no view of the project, so a login flow may need extra pairs (for example the provider's authentication host). Choose a login flow that works in a terminal without a local browser, such as a device code; the exact files and flags depend on each CLI and its version. `docs/sandbox/Dockerfile.agents` is an example agent image.
 
 ## A .NET example
 

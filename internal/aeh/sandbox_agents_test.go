@@ -43,7 +43,7 @@ func TestAgentSandboxConfig(t *testing.T) {
 }
 
 // Policy 1 contracts keep their exact bytes, so flows created under S1 still resume; an
-// agent image moves the contract to policy 2 and pins the agent fields.
+// agent image moves the contract to policy 3 and pins the agent fields, egress included.
 func TestSandboxContractPolicies(t *testing.T) {
 	sb := &sandbox{cfg: SandboxConfig{Memory: "4g", CPUs: "2"}, engine: sandboxEngine{ID: "e"}, image: sandboxImage{ID: "sha256:i"}}
 	got, err := sandboxSnapshot(sb)
@@ -54,6 +54,7 @@ func TestSandboxContractPolicies(t *testing.T) {
 		t.Fatalf("policy 1 snapshot\n got %s\nwant %s", got, want)
 	}
 	sb.agent, sb.agentEnv = sandboxImage{ID: "sha256:a"}, map[string][]string{"b": {"OPENAI_API_KEY"}}
+	sb.agentEgress = map[string][]string{"b": {"api.openai.com:443"}}
 	got, err = sandboxSnapshot(sb)
 	if err != nil {
 		t.Fatal(err)
@@ -63,12 +64,24 @@ func TestSandboxContractPolicies(t *testing.T) {
 		AgentImage   string
 		AgentNetwork string
 		AgentEnv     map[string][]string
+		AgentEgress  map[string][]string
 	}
-	if err := json.Unmarshal([]byte(got), &c); err != nil || c.Policy != 2 || c.AgentImage != "sha256:a" || c.AgentNetwork != "bridge" || c.AgentEnv["b"][0] != "OPENAI_API_KEY" {
-		t.Fatalf("policy 2 snapshot %s (%v)", got, err)
+	if err := json.Unmarshal([]byte(got), &c); err != nil || c.Policy != 3 || c.AgentImage != "sha256:a" || c.AgentNetwork != "none" ||
+		c.AgentEnv["b"][0] != "OPENAI_API_KEY" || c.AgentEgress["b"][0] != "api.openai.com:443" {
+		t.Fatalf("policy 3 snapshot %s (%v)", got, err)
 	}
 	if checkPlanSandbox("p", `{"Policy":1,"Engine":"e","Image":"sha256:i","Memory":"4g","CPUs":"2","GateEnv":null}`, sb) == nil {
-		t.Fatal("a policy 1 plan was accepted under policy 2")
+		t.Fatal("a policy 1 plan was accepted under policy 3")
+	}
+	// A plan made under S2 (agents on Docker's default network) does not resume under S3.
+	if checkPlanSandbox("p", `{"Policy":2,"Engine":"e","Image":"sha256:i","Memory":"4g","CPUs":"2","GateEnv":null,"AgentImage":"sha256:a","AgentNetwork":"bridge","AgentEnv":{"b":["OPENAI_API_KEY"]}}`, sb) == nil {
+		t.Fatal("a policy 2 plan was accepted under policy 3")
+	}
+	// Changing a profile's egress changes the contract.
+	before := got
+	sb.agentEgress["b"] = []string{"api.openai.com:443", "chatgpt.com:443"}
+	if after, _ := sandboxSnapshot(sb); after == before {
+		t.Fatal("the egress pairs are not pinned")
 	}
 }
 
@@ -144,7 +157,7 @@ func TestDockerSandboxedAgentsRunWithoutHostCheckouts(t *testing.T) {
 			t.Fatalf("%s: %v", name, err)
 		}
 		var rec launchRecord
-		if err := json.Unmarshal(b, &rec); err != nil || rec.Class != ClassProcess || rec.Network != "bridge" || rec.Image == "" {
+		if err := json.Unmarshal(b, &rec); err != nil || rec.Class != ClassProcess || rec.Network != "none" || rec.Image == "" {
 			t.Fatalf("%s: %s", name, b)
 		}
 		if (name == "agent.launch.json") != rec.WorkWritable {

@@ -397,7 +397,7 @@ func SandboxLogin(ctx context.Context, r Repo, name string, in *os.File, out, er
 	}
 	var rep sessionReport
 	res, err := sb.run(ctx, sandboxLaunch{Kind: "login", Argv: argv, Env: env, Workdir: sandboxHome, Pids: true,
-		Timeout: sessionLoginTime, Agent: true, Interactive: &interactiveIO{In: in, Out: out, Err: errw, TTY: tty},
+		Timeout: sessionLoginTime, Agent: true, Interactive: &interactiveIO{In: in, Out: out, Err: errw, TTY: tty}, Egress: p.sandboxEgress(),
 		Volumes: []sandboxVolume{{Target: sandboxHome, Private: true, Fill: treeFiles(nil, nil)}},
 		SaveSession: func(cid string, res LaunchResult) {
 			if res.ExitCode == 0 {

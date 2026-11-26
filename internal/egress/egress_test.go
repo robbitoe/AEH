@@ -1,0 +1,325 @@
+package egress
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestCheckPair(t *testing.T) {
+	for _, ok := range []string{"api.openai.com:443", "chatgpt.com:443", "a-b.example.org:8443", "8.8.8.8:53", "[2606:4700::1111]:443"} {
+		if err := CheckPair(ok); err != nil {
+			t.Errorf("%s: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"api.openai.com", "API.openai.com:443", "*.openai.com:443", "x.com:0", "x.com:65536", "x.com:0443",
+		"-x.com:443", "x..com:443", "x.com.:443", "1.2.3:443", "2606:4700::1111:443", "x_y.com:443", ":443", "x.com:"} {
+		if err := CheckPair(bad); err == nil {
+			t.Errorf("%s was accepted", bad)
+		}
+	}
+	if err := CheckPairs([]string{"a.com:443", "a.com:443"}); err == nil {
+		t.Error("duplicate accepted")
+	}
+	many := make([]string, MaxPairs+1)
+	for i := range many {
+		many[i] = fmt.Sprintf("h%d.com:443", i)
+	}
+	if err := CheckPairs(many); err == nil {
+		t.Error("too many pairs accepted")
+	}
+}
+
+func TestParsePolicy(t *testing.T) {
+	if _, err := ParsePolicy([]byte(`{"allow":["a.com:443"],"max_connections":1,"max_bytes":1,"idle_seconds":1,"connect_seconds":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{`{"allow":["a.com:443"],"max_connections":1,"max_bytes":1,"idle_seconds":1,"connect_seconds":1,"x":1}`,
+		`{"allow":["a.com"],"max_connections":1,"max_bytes":1,"idle_seconds":1,"connect_seconds":1}`,
+		`{"allow":[],"max_connections":0,"max_bytes":1,"idle_seconds":1,"connect_seconds":1}`} {
+		if _, err := ParsePolicy([]byte(bad)); err == nil {
+			t.Errorf("accepted %s", bad)
+		}
+	}
+}
+
+func TestPublic(t *testing.T) {
+	for _, s := range []string{"8.8.8.8", "1.1.1.1", "2606:4700::1111", "::ffff:8.8.8.8"} {
+		if !Public(netip.MustParseAddr(s)) {
+			t.Errorf("%s should be public", s)
+		}
+	}
+	for _, s := range []string{"127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0",
+		"255.255.255.255", "224.0.0.1", "198.18.0.1", "192.0.2.1", "::1", "::", "fe80::1", "fc00::1", "fd00:ec2::254",
+		"::ffff:127.0.0.1", "::ffff:169.254.169.254", "64:ff9b::a9fe:a9fe", "2002:a9fe:a9fe::1", "2001::1", "ff02::1", "2001:db8::1"} {
+		if Public(netip.MustParseAddr(s)) {
+			t.Errorf("%s should not be public", s)
+		}
+	}
+}
+
+// startProxy serves a proxy on a Unix socket. Names resolve to the local echo server and
+// local addresses count as allowed, so the tunnel can be tested without a network.
+func startProxy(t *testing.T, pol Policy, target string) (socket string, logs *syncBuffer) {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "egr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	socket = filepath.Join(dir, "p.sock")
+	l, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Skipf("no Unix sockets here: %v", err)
+	}
+	t.Cleanup(func() { l.Close() })
+	tap := netip.MustParseAddrPort(target)
+	logs = &syncBuffer{}
+	p := &Proxy{Policy: pol, Log: logs,
+		Resolve: func(_ context.Context, host string) ([]netip.Addr, error) {
+			if host == "private.example.com" {
+				return []netip.Addr{netip.MustParseAddr("10.0.0.1")}, nil
+			}
+			return []netip.Addr{tap.Addr()}, nil
+		},
+		Allowed: func(a netip.Addr) bool { return a == tap.Addr() }}
+	go p.Serve(l)
+	return socket, logs
+}
+
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// echoServer answers each line with the same line upper-cased.
+func echoServer(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				s := bufio.NewScanner(c)
+				for s.Scan() {
+					fmt.Fprintln(c, strings.ToUpper(s.Text()))
+				}
+			}()
+		}
+	}()
+	return l.Addr().String()
+}
+
+func connect(t *testing.T, socket, request string) (net.Conn, *bufio.Reader, int) {
+	t.Helper()
+	c, err := net.Dial("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.WriteString(c, request); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReader(c)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c, br, resp.StatusCode
+}
+
+func TestProxyTunnelsOnlyDeclaredPairs(t *testing.T) {
+	target := echoServer(t)
+	_, port, _ := net.SplitHostPort(target)
+	pol := DefaultPolicy([]string{"api.example.com:" + port, "private.example.com:" + port})
+	socket, logs := startProxy(t, pol, target)
+
+	// A declared pair: the tunnel works, including bytes sent right after the request.
+	c, br, code := connect(t, socket, "CONNECT api.example.com:"+port+" HTTP/1.1\r\nHost: api.example.com:"+port+"\r\n\r\nhello\n")
+	if code != 200 {
+		t.Fatalf("declared pair: %d", code)
+	}
+	if line, err := br.ReadString('\n'); err != nil || line != "HELLO\n" {
+		t.Fatalf("tunnel: %q %v", line, err)
+	}
+	fmt.Fprintln(c, "again")
+	if line, _ := br.ReadString('\n'); line != "AGAIN\n" {
+		t.Fatalf("tunnel: %q", line)
+	}
+	c.Close()
+
+	for name, tc := range map[string]struct {
+		req  string
+		code int
+	}{
+		"unlisted host":    {"CONNECT other.example.com:" + port + " HTTP/1.1\r\n\r\n", 403},
+		"unlisted port":    {"CONNECT api.example.com:1 HTTP/1.1\r\n\r\n", 403},
+		"address literal":  {"CONNECT " + target + " HTTP/1.1\r\n\r\n", 403},
+		"private address":  {"CONNECT private.example.com:" + port + " HTTP/1.1\r\n\r\n", 403},
+		"plain HTTP":       {"GET http://api.example.com:" + port + "/ HTTP/1.1\r\nHost: api.example.com\r\n\r\n", 405},
+		"malformed":        {"NONSENSE\r\n\r\n", 400},
+		"oversized header": {"CONNECT api.example.com:" + port + " HTTP/1.1\r\nX: " + strings.Repeat("a", requestLimit) + "\r\n\r\n", 400},
+	} {
+		if _, _, code := connect(t, socket, tc.req); code != tc.code {
+			t.Errorf("%s: %d, want %d", name, code, tc.code)
+		}
+	}
+	// Upper case and a trailing dot name the same declared host.
+	if _, _, code := connect(t, socket, "CONNECT API.Example.com.:"+port+" HTTP/1.1\r\n\r\n"); code != 200 {
+		t.Errorf("normalized host: %d", code)
+	}
+	time.Sleep(200 * time.Millisecond)
+	log := logs.String()
+	if !strings.Contains(log, `"verdict":"allow"`) || !strings.Contains(log, `"reason":"not in the egress list"`) || strings.Contains(log, "hello") {
+		t.Fatalf("log:\n%s", log)
+	}
+}
+
+func TestProxyLimits(t *testing.T) {
+	target := echoServer(t)
+	_, port, _ := net.SplitHostPort(target)
+	req := "CONNECT api.example.com:" + port + " HTTP/1.1\r\n\r\n"
+
+	pol := DefaultPolicy([]string{"api.example.com:" + port})
+	pol.MaxConnections = 1
+	socket, _ := startProxy(t, pol, target)
+	first, _, code := connect(t, socket, req)
+	if code != 200 {
+		t.Fatal(code)
+	}
+	if _, _, code := connect(t, socket, req); code != 503 {
+		t.Errorf("second connection: %d", code)
+	}
+	first.Close()
+
+	pol = DefaultPolicy([]string{"api.example.com:" + port})
+	pol.MaxBytes = 10
+	socket, _ = startProxy(t, pol, target)
+	c, br, code := connect(t, socket, req)
+	if code != 200 {
+		t.Fatal(code)
+	}
+	fmt.Fprintln(c, strings.Repeat("x", 20))
+	if _, err := br.ReadString('\n'); err == nil {
+		t.Error("the byte limit did not close the tunnel")
+	}
+	if _, _, code := connect(t, socket, req); code != 403 {
+		t.Errorf("after the byte limit: %d", code)
+	}
+
+	pol = DefaultPolicy([]string{"api.example.com:" + port})
+	pol.IdleSeconds = 1
+	socket, _ = startProxy(t, pol, target)
+	_, br, code = connect(t, socket, req)
+	if code != 200 {
+		t.Fatal(code)
+	}
+	start := time.Now()
+	if _, err := br.ReadString('\n'); err == nil || time.Since(start) > 5*time.Second {
+		t.Errorf("idle tunnel: %v after %s", err, time.Since(start))
+	}
+}
+
+// The forwarder relays a TCP port to the proxy socket.
+func TestForward(t *testing.T) {
+	target := echoServer(t)
+	_, port, _ := net.SplitHostPort(target)
+	socket, _ := startProxy(t, DefaultPolicy([]string{"api.example.com:" + port}), target)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go Forward(l, socket)
+	c, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	fmt.Fprintf(c, "CONNECT api.example.com:%s HTTP/1.1\r\n\r\nvia forward\n", port)
+	br := bufio.NewReader(c)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("%v %v", resp, err)
+	}
+	if line, _ := br.ReadString('\n'); line != "VIA FORWARD\n" {
+		t.Fatalf("%q", line)
+	}
+}
+
+// helperExit lets the test binary act as the launched program.
+func TestMain(m *testing.M) {
+	if code := os.Getenv("EGRESS_HELPER_EXIT"); code != "" {
+		var n int
+		fmt.Sscanf(code, "%d", &n)
+		if addr := os.Getenv("EGRESS_HELPER_DIAL"); addr != "" {
+			c, err := net.Dial("tcp", addr)
+			if err != nil {
+				os.Exit(99)
+			}
+			c.Close()
+		}
+		os.Exit(n)
+	}
+	os.Exit(m.Run())
+}
+
+func TestLaunch(t *testing.T) {
+	target := echoServer(t)
+	_, port, _ := net.SplitHostPort(target)
+	socket, _ := startProxy(t, DefaultPolicy([]string{"api.example.com:" + port}), target)
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	listen := l.Addr().String()
+	l.Close()
+	var errb bytes.Buffer
+	t.Setenv("EGRESS_HELPER_EXIT", "7")
+	t.Setenv("EGRESS_HELPER_DIAL", listen)
+	if code := Launch(socket, listen, 5*time.Second, []string{os.Args[0]}, &errb); code != 7 {
+		t.Fatalf("exit %d, want the program's 7: %s", code, errb.String())
+	}
+	// No proxy: the launcher gives up before the program starts.
+	errb.Reset()
+	start := time.Now()
+	if code := Launch(filepath.Join(t.TempDir(), "none.sock"), listen, 500*time.Millisecond, []string{os.Args[0]}, &errb); code != LauncherFailed ||
+		!strings.Contains(errb.String(), "did not answer") || time.Since(start) > 5*time.Second {
+		t.Fatalf("missing proxy: exit %d %q", code, errb.String())
+	}
+	// A program that cannot start is the launcher's failure.
+	errb.Reset()
+	if code := Launch(socket, listen, 5*time.Second, []string{filepath.Join(t.TempDir(), "missing")}, &errb); code != LauncherFailed {
+		t.Fatalf("missing program: exit %d", code)
+	}
+}

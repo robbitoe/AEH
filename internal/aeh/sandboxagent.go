@@ -184,6 +184,17 @@ func (s *sandbox) runAgent(ctx context.Context, a agentLaunch) (outPath string, 
 			}
 		}
 	}
+	// A profile with egress reaches its pairs through the launch's proxy, whose log is
+	// kept beside the output; without egress the agent has no network.
+	var egressLog io.Writer
+	if len(a.Profile.sandboxEgress()) > 0 {
+		lf, err := os.OpenFile(filepath.Join(a.RunDir, a.LogName+".egress.log"), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
+			return "", LaunchResult{}, err
+		}
+		defer lf.Close()
+		egressLog = &cappedFile{f: lf, left: egressLogLimit}
+	}
 	timeout := time.Duration(a.Profile.TimeoutMinutes) * time.Minute
 	if timeout <= 0 {
 		timeout = 30 * time.Minute
@@ -211,7 +222,8 @@ func (s *sandbox) runAgent(ctx context.Context, a agentLaunch) (outPath string, 
 	}
 	res, err = s.run(ctx, sandboxLaunch{Kind: a.Kind, Argv: argv, Volumes: vols, Env: env, Workdir: workdir,
 		Pids: true, Timeout: timeout, Output: &cappedFile{f: out, left: agentOutputLimit},
-		Stderr: &cappedFile{f: errf, left: agentOutputLimit}, Agent: true, SaveSession: saveSession}, after)
+		Stderr: &cappedFile{f: errf, left: agentOutputLimit}, Agent: true, SaveSession: saveSession,
+		Egress: a.Profile.sandboxEgress(), EgressLog: egressLog}, after)
 	if err != nil {
 		return outPath, res, err
 	}
