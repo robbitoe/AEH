@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -202,8 +203,9 @@ func (p *Proxy) untrack(c net.Conn) {
 }
 
 // Shutdown stops accepting, closes every open connection and waits up to wait for the
-// handlers to write their final log lines, with the bytes each tunnel carried.
-func (p *Proxy) Shutdown(wait time.Duration) {
+// handlers to write their final log lines, with the bytes each tunnel carried. It fails
+// when a handler did not finish in time: its line may be missing.
+func (p *Proxy) Shutdown(wait time.Duration) error {
 	p.mu.Lock()
 	p.closing = true
 	if p.cancel != nil {
@@ -223,7 +225,9 @@ func (p *Proxy) Shutdown(wait time.Duration) {
 	}()
 	select {
 	case <-done:
+		return nil
 	case <-time.After(wait):
+		return errors.New("shutdown: some connections did not finish; their log lines may be missing")
 	}
 }
 

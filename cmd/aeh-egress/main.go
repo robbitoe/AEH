@@ -99,8 +99,8 @@ func proxy(socket, policyFile string) error {
 	go func() { served <- px.Serve(l) }()
 	select {
 	case <-sigs:
-		px.Shutdown(5 * time.Second)
-		return nil
+		// A nonzero exit tells aeh the log may be incomplete.
+		return px.Shutdown(5 * time.Second)
 	case err := <-served:
 		return err
 	}

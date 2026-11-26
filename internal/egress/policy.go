@@ -95,6 +95,9 @@ func CheckPair(pair string) error {
 	if err := checkName(host); err != nil {
 		return fmt.Errorf("egress: %q: %w", pair, err)
 	}
+	if net.JoinHostPort(host, port) != pair {
+		return fmt.Errorf("egress: %q: write a host name without brackets, %s", pair, net.JoinHostPort(host, port))
+	}
 	return nil
 }
 

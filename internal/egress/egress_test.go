@@ -24,7 +24,7 @@ func TestCheckPair(t *testing.T) {
 		}
 	}
 	for _, bad := range []string{"api.openai.com", "API.openai.com:443", "*.openai.com:443", "x.com:0", "x.com:65536", "x.com:0443",
-		"-x.com:443", "x..com:443", "x.com.:443", "1.2.3:443", "2606:4700::1111:443", "x_y.com:443", ":443", "x.com:"} {
+		"-x.com:443", "x..com:443", "x.com.:443", "1.2.3:443", "2606:4700::1111:443", "x_y.com:443", ":443", "x.com:", "[example.com]:443"} {
 		if err := CheckPair(bad); err == nil {
 			t.Errorf("%s was accepted", bad)
 		}
@@ -391,7 +391,9 @@ func TestShutdownLogsOpenTunnels(t *testing.T) {
 	if line, _ := br.ReadString('\n'); line != "PING\n" {
 		t.Fatalf("%q", line)
 	}
-	p.Shutdown(5 * time.Second)
+	if err := p.Shutdown(5 * time.Second); err != nil {
+		t.Fatal(err)
+	}
 	_ = c
 	if log := logs.String(); !strings.Contains(log, `"verdict":"allow"`) || !strings.Contains(log, `"up":5`) {
 		t.Fatalf("log after shutdown:\n%s", log)
@@ -424,7 +426,9 @@ func TestShutdownCancelsPendingResolution(t *testing.T) {
 	io.WriteString(c, "CONNECT slow.example.com:443 HTTP/1.1\r\n\r\n")
 	<-started
 	start := time.Now()
-	p.Shutdown(5 * time.Second)
+	if err := p.Shutdown(5 * time.Second); err != nil {
+		t.Fatal(err)
+	}
 	if time.Since(start) > 3*time.Second || !strings.Contains(logs.String(), "name not resolved") {
 		t.Fatalf("after %s, log:\n%s", time.Since(start), logs.String())
 	}
@@ -456,5 +460,42 @@ func TestEveryTunnelIsLogged(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if n := strings.Count(logs.String(), `"verdict":"allow"`); n != 2 {
 		t.Fatalf("%d tunnel lines, want 2:\n%s", n, logs.String())
+	}
+}
+
+// blockingLog stalls every write of a tunnel's line.
+type blockingLog struct{ release chan struct{} }
+
+func (b blockingLog) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), `"verdict":"allow"`) {
+		<-b.release
+	}
+	return len(p), nil
+}
+
+// A handler that cannot write its line in time makes Shutdown fail, so the proxy exits
+// nonzero and aeh reports its log as possibly incomplete.
+func TestShutdownFailsWhenALineIsStuck(t *testing.T) {
+	target := echoServer(t)
+	_, port, _ := net.SplitHostPort(target)
+	tap := netip.MustParseAddrPort(target)
+	dir, _ := os.MkdirTemp("", "egr")
+	defer os.RemoveAll(dir)
+	socket := filepath.Join(dir, "p.sock")
+	l, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Skipf("no Unix sockets here: %v", err)
+	}
+	stuck := blockingLog{release: make(chan struct{})}
+	defer close(stuck.release)
+	p := &Proxy{Policy: DefaultPolicy([]string{"api.example.com:" + port}), Log: stuck,
+		Resolve: func(context.Context, string) ([]netip.Addr, error) { return []netip.Addr{tap.Addr()}, nil },
+		Allowed: func(a netip.Addr) bool { return a == tap.Addr() }}
+	go p.Serve(l)
+	if _, _, code := connect(t, socket, "CONNECT api.example.com:"+port+" HTTP/1.1\r\n\r\n"); code != 200 {
+		t.Fatal(code)
+	}
+	if err := p.Shutdown(500 * time.Millisecond); err == nil {
+		t.Fatal("a stuck log line was not reported")
 	}
 }
