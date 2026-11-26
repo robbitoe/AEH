@@ -156,7 +156,7 @@ ls /egress`
 			t.Errorf("open tunnel not logged:\n%s", l)
 		}
 	}
-	log, err :=os.ReadFile(filepath.Join(dir, "a.egress.log"))
+	log, err := os.ReadFile(filepath.Join(dir, "a.egress.log"))
 	if err != nil || !strings.Contains(string(log), `"host":"other.example.com"`) || !strings.Contains(string(log), "not in the egress list") ||
 		!strings.Contains(string(log), "no public address") {
 		t.Fatalf("proxy log %v:\n%s", err, log)
