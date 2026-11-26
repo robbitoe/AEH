@@ -499,3 +499,29 @@ func TestShutdownFailsWhenALineIsStuck(t *testing.T) {
 		t.Fatal("a stuck log line was not reported")
 	}
 }
+
+// A connection that closes before sending anything (the launcher's readiness probe) is
+// not logged; one that sends a partial request still is.
+func TestEmptyConnectionIsNotLogged(t *testing.T) {
+	target := echoServer(t)
+	_, port, _ := net.SplitHostPort(target)
+	socket, logs := startProxy(t, DefaultPolicy([]string{"api.example.com:" + port}), target)
+	c, err := net.Dial("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+	c, err = net.Dial("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = c.Write([]byte("CONN"))
+	c.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(logs.String(), "malformed request") && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := strings.Count(logs.String(), "\n"); n != 1 || !strings.Contains(logs.String(), "malformed request") {
+		t.Fatalf("want only the partial request logged:\n%s", logs.String())
+	}
+}

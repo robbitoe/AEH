@@ -274,6 +274,9 @@ echo AGENT-OK`
 		if len(cfg.Profiles[name].sandboxEgress()) == 0 {
 			fmt.Fprintf(w, "warning   profile %s declares no sandbox.egress: its agent has no network and cannot reach its provider\n", name)
 		}
+		if mode := codexOwnSandbox(cfg.Profiles[name].Command); mode != "" {
+			fmt.Fprintf(w, "warning   profile %s: codex %s needs user namespaces, which the agent container does not allow; use --sandbox danger-full-access there (the container is the sandbox)\n", name, mode)
+		}
 	}
 	// Sessions live in the main checkout, also when aeh runs from a linked worktree.
 	main, merr := MainCheckout(Repo{Root: s.root()})
@@ -298,4 +301,36 @@ echo AGENT-OK`
 		}
 	}
 	return nil
+}
+
+// codexOwnSandbox reports the Codex sandbox mode a command asks for when it is not
+// danger-full-access: Codex's own sandbox needs bubblewrap and user namespaces, which an
+// agent container refuses, so the agent would have no shell and could not write files.
+func codexOwnSandbox(command []string) string {
+	if len(command) == 0 {
+		return ""
+	}
+	prog := strings.ToLower(command[0][strings.LastIndexAny(command[0], `/\`)+1:])
+	if strings.TrimSuffix(prog, ".exe") != "codex" {
+		return ""
+	}
+	for i, a := range command[1:] {
+		mode := ""
+		switch {
+		case a == "--full-auto":
+			return "--full-auto"
+		case a == "--sandbox" || a == "-s":
+			if i+2 < len(command) {
+				mode = command[i+2]
+			}
+		default:
+			if v, ok := strings.CutPrefix(a, "--sandbox="); ok {
+				mode = v
+			}
+		}
+		if mode != "" && mode != "danger-full-access" {
+			return "--sandbox " + mode
+		}
+	}
+	return ""
 }

@@ -243,6 +243,11 @@ func (p *Proxy) handle(c net.Conn) {
 	_ = c.SetDeadline(deadline)
 	br := bufio.NewReaderSize(io.LimitReader(c, requestLimit), 4096)
 	req, err := http.ReadRequest(br)
+	if err == io.EOF {
+		// A connection closed before sending anything asked for nothing: the launcher's
+		// readiness probe, for one. There is nothing to refuse or log.
+		return
+	}
 	if err != nil {
 		p.log(logEntry{Verdict: "deny", Reason: "malformed request"})
 		reply(c, http.StatusBadRequest)
