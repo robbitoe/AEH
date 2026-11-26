@@ -42,6 +42,8 @@ type Proxy struct {
 	listener net.Listener
 	closing  bool
 	handlers sync.WaitGroup
+	ctx      context.Context // ends with Shutdown: pending resolutions and dials stop
+	cancel   context.CancelFunc
 }
 
 // logEntry is one line of the proxy's log. It holds no path, header or content.
@@ -86,6 +88,9 @@ func (p *Proxy) Serve(l net.Listener) error {
 	p.slots = make(chan struct{}, p.Policy.MaxConnections)
 	p.open = map[net.Conn]bool{}
 	p.listener = l
+	if p.ctx == nil {
+		p.ctx, p.cancel = context.WithCancel(context.Background())
+	}
 	closing := p.closing
 	p.mu.Unlock()
 	if closing {
@@ -99,12 +104,11 @@ func (p *Proxy) Serve(l net.Listener) error {
 		}
 		select {
 		case p.slots <- struct{}{}:
-			if !p.track(c) {
+			if !p.trackHandler(c) {
 				<-p.slots
 				_ = c.Close()
 				continue
 			}
-			p.handlers.Add(1)
 			go func() {
 				defer p.handlers.Done()
 				defer func() { <-p.slots }()
@@ -131,6 +135,19 @@ func (p *Proxy) track(c net.Conn) bool {
 	return true
 }
 
+// trackHandler registers a client connection and its handler together, under the lock
+// Shutdown takes, so Shutdown either refuses the handler or waits for it.
+func (p *Proxy) trackHandler(c net.Conn) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closing {
+		return false
+	}
+	p.open[c] = true
+	p.handlers.Add(1)
+	return true
+}
+
 func (p *Proxy) untrack(c net.Conn) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -142,6 +159,9 @@ func (p *Proxy) untrack(c net.Conn) {
 func (p *Proxy) Shutdown(wait time.Duration) {
 	p.mu.Lock()
 	p.closing = true
+	if p.cancel != nil {
+		p.cancel()
+	}
 	if p.listener != nil {
 		_ = p.listener.Close()
 	}
@@ -203,7 +223,7 @@ func (p *Proxy) handle(c net.Conn) {
 		deny(http.StatusForbidden, "byte limit reached")
 		return
 	}
-	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	ctx, cancel := context.WithDeadline(p.ctx, deadline)
 	defer cancel()
 	addrs, err := p.resolve(ctx, host)
 	if err != nil {

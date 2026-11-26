@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/robbitoe/aeh/internal/egress"
 )
@@ -110,8 +111,11 @@ func (s *sandbox) startEgress(ctx context.Context, id, kind string, pairs []stri
 }
 
 // endEgress checks that the proxy is still running after the launch, stops it and copies
-// its log to w (when not nil). A proxy that stopped on its own is an error.
-func (s *sandbox) endEgress(ctx context.Context, cid string, w io.Writer) error {
+// its log to w (when not nil). A proxy that stopped on its own is an error. It has its own
+// bounded context: a cancelled launch still keeps the proxy's log as evidence.
+func (s *sandbox) endEgress(cid string, w io.Writer) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
 	st, err := s.inspect(cid)
 	if err != nil {
 		return err

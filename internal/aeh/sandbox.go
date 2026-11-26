@@ -974,12 +974,14 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 	if runCtx.Err() != nil {
 		// The container may still run. Stop it before anything else.
 		_, _ = s.d.admin("kill", cid)
-		if proxy != "" {
-			_ = s.endEgress(ctx, proxy, l.EgressLog)
-		}
 		reason := "cancelled"
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 			reason = fmt.Sprintf("timed out after %s", l.Timeout)
+		}
+		if proxy != "" {
+			if err := s.endEgress(proxy, l.EgressLog); err != nil {
+				reason += " (egress proxy: " + err.Error() + ")"
+			}
 		}
 		return LaunchResult{Class: ClassTerminated, ExitCode: -1, Reason: reason}, nil
 	}
@@ -996,7 +998,7 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 		// agent's failures unexplained. The launcher's own exit code says it could not
 		// run the program behind the forwarder.
 		var problem error
-		if err := s.endEgress(ctx, proxy, l.EgressLog); err != nil {
+		if err := s.endEgress(proxy, l.EgressLog); err != nil {
 			problem = fmt.Errorf("egress proxy: %w", err)
 		} else if res.Class == ClassProcess && res.ExitCode == egress.LauncherFailed {
 			problem = fmt.Errorf("the egress launcher failed (exit %d); its reason is in the launch's stderr", egress.LauncherFailed)

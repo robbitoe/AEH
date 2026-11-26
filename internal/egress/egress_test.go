@@ -397,3 +397,35 @@ func TestShutdownLogsOpenTunnels(t *testing.T) {
 		t.Fatalf("log after shutdown:\n%s", log)
 	}
 }
+
+// Shutdown ends a pending resolution, and the request is still logged.
+func TestShutdownCancelsPendingResolution(t *testing.T) {
+	dir, _ := os.MkdirTemp("", "egr")
+	defer os.RemoveAll(dir)
+	socket := filepath.Join(dir, "p.sock")
+	l, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Skipf("no Unix sockets here: %v", err)
+	}
+	logs := &syncBuffer{}
+	started := make(chan struct{})
+	p := &Proxy{Policy: DefaultPolicy([]string{"slow.example.com:443"}), Log: logs,
+		Resolve: func(ctx context.Context, _ string) ([]netip.Addr, error) {
+			close(started)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}}
+	go p.Serve(l)
+	c, err := net.Dial("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	io.WriteString(c, "CONNECT slow.example.com:443 HTTP/1.1\r\n\r\n")
+	<-started
+	start := time.Now()
+	p.Shutdown(5 * time.Second)
+	if time.Since(start) > 3*time.Second || !strings.Contains(logs.String(), "name not resolved") {
+		t.Fatalf("after %s, log:\n%s", time.Since(start), logs.String())
+	}
+}

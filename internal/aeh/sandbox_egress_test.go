@@ -193,4 +193,21 @@ func TestDockerEgressFailuresAreInfrastructure(t *testing.T) {
 	}
 	assertNoLeftovers(t, s)
 
+	// A cancelled launch still keeps the proxy's log.
+	p = Profile{Command: []string{"sh", "-c", `(printf 'CONNECT other.example.com:443 HTTP/1.1
+
+'; sleep 1) | nc 127.0.0.1 3128; sleep 60`},
+		Sandbox: &ProfileSandbox{Egress: []string{"example.com:443"}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(8*time.Second, cancel)
+	dir = t.TempDir()
+	_, res, err = s.runAgent(ctx, agentLaunch{Kind: "review", Profile: p, Prompt: "x", RunDir: dir, LogName: "c"})
+	if err != nil || res.Class != ClassTerminated {
+		t.Fatalf("cancelled: %+v %v", res, err)
+	}
+	if log, _ := os.ReadFile(filepath.Join(dir, "c.egress.log")); !strings.Contains(string(log), "other.example.com") {
+		t.Fatalf("cancelled launch lost the proxy log: %q", log)
+	}
+	assertNoLeftovers(t, s)
+
 }
