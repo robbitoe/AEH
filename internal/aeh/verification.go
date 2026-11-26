@@ -11,10 +11,13 @@ import (
 )
 
 // The sandbox policy version a flow pins: 0 runs everything on the host; 1 runs gate
-// commands in containers (stage 6, S1); 2 also runs every agent in a container (S2).
+// commands in containers (stage 6, S1); 2 also ran every agent in a container on
+// Docker's default network (S2); 3 runs agents with no network but their profile's
+// egress pairs, through a proxy per launch (S3). Agents always run under 3 now.
 const (
 	sandboxPolicyGates  = 1
 	sandboxPolicyAgents = 2
+	sandboxPolicyEgress = 3
 )
 
 // sandboxContract is what a resumable flow pins about isolation. It is nil without a
@@ -35,15 +38,16 @@ func sandboxContract(sb *sandbox) any {
 		AgentNetwork string              `json:",omitempty"`
 		AgentEnv     map[string][]string `json:",omitempty"`
 		AgentSession map[string][]string `json:",omitempty"`
+		AgentEgress  map[string][]string `json:",omitempty"`
 	}{Policy: sandboxPolicyGates, Engine: sb.engine.ID, Image: sb.image.ID, Memory: sb.cfg.Memory, CPUs: sb.cfg.CPUs, GateEnv: sb.cfg.GateEnv}
 	if sb.agents() {
-		c.Policy, c.AgentImage, c.AgentNetwork, c.AgentEnv = sandboxPolicyAgents, sb.agent.ID, "bridge", sb.agentEnv
-		c.AgentSession = sb.agentSession
+		c.Policy, c.AgentImage, c.AgentNetwork, c.AgentEnv = sandboxPolicyEgress, sb.agent.ID, "none", sb.agentEnv
+		c.AgentSession, c.AgentEgress = sb.agentSession, sb.agentEgress
 	}
 	return c
 }
 
-// agents reports whether agents run in containers (policy 2).
+// agents reports whether agents run in containers (policy 3).
 func (s *sandbox) agents() bool { return s != nil && s.agent.ID != "" }
 
 // openFlowSandbox opens the project's sandbox for one flow, or returns nil when the
@@ -58,13 +62,16 @@ func openFlowSandbox(r Repo, cfg Config, flow string) (*sandbox, error) {
 		return nil, err
 	}
 	if sb.agents() {
-		sb.agentEnv, sb.agentSession = map[string][]string{}, map[string][]string{}
+		sb.agentEnv, sb.agentSession, sb.agentEgress = map[string][]string{}, map[string][]string{}, map[string][]string{}
 		for name, p := range cfg.Profiles {
 			if env := p.sandboxPassEnv(); len(env) > 0 {
 				sb.agentEnv[name] = append([]string(nil), env...)
 			}
 			if files := p.sandboxSession(); len(files) > 0 {
 				sb.agentSession[name] = append([]string(nil), files...)
+			}
+			if pairs := p.sandboxEgress(); len(pairs) > 0 {
+				sb.agentEgress[name] = append([]string(nil), pairs...)
 			}
 		}
 	}

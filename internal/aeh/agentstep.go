@@ -147,25 +147,26 @@ func (s *sandbox) agentStep(ctx context.Context, root string, cfg Config, st age
 
 // launchRecord is the evidence of one agent launch, beside its output in the run directory.
 type launchRecord struct {
-	Kind         string `json:"kind"`
-	Profile      string `json:"profile"`
-	Class        string `json:"class"`
-	ExitCode     int    `json:"exit_code"`
-	Reason       string `json:"reason,omitempty"`
-	Image        string `json:"image"`
-	Network      string `json:"network"`
-	Work         string `json:"work,omitempty"`
-	WorkTree     string `json:"work_tree,omitempty"`
-	WorkWritable bool   `json:"work_writable,omitempty"`
-	Out          bool   `json:"out,omitempty"`
-	MemoryCommit string `json:"memory_commit,omitempty"`
-	Candidate    string `json:"candidate,omitempty"`
+	Kind         string   `json:"kind"`
+	Profile      string   `json:"profile"`
+	Class        string   `json:"class"`
+	ExitCode     int      `json:"exit_code"`
+	Reason       string   `json:"reason,omitempty"`
+	Image        string   `json:"image"`
+	Network      string   `json:"network"`
+	Egress       []string `json:"egress,omitempty"`
+	Work         string   `json:"work,omitempty"`
+	WorkTree     string   `json:"work_tree,omitempty"`
+	WorkWritable bool     `json:"work_writable,omitempty"`
+	Out          bool     `json:"out,omitempty"`
+	MemoryCommit string   `json:"memory_commit,omitempty"`
+	Candidate    string   `json:"candidate,omitempty"`
 }
 
 func writeLaunchRecord(s *sandbox, st agentStep, r agentStepResult) error {
 	return writePrivateJSON(filepath.Join(st.RunDir, st.LogName+".launch.json"), launchRecord{
 		Kind: st.Kind, Profile: st.Profile, Class: r.Launch.Class, ExitCode: r.Launch.ExitCode, Reason: r.Launch.Reason,
-		Image: s.agent.ID, Network: "bridge", Work: st.Work, WorkTree: st.WorkLabel, WorkWritable: st.Capture != "", Out: st.Out,
+		Image: s.agent.ID, Network: agentNetworkName(s.agentEgress[st.Profile]), Egress: s.agentEgress[st.Profile], Work: st.Work, WorkTree: st.WorkLabel, WorkWritable: st.Capture != "", Out: st.Out,
 		MemoryCommit: st.MemoryCommit, Candidate: r.Candidate})
 }
 

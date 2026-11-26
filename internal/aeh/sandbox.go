@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/robbitoe/aeh/internal/egress"
 	"gopkg.in/yaml.v3"
 )
 
@@ -390,9 +391,11 @@ type sandbox struct {
 	agentEnv map[string][]string
 	// agentSession is each profile's sandbox.session, pinned the same way.
 	agentSession map[string][]string
-	project      string // label: first 12 hex digits of sha256(project root)
-	dir          string // runner-private directory: .aeh/sandbox
-	flow         string // intents of this flow live in dir/intents/<flow>
+	// agentEgress is each profile's sandbox.egress, pinned the same way.
+	agentEgress map[string][]string
+	project     string // label: first 12 hex digits of sha256(project root)
+	dir         string // runner-private directory: .aeh/sandbox
+	flow        string // intents of this flow live in dir/intents/<flow>
 }
 
 // root is the project checkout whose .aeh/sandbox the sandbox uses.
@@ -512,8 +515,10 @@ func (s *sandbox) release(id string) error {
 		return fmt.Errorf("sandbox cleanup %s: removal not confirmed; Docker objects labeled aeh.launch=%s remain: %v", id, id, err)
 	}
 	// Launch-local files go with the Docker objects; the intent is the last to go.
-	if err := os.Remove(filepath.Join(s.dir, "env", id+".env")); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("sandbox cleanup %s: %w", id, err)
+	for _, name := range []string{id + ".env", id + "-egress.env"} {
+		if err := os.Remove(filepath.Join(s.dir, "env", name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("sandbox cleanup %s: %w", id, err)
+		}
 	}
 	if err := os.Remove(filepath.Join(s.intentDir(), id+".json")); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("sandbox cleanup %s: %w", id, err)
@@ -574,10 +579,16 @@ type sandboxLaunch struct {
 	Timeout time.Duration
 	Output  io.Writer // stdout, and stderr too unless Stderr is set
 	Stderr  io.Writer
-	// Agent selects the agent image and Docker's default bridge network (S2, owner
-	// decision Q3-A: the file system is isolated, the network only from S3 on). Gates run
-	// in the gate image with no network.
+	// Agent selects the agent image. Gates run in the gate image.
 	Agent bool
+	// Network is Docker's network mode; empty means none. Only an egress proxy has one.
+	Network string
+	// Egress lists the host:port pairs the launch may reach (S3). When set, a proxy
+	// container with the network serves them on a Unix socket in a volume shared with
+	// the launch, which keeps no network; aeh-egress launch relays its loopback port
+	// 3128 to that socket and then runs Argv. EgressLog receives the proxy's log.
+	Egress    []string
+	EgressLog io.Writer
 	// Interactive attaches the launch to a terminal instead of collecting its output.
 	Interactive *interactiveIO
 	// SaveSession runs while the stopped container still exists, before after, when the
@@ -606,8 +617,8 @@ func (s *sandbox) launchImage(l sandboxLaunch) sandboxImage {
 }
 
 func launchNetwork(l sandboxLaunch) string {
-	if l.Agent {
-		return "bridge"
+	if l.Network != "" {
+		return l.Network
 	}
 	return "none"
 }
@@ -622,6 +633,7 @@ type containerState struct {
 		WorkingDir string   `json:"WorkingDir"`
 		Entrypoint []string `json:"Entrypoint"`
 		Cmd        []string `json:"Cmd"`
+		StopSignal string   `json:"StopSignal"`
 	} `json:"Config"`
 	HostConfig struct {
 		NetworkMode    string            `json:"NetworkMode"`
@@ -674,8 +686,9 @@ const (
 )
 
 // launchEnv is the environment a container must end up with: the image's, then
-// HOME, TMPDIR, empty proxy variables and the launch's own.
-func (s *sandbox) launchEnv(img sandboxImage, extra []string) ([]string, map[string]string, error) {
+// HOME, TMPDIR, the proxy variables and the launch's own. The proxy variables are empty,
+// or name the launch's forwarder when it has egress.
+func (s *sandbox) launchEnv(img sandboxImage, extra []string, proxied bool) ([]string, map[string]string, error) {
 	want := map[string]string{}
 	for _, kv := range img.Env {
 		k, v, _ := strings.Cut(kv, "=")
@@ -683,7 +696,7 @@ func (s *sandbox) launchEnv(img sandboxImage, extra []string) ([]string, map[str
 	}
 	own := []string{"HOME=" + sandboxHome, "TMPDIR=/tmp"}
 	for _, p := range proxyVars {
-		own = append(own, p+"=")
+		own = append(own, p+"="+proxyValue(p, proxied))
 	}
 	own = append(own, extra...)
 	for _, kv := range own {
@@ -870,7 +883,32 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 	if err != nil {
 		return infra(err)
 	}
-	own, want, err := s.launchEnv(img, l.Env)
+	var proxy string // the egress proxy's container
+	egressEnded := false
+	finishEgress := func() error {
+		if proxy == "" || egressEnded {
+			return nil
+		}
+		egressEnded = true
+		return s.endEgress(proxy, l.EgressLog)
+	}
+	if len(l.Egress) > 0 {
+		sock, cid, err := s.startEgress(ctx, in.ID, l.Kind, l.Egress)
+		if err != nil {
+			return infra(fmt.Errorf("egress proxy: %w", err))
+		}
+		proxy = cid
+		// Every exit from here on stops the proxy and keeps its log before release
+		// removes it; the paths below that check the proxy do so through finishEgress.
+		defer func() {
+			if ferr := finishEgress(); ferr != nil && res.Class != ClassProcess {
+				res.Reason += " (egress proxy: " + ferr.Error() + ")"
+			}
+		}()
+		vols = append(vols, sandboxVolume{Name: sock, Target: egressDir, ReadOnly: true})
+		l.Argv = append([]string{"aeh-egress", "launch", "--socket", egressSocket, "--listen", egressListen, "--"}, l.Argv...)
+	}
+	own, want, err := s.launchEnv(img, l.Env, proxy != "")
 	if err != nil {
 		return infra(err)
 	}
@@ -956,6 +994,9 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 			reason = fmt.Sprintf("timed out after %s", l.Timeout)
 		}
+		if err := finishEgress(); err != nil {
+			reason += " (egress proxy: " + err.Error() + ")"
+		}
 		return LaunchResult{Class: ClassTerminated, ExitCode: -1, Reason: reason}, nil
 	}
 	st, err := s.inspect(cid)
@@ -965,6 +1006,24 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 	res = classify(st)
 	if msg := waitMismatch(waited, waitErr, res); msg != "" {
 		return LaunchResult{Class: ClassInfrastructure, ExitCode: -1, Reason: msg}, nil
+	}
+	if proxy != "" {
+		// The proxy must have served the whole launch: one that stopped leaves the
+		// agent's failures unexplained. The launcher's own exit code says it could not
+		// run the program behind the forwarder.
+		var problem error
+		if err := finishEgress(); err != nil {
+			problem = fmt.Errorf("egress proxy: %w", err)
+		} else if res.Class == ClassProcess && res.ExitCode == egress.LauncherFailed {
+			problem = fmt.Errorf("the egress launcher failed (exit %d); its reason is in the launch's stderr", egress.LauncherFailed)
+		}
+		if problem != nil {
+			// The output still explains what happened; the result stays infrastructure.
+			if l.Output != nil {
+				_ = s.logs(ctx, cid, l.Output, l.Stderr)
+			}
+			return infra(problem)
+		}
 	}
 	if l.SaveSession != nil && res.Class == ClassProcess {
 		l.SaveSession(cid, res)

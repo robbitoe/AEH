@@ -8,6 +8,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/robbitoe/aeh/internal/egress"
 	"gopkg.in/yaml.v3"
 )
 
@@ -38,6 +39,14 @@ func (p Profile) sandboxPassEnv() []string {
 	return p.Sandbox.PassEnv
 }
 
+// sandboxEgress is the profile's sandbox.egress, or none.
+func (p Profile) sandboxEgress() []string {
+	if p.Sandbox == nil {
+		return nil
+	}
+	return p.Sandbox.Egress
+}
+
 // sandboxSession is the profile's sandbox.session, or none.
 func (p Profile) sandboxSession() []string {
 	if p.Sandbox == nil {
@@ -50,20 +59,23 @@ func (p Profile) sandboxSession() []string {
 // pass_env is never forwarded into a container: each profile names its own. Session
 // lists the files, relative to HOME, its CLI needs to authenticate: aeh keeps them
 // between launches (stage 6, section 6). Login is the command `aeh sandbox login` runs.
-// The new fields are omitted from JSON when unset, so plan digests do not change.
+// Egress lists the host:port pairs its CLI may reach through the launch's proxy (S3);
+// without it, the agent has no network. The new fields are omitted from JSON when unset,
+// so plan digests do not change.
 type ProfileSandbox struct {
 	PassEnv []string `yaml:"pass_env"`
 	Session []string `yaml:"session" json:",omitempty"`
 	Login   []string `yaml:"login" json:",omitempty"`
+	Egress  []string `yaml:"egress" json:",omitempty"`
 }
 
 // UnmarshalYAML rejects misspelled profile sandbox settings.
 func (s *ProfileSandbox) UnmarshalYAML(n *yaml.Node) error {
 	if n.Kind != yaml.MappingNode {
-		return errors.New("profile sandbox must be a mapping of pass_env, session and login")
+		return errors.New("profile sandbox must be a mapping of pass_env, session, login and egress")
 	}
 	for i := 0; i+1 < len(n.Content); i += 2 {
-		if k := n.Content[i].Value; k != "pass_env" && k != "session" && k != "login" {
+		if k := n.Content[i].Value; k != "pass_env" && k != "session" && k != "login" && k != "egress" {
 			return fmt.Errorf("profile sandbox: unknown key %q", k)
 		}
 	}
@@ -311,6 +323,9 @@ func (c *Config) validate() error {
 			}
 			if len(p.Sandbox.Login) > 0 && len(p.Sandbox.Session) == 0 {
 				return fmt.Errorf("config: profile %q: sandbox.login needs sandbox.session: the files to keep after the login", name)
+			}
+			if err := egress.CheckPairs(p.Sandbox.Egress); err != nil {
+				return fmt.Errorf("config: profile %q: sandbox.%w", name, err)
 			}
 		}
 	}

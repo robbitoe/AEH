@@ -226,7 +226,8 @@ func SandboxCheck(ctx context.Context, r Repo, w io.Writer) error {
 }
 
 // checkAgentImage runs one throwaway agent container: the agent image runs as user 10001
-// with the agent network, and has the program of every profile's command.
+// with no network, and has the program of every profile's command, and aeh-egress when a
+// profile declares egress.
 func checkAgentImage(ctx context.Context, s *sandbox, cfg Config, w io.Writer) error {
 	fmt.Fprintf(w, "agents    %s\n          %s\n", s.cfg.AgentImage, s.agent.ID)
 	names := make([]string, 0, len(cfg.Profiles))
@@ -242,6 +243,12 @@ func checkAgentImage(ctx context.Context, s *sandbox, cfg Config, w io.Writer) e
 				argv = append(argv, c[0])
 			}
 			programs[c[0]] = append(programs[c[0]], name)
+		}
+		if len(cfg.Profiles[name].sandboxEgress()) > 0 {
+			if programs["aeh-egress"] == nil {
+				argv = append(argv, "aeh-egress")
+			}
+			programs["aeh-egress"] = append(programs["aeh-egress"], name)
 		}
 	}
 	script := `test "$(id -u)" = 10001 || { echo "not user 10001"; exit 1; }
@@ -261,6 +268,11 @@ echo AGENT-OK`
 	for _, line := range strings.Split(text, "\n") {
 		if p, ok := strings.CutPrefix(strings.TrimSpace(line), "MISSING-PROGRAM: "); ok {
 			fmt.Fprintf(w, "warning   %s (profiles %s) was not found in the agent image\n", p, strings.Join(programs[p], ", "))
+		}
+	}
+	for _, name := range names {
+		if len(cfg.Profiles[name].sandboxEgress()) == 0 {
+			fmt.Fprintf(w, "warning   profile %s declares no sandbox.egress: its agent has no network and cannot reach its provider\n", name)
 		}
 	}
 	// Sessions live in the main checkout, also when aeh runs from a linked worktree.
