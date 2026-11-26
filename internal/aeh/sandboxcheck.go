@@ -317,16 +317,18 @@ func codexOwnSandbox(command []string) string {
 	for i, a := range command[1:] {
 		mode := ""
 		switch {
+		case a == "--":
+			return "" // the rest is the prompt
 		case a == "--full-auto":
 			return "--full-auto"
 		case a == "--sandbox" || a == "-s":
 			if i+2 < len(command) {
 				mode = command[i+2]
 			}
-		default:
-			if v, ok := strings.CutPrefix(a, "--sandbox="); ok {
-				mode = v
-			}
+		case strings.HasPrefix(a, "--sandbox="):
+			mode = strings.TrimPrefix(a, "--sandbox=")
+		case strings.HasPrefix(a, "-s") && !strings.HasPrefix(a, "--"):
+			mode = strings.TrimPrefix(strings.TrimPrefix(a, "-s"), "=") // -sMODE or -s=MODE
 		}
 		if mode != "" && mode != "danger-full-access" {
 			return "--sandbox " + mode

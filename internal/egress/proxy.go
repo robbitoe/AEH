@@ -241,11 +241,14 @@ func (p *Proxy) handle(c net.Conn) {
 	// One deadline covers reading the request, resolving the name and connecting.
 	deadline := time.Now().Add(time.Duration(p.Policy.ConnectSeconds) * time.Second)
 	_ = c.SetDeadline(deadline)
-	br := bufio.NewReaderSize(io.LimitReader(c, requestLimit), 4096)
+	in := &countingReader{r: io.LimitReader(c, requestLimit)}
+	br := bufio.NewReaderSize(in, 4096)
 	req, err := http.ReadRequest(br)
-	if err == io.EOF {
-		// A connection closed before sending anything asked for nothing: the launcher's
-		// readiness probe, for one. There is nothing to refuse or log.
+	if err == io.EOF && in.n == 0 {
+		// A connection closed before sending a single byte asked for nothing: the
+		// launcher's readiness probe, for one. There is nothing to refuse or log. Any byte
+		// received makes it a request, logged like every other (io.EOF alone does not
+		// prove that: a line longer than the buffer or the limit also ends in io.EOF).
 		return
 	}
 	if err != nil {
@@ -342,6 +345,18 @@ func (p *Proxy) handle(c net.Conn) {
 	if p.bytes.Load() >= p.Policy.MaxBytes {
 		entry.Reason = "byte limit reached"
 	}
+}
+
+// countingReader counts the bytes read from a client.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(b []byte) (int, error) {
+	n, err := c.r.Read(b)
+	c.n += int64(n)
+	return n, err
 }
 
 func (p *Proxy) resolve(ctx context.Context, host string) ([]netip.Addr, error) {

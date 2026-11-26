@@ -116,7 +116,7 @@ An agent container never has a network of its own: Docker's `none` mode leaves o
 profiles:
   medio:
     provider: openai
-    command: [codex, exec, --skip-git-repo-check, "{{prompt}}"]
+    command: [codex, exec, --skip-git-repo-check, --sandbox, danger-full-access, "{{prompt}}"]
     sandbox:
       egress: [api.openai.com:443, chatgpt.com:443, auth.openai.com:443]
 ```
@@ -147,7 +147,7 @@ A profile that signs in with a subscription instead of an API key declares the f
 profiles:
   medio:
     provider: openai
-    command: [codex, exec, --skip-git-repo-check, "{{prompt}}"]
+    command: [codex, exec, --skip-git-repo-check, --sandbox, danger-full-access, "{{prompt}}"]
     sandbox:
       session: [.codex/auth.json]
       login: [codex, login, --device-auth]
