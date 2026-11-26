@@ -317,7 +317,7 @@ func (d *discoverySession) resumeBook(ctx context.Context) error {
 		p.Review.Feedback, p.Review.Findings = "", nil
 	}
 	if p.Review.Status == "not_run" {
-		if err := d.reviewBook(ctx, p, files); err != nil {
+		if err := d.reviewBook(ctx, p, files, "aeh discover run "+d.state.Slug); err != nil {
 			// The first cancellation leaves a resumable book. If that recovery cannot
 			// complete either, preserve interrupted evidence and import it anyway.
 			if !retrying || p.Review.Status != "interrupted" {
@@ -334,7 +334,9 @@ func (d *discoverySession) resumeBook(ctx context.Context) error {
 	return d.acceptReviewed(p.Round, &d.state.Attempts[p.Attempt-1], out, review)
 }
 
-func (d *discoverySession) reviewBook(ctx context.Context, p *pendingBook, files map[string][]byte) error {
+// reviewBook runs the book's advisory review. retry is the command that runs it again
+// when it cannot run now.
+func (d *discoverySession) reviewBook(ctx context.Context, p *pendingBook, files map[string][]byte, retry string) error {
 	v := p.Review
 	text, templateErr := loadPrompt(d.repo, "review-book.md")
 	if templateErr == nil {
@@ -415,11 +417,20 @@ func (d *discoverySession) reviewBook(ctx context.Context, p *pendingBook, files
 			if err := d.save(); err != nil {
 				return errors.Join(cause, err)
 			}
-			return fmt.Errorf("the book review could not run in the sandbox; fix the cause (for example start Docker), then run again: aeh discover run %s: %w", d.state.Slug, cause)
+			return fmt.Errorf("the book review could not run in the sandbox; fix the cause (for example start Docker), then run again: %s: %w", retry, cause)
 		}
 		outPath, runErr = step.OutPath, step.AgentErr
 	} else {
 		outPath, runErr = runAgent(ctx, d.cfg.Profiles[profile], d.cfg.PassEnv, outDir, prompt, runDir, "review-book")
+	}
+	if note := quotaNote(d.cfg, profile, runErr); note != "" {
+		// The reviewer was not reached: the review stays not run, never interrupted, so
+		// the book is not imported without it.
+		p.Running, v.Status, v.Feedback = false, "not_run", ""
+		if err := d.save(); err != nil {
+			return errors.Join(runErr, err)
+		}
+		return fmt.Errorf("the book review stopped: %s, then run again: %s: %w", note, retry, runErr)
 	}
 	p.Running = false
 	if runErr != nil {
@@ -691,7 +702,7 @@ func DiscoverReview(ctx context.Context, r Repo, slug string, log io.Writer) (_ 
 	}
 	p := &pendingBook{Attempt: attempt, Round: round.N, Review: &DiscoveryBookReview{Book: d.bookDigest(files), Status: "not_run"}}
 	d.logf("  reviewing the draft book of round %d again", round.N)
-	if err := d.reviewBook(ctx, p, files); err != nil {
+	if err := d.reviewBook(ctx, p, files, "aeh discover review "+d.state.Slug); err != nil {
 		return *st, err
 	}
 	// The earlier review had no verdict, so it had no findings: they are replaced, not lost.

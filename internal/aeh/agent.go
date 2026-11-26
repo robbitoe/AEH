@@ -89,10 +89,9 @@ func runAgentWithOutput(ctx context.Context, p Profile, passEnv []string, dir, o
 	}
 	var exit *exec.ExitError
 	if errors.As(runErr, &exit) {
-		for _, code := range p.QuotaExitCodes {
-			if exit.ExitCode() == code {
-				return outPath, fmt.Errorf("provider quota signal (exit %d): %w", code, exit)
-			}
+		// Only a normal exit with a code is judged: a process killed by a signal reports -1.
+		if q := quotaSignal(p, exit.ExitCode(), outPath); q != nil {
+			return outPath, fmt.Errorf("%w: %w", q, exit)
 		}
 		return outPath, fmt.Errorf("agent exited with code %d: %w", exit.ExitCode(), exit)
 	}

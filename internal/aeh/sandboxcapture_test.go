@@ -192,7 +192,7 @@ func TestAgentErrorKeepsTheHostMeanings(t *testing.T) {
 	cases := map[LaunchResult]string{
 		{Class: ClassProcess}:                                     "",
 		{Class: ClassProcess, ExitCode: 2}:                        "agent exited with code 2",
-		{Class: ClassProcess, ExitCode: 75}:                       "provider quota signal (exit 75)",
+		{Class: ClassProcess, ExitCode: 75}:                       "provider quota signal (exit code 75)",
 		{Class: ClassTerminated, Reason: "timed out after 1m0s"}:  "deadline exceeded",
 		{Class: ClassInfrastructure, Reason: "image missing"}:     "sandbox infrastructure failure: image missing",
 		{Class: ClassResource, Reason: "killed for exceeding..."}: "agent killed",

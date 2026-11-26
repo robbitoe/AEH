@@ -22,6 +22,7 @@ type GateResult struct {
 	Output    string   `json:"output,omitempty"`
 	Seconds   float64  `json:"seconds"`
 	Uncertain bool     `json:"uncertain,omitempty"`
+	Quota     string   `json:"quota,omitempty"` // set with Uncertain when a provider's limit ended an agent
 	Skipped   bool     `json:"skipped,omitempty"`
 	Warnings  []string `json:"warnings,omitempty"`
 	// Class says how a command gate's process ended (see LaunchResult). Only
@@ -428,11 +429,12 @@ func runShell(ctx context.Context, dir, command string, timeout time.Duration, p
 	return buf.String(), err
 }
 
-// uncertainExit reports an agent or command whose outcome is unknown: it was stopped, or
-// the sandbox could not carry it out. Such a result blocks without spending a ladder step.
+// uncertainExit reports an agent or command whose outcome is unknown: it was stopped, the
+// sandbox could not carry it out, or the provider's usage limit ended it. Such a result
+// blocks without spending a ladder step.
 func uncertainExit(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || errors.Is(err, exec.ErrWaitDelay) ||
-		errors.Is(err, errSandboxInfrastructure)
+		errors.Is(err, errSandboxInfrastructure) || errors.Is(err, errProviderQuota)
 }
 
 // tail keeps the last n bytes of command or agent output. It redacts recognized secrets in the

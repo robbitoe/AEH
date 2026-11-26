@@ -250,10 +250,8 @@ func agentError(p Profile, res LaunchResult) error {
 		if res.ExitCode == 0 {
 			return nil
 		}
-		for _, code := range p.QuotaExitCodes {
-			if res.ExitCode == code {
-				return fmt.Errorf("provider quota signal (exit %d)", code)
-			}
+		if q := quotaSignal(p, res.ExitCode, ""); q != nil {
+			return q
 		}
 		return fmt.Errorf("agent exited with code %d", res.ExitCode)
 	case ClassResource:

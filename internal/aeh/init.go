@@ -96,6 +96,7 @@ profiles:
     stdin: true
     timeout_minutes: 30
     # quota_exit_codes: []  # Set only when the CLI documents a distinct quota exit code.
+    # quota_messages: []    # Add the phrase Codex prints at its usage limit, from a real log.
   codex-review:
     provider: openai
     command: ["codex", "exec", "--skip-git-repo-check", "--sandbox", "read-only", "-"]
@@ -108,17 +109,22 @@ profiles:
   # acceptEdits lets it edit files; to let it run your tests too, add for example
   # "--allowedTools", "Bash(npm test:*)".
   # Text output keeps a final SPEC-QUESTION line readable; json would hide it.
+  # quota_messages: phrases the CLI prints when the provider's usage limit is hit (checked
+  # in the last 4 KiB of its output after a nonzero exit). The step then blocks without
+  # spending a ladder step. Verify them against a real log of the CLI version you use.
   fuerte:
     provider: anthropic
     command: ["claude", "-p", "--safe-mode", "--permission-mode", "acceptEdits", "--permission-prompts", "none", "--output-format", "text"]
     stdin: true
     timeout_minutes: 30
+    quota_messages: ["hit your 5-hour limit"]
   # Read-only Claude reviewer; it reviews what Codex implements.
   claude-review:
     provider: anthropic
     command: ["claude", "-p", "--safe-mode", "--tools", "Read,Grep,Glob", "--permission-prompts", "none", "--output-format", "text"]
     stdin: true
     timeout_minutes: 15
+    quota_messages: ["hit your 5-hour limit"]
   # A local model through LM Studio's Anthropic-compatible endpoint. Use the port your
   # server listens on and a model id it has loaded.
   local:
