@@ -1268,7 +1268,7 @@ case "$1" in *"role security"*) `+tc.security+` ;; *) `+reviewOK+` ;; esac`)
 					failure = "reviewer gave no verdict"
 				case "quota":
 					failure = `provider quota reached for profile "qa-default"`
-					guidance = "then answer to retry the missing review"
+					guidance = "then answer to retry"
 				case "timeout":
 					failure = "context canceled" // the run is cancelled while the review sleeps
 					guidance = "Confirm all processes stopped and review possible effects before answering to retry"

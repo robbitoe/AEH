@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -40,6 +41,7 @@ func TestQuotaSignal(t *testing.T) {
 		{"message on stdout", 1, quotaLine + "\n", "", "message #1"},
 		{"message on stderr", 1, "", "error: " + quotaLine, "message #1"},
 		{"case and ANSI", 1, "\x1b[31mYOU'VE HIT YOUR \x1b[1m5-HOUR LIMIT\x1b[0m", "", "message #1"},
+		{"colon-form SGR", 1, "hit your [38:2:255:0:0m5-hour limit", "", "message #1"},
 		{"exit 0 never", 0, quotaLine, "", ""},
 		{"killed by a signal never", -1, quotaLine, "", ""},
 		{"other failure", 1, "build failed", "", ""},
@@ -126,8 +128,9 @@ func TestQuotaBlocksWithoutSpendingTheLadder(t *testing.T) {
 		strings.Contains(st.Question, "resets") || strings.Contains(st.Question, "Confirm all processes") {
 		t.Fatalf("question %q", st.Question)
 	}
-	if st.Tasks[0].Attempts[0].Worktree != "" {
-		t.Fatal("a quota attempt kept its worktree")
+	// As for an infrastructure failure, the attempt's host worktree is kept as evidence.
+	if wt := st.Tasks[0].Attempts[0].Worktree; wt != "" {
+		t.Cleanup(func() { removeWorktree(f.dir, wt) })
 	}
 	// After the limit resets, the answer restarts the task's ladder.
 	f.setScript("medio", agentGood)
@@ -335,12 +338,91 @@ func TestQuotaAfterASpecQuestion(t *testing.T) {
 // Profiles without quota_messages serialize as before, so the digests of plans reserved
 // before this field existed do not change.
 func TestQuotaMessagesKeepOldDigests(t *testing.T) {
-	b, err := json.Marshal(Profile{Provider: "a", Command: []string{"x"}})
-	if err != nil || strings.Contains(string(b), "QuotaMessages") {
-		t.Fatalf("%s %v", b, err)
+	// Captured from commit 4e6a2a8, before quota_messages existed.
+	const before = `{"Provider":"a","Transport":"","Command":["x"],"Env":null,"Stdin":false,"TimeoutMinutes":5,"QuotaExitCodes":[75]}`
+	b, err := json.Marshal(Profile{Provider: "a", Command: []string{"x"}, QuotaExitCodes: []int{75}, TimeoutMinutes: 5})
+	if err != nil || string(b) != before {
+		t.Fatalf("a profile without quota_messages serializes differently:\n%s\n%s %v", b, before, err)
 	}
 	b, _ = json.Marshal(Profile{QuotaMessages: []string{"hit your 5-hour limit"}})
 	if !strings.Contains(string(b), "QuotaMessages") {
 		t.Fatalf("set rules must reach the digest: %s", b)
+	}
+}
+
+func TestQuotaOfADoAsksToRunItAgain(t *testing.T) {
+	f := newFixture(t, map[string]string{"medio": agentQuota}, []string{"medio"}, "")
+	f.quotaProfile("medio")
+	mustGit(t, f.dir, "add", "-A")
+	mustGit(t, f.dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "quota")
+	st, err := Do(context.Background(), f.repo, `Write src/fees.txt containing "fees ok"`, []string{"src/"}, "", MemoryLink{}, nil, RouteTrivial)
+	if err != nil || st.Status != StatusBlocked || !strings.Contains(st.Question, "provider quota reached") ||
+		!strings.Contains(st.Question, "run `aeh do` again") || strings.Contains(st.Question, "answer to retry") {
+		t.Fatalf("want a quota block that says to run aeh do again: %+v %v", st, err)
+	}
+	if wt := st.Tasks[0].Attempts[0].Worktree; wt != "" {
+		t.Cleanup(func() { removeWorktree(f.dir, wt) })
+	}
+}
+
+func TestQuotaOfAnAdoptionSealAuthorBlocks(t *testing.T) {
+	f, _ := newCharFixture(t, agentQuota)
+	addQuota(t, f.repo, "author", "author")
+	f.commitAll("quota")
+	st, log, err := f.seal()
+	if err != nil || st.Status != StatusBlocked || !strings.Contains(st.Question, `provider quota reached for profile "author"`) {
+		t.Fatalf("want a quota block: %+v %v\n%s", st, err, log)
+	}
+}
+
+func TestQuotaOfADamagingPlanReviewerIsItsDamage(t *testing.T) {
+	f := newPlanFixture(t, authorOK, "echo changed > src/README; "+agentQuota)
+	addQuota(t, f.repo, "qa", "qa")
+	f.commitAll("quota")
+	st := f.plan()
+	if strings.Contains(st.Question, "provider quota") {
+		t.Fatalf("damage reported as quota: %q", st.Question)
+	}
+	for _, a := range st.Attempts {
+		if strings.Contains(a.Feedback, "provider quota") {
+			t.Fatalf("damage reported as quota: %+v", a)
+		}
+	}
+}
+
+func TestQuotaOfAnExplicitBookReviewKeepsItsRound(t *testing.T) {
+	endToEnd(t)
+	f := newDiscoveryFixture(t, writeBook)
+	f.setReviewer(`exit 3`, "b")
+	f.start()
+	if st := f.run(); st.Rounds[0].Review.Status != "invalid" {
+		t.Fatalf("a failing reviewer gives an invalid review: %+v", st.Rounds[0].Review)
+	}
+	addQuota(t, f.repo, "qa", "b")
+	write(t, f.tmp, "review.sh", "#!/bin/sh\n"+agentQuota+"\n")
+	_, err := DiscoverReview(context.Background(), f.repo, "shop", nil)
+	if err == nil || !strings.Contains(err.Error(), `provider quota reached for profile "qa"`) || !strings.Contains(err.Error(), "aeh discover review shop") {
+		t.Fatalf("want a quota stop naming discover review: %v", err)
+	}
+	st, _, err := LoadDiscovery(f.repo, "shop")
+	if err != nil || st.Rounds[0].Review.Status != "invalid" || st.Book != nil {
+		t.Fatalf("the round changed: %+v %v", st, err)
+	}
+	write(t, f.tmp, "review.sh", "#!/bin/sh\n"+approveBook+"\n")
+	if st, err = DiscoverReview(context.Background(), f.repo, "shop", nil); err != nil || st.Rounds[0].Review.Status != "approve" {
+		t.Fatalf("after the reset: %+v %v", st, err)
+	}
+}
+
+// A process killed by a signal after printing the phrase is not a quota signal.
+func TestQuotaIgnoresAKilledProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a POSIX signal ends the shell only on Unix")
+	}
+	f := newFixture(t, map[string]string{"medio": `echo "` + quotaLine + `"; kill -9 $$`}, []string{"medio"}, "")
+	f.quotaProfile("medio")
+	st, log := f.run()
+	if strings.Contains(st.Question, "provider quota") {
+		t.Fatalf("a killed process read as quota: %q\n%s", st.Question, log)
 	}
 }

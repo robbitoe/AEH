@@ -594,7 +594,7 @@ func (ru *runner) runTask(ctx context.Context, t Task, ts *TaskState) (bool, str
 		}
 		if res.Uncertain && res.Quota != "" {
 			ts.Status = StatusBlocked
-			return false, fmt.Sprintf("Task %s stopped at %s: %s, then answer to retry. See the attempt artifacts.", t.ID, res.FailedGate, res.Quota), nil
+			return false, fmt.Sprintf("Task %s stopped at %s: %s, then %s. See the attempt artifacts.", t.ID, res.FailedGate, res.Quota, ru.retryHint()), nil
 		}
 		if res.Uncertain {
 			ts.Status = StatusBlocked
@@ -709,7 +709,7 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 			err := runErr
 			res.FailedGate, res.Feedback = "agent", err.Error()
 			res.Uncertain, res.Quota = uncertainExit(err), quotaNote(ru.cfg, profile, err)
-			if res.Uncertain && res.Quota == "" && !sandboxed {
+			if res.Uncertain && !sandboxed {
 				res.Worktree = wt
 			}
 			check(GateResult{Name: res.FailedGate, Output: res.Feedback, Uncertain: res.Uncertain, Quota: res.Quota, Sandboxed: sandboxed})
@@ -887,7 +887,7 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 		failed := gates[len(gates)-1]
 		res.FailedGate, res.Feedback = failed.Name, failed.Output
 		res.Uncertain, res.Quota = failed.Uncertain, failed.Quota
-		if res.Uncertain && res.Quota == "" {
+		if res.Uncertain {
 			res.Worktree = verified
 		}
 	}
@@ -1140,7 +1140,7 @@ func (ru *runner) completeTaskReviews(ctx context.Context, t Task, a *Attempt, m
 		ru.logf("    added %s review for %s: %s", role, t.ID, gateStatus(g))
 		question := ""
 		if !g.Passed {
-			keep = g.Uncertain && g.Quota == "" && !sandboxed
+			keep = g.Uncertain && !sandboxed
 			if keep {
 				a.Worktree = wt
 			}
@@ -1159,7 +1159,7 @@ func (ru *runner) completeTaskReviews(ctx context.Context, t Task, a *Attempt, m
 				}
 				a.SpecQuestion, ru.state.Cursor = c, c
 			case g.Uncertain && g.Quota != "":
-				question = fmt.Sprintf("Task %s required %s review stopped on its accepted SHA %s: %s, then answer to retry the missing review.", t.ID, role, a.Commit, g.Quota)
+				question = fmt.Sprintf("Task %s required %s review stopped on its accepted SHA %s: %s, then %s.", t.ID, role, a.Commit, g.Quota, ru.retryHint())
 			case g.Uncertain:
 				question += "Confirm all processes stopped and review possible effects before answering to retry. See the attempt artifacts."
 			case verdict.Verdict == "REJECT":
@@ -1313,6 +1313,15 @@ func (ru *runner) finalCheck(ctx context.Context) (_ bool, _ string, err error) 
 		return false, "", fmt.Errorf("integration branch changed during the final check")
 	}
 	return true, "", nil
+}
+
+// retryHint says how a run blocked on a provider's limit continues: an answer, or for
+// aeh do (which resumes only a SPEC-QUESTION) the command again.
+func (ru *runner) retryHint() string {
+	if strings.HasPrefix(ru.outcome.ID, "DO-") {
+		return "run `aeh do` again"
+	}
+	return "answer to retry"
 }
 
 func (ru *runner) block(question string) error {

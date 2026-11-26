@@ -1183,8 +1183,9 @@ func (p *planner) attempt(ctx context.Context, a *PlanAttempt, feedback string) 
 			outPath, err = runAgent(ctx, p.cfg.Profiles[a.Profile], p.cfg.PassEnv, wt, prompt, runDir, "plan")
 			if err != nil {
 				if note := quotaNote(p.cfg, a.Profile, err); note != "" {
+					keep = true
 					a.FailedStep, a.Feedback = "author", err.Error()
-					return p.blockNow(fmt.Sprintf("The plan author stopped: %s, then answer to retry.", note)), nil
+					return p.blockNow(fmt.Sprintf("The plan author stopped: %s, then answer to retry (worktree kept at %s).", note, wt)), nil
 				}
 				if uncertainExit(err) {
 					keep = true
@@ -1383,6 +1384,7 @@ func (p *planner) verifyFrozen(ctx context.Context, a *PlanAttempt) (string, err
 		question := ""
 		switch {
 		case g.Uncertain && g.Quota != "":
+			keep = !sandboxed
 			a.FailedStep, a.Feedback = "review", g.Output
 			question = p.blockNow(fmt.Sprintf("The %s review of the plan stopped: %s, then answer to retry.", role, g.Quota))
 		case g.Uncertain:

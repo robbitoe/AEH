@@ -63,3 +63,48 @@ func TestDockerSandboxedImplementerQuotaBlocks(t *testing.T) {
 		t.Fatalf("want a quota block: %+v\n%s", st, log)
 	}
 }
+
+// A sandboxed inspector that hits its limit blocks after one attempt.
+func TestDockerSandboxedInspectionQuotaBlocks(t *testing.T) {
+	image := testImageID(t)
+	f := newAdoptFixture(t, agentQuota)
+	sandboxedDiscoveryConfig(t, f, image, agentQuota, "")
+	addQuota(t, f.repo, "agent", "a")
+	f.commitCode("sandbox")
+	st, err := AdoptInventory(context.Background(), f.repo, "", nil)
+	if err == nil || !strings.Contains(err.Error(), `provider quota reached for profile "agent"`) || st.Status != StatusBlocked || len(st.Attempts) != 1 {
+		t.Fatalf("%v: %+v", err, st)
+	}
+}
+
+// An explicit, sandboxed review of the book that hits its limit keeps the round and says
+// to repeat aeh discover review.
+func TestDockerSandboxedExplicitBookReviewQuota(t *testing.T) {
+	image := testImageID(t)
+	f := newDiscoveryFixture(t, writeBook)
+	cfg := func(review string, quota bool) string {
+		q := ""
+		if quota {
+			q = quotaRule
+		}
+		return "project: test\ncommands:\n  test: \"true\"\nladder: [agent]\nreviewers:\n  qa: [qa]\n" +
+			"profiles:\n  agent:\n    provider: a\n    timeout_minutes: 2\n    command: [sh, -c, " + strconvQuote(writeBook) + ", aeh, \"{{prompt}}\"]\n" +
+			"  qa:\n    provider: b\n    timeout_minutes: 2\n    command: [sh, -c, " + strconvQuote(review) + "]\n" + q +
+			"sandbox:\n  image: \"" + image + "\"\n  agent_image: \"" + image + "\"\n  memory: 256m\n"
+	}
+	write(t, f.dir, "aeh/config.yaml", cfg("exit 3", false))
+	mustGit(t, f.dir, "add", "-A")
+	mustGit(t, f.dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "sandbox")
+	f.start()
+	if st := f.run(); len(st.Rounds) != 1 || st.Rounds[0].Review.Status != "invalid" {
+		t.Fatalf("want an invalid review: %+v", st)
+	}
+	write(t, f.dir, "aeh/config.yaml", cfg(agentQuota, true))
+	_, err := DiscoverReview(context.Background(), f.repo, "shop", nil)
+	if err == nil || !strings.Contains(err.Error(), `provider quota reached for profile "qa"`) || !strings.Contains(err.Error(), "aeh discover review shop") {
+		t.Fatalf("want a quota stop naming discover review: %v", err)
+	}
+	if st, _, err := LoadDiscovery(f.repo, "shop"); err != nil || st.Rounds[0].Review.Status != "invalid" {
+		t.Fatalf("the round changed: %+v %v", st, err)
+	}
+}

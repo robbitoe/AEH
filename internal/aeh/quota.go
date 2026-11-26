@@ -85,7 +85,7 @@ func quotaSignal(p Profile, code int, outPath string) error {
 }
 
 // ansiEscape matches terminal escape sequences (CSI and OSC), removed before matching.
-var ansiEscape = regexp.MustCompile(`\x1b(\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(\x07|\x1b\\))`)
+var ansiEscape = regexp.MustCompile(`\x1b(\[[0-9;:?<=>]*[ -/]*[@-~]|\][^\x07\x1b]*(\x07|\x1b\\))`)
 
 // fileTail reads up to n bytes from the end of a file; a file that cannot be read gives "".
 func fileTail(path string, n int64) string {
