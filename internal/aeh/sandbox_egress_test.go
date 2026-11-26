@@ -99,7 +99,8 @@ func egressTestImage(t *testing.T, s *sandbox) sandboxImage {
 	if _, err := s.d.run(context.Background(), &tb, nil, "cp", "-", cid+":/usr/local/bin"); err != nil {
 		t.Fatal(err)
 	}
-	id, err := s.d.admin("commit", cid)
+	// A stop signal of the image's own must not reach the proxy.
+	id, err := s.d.admin("commit", "--change", "STOPSIGNAL SIGQUIT", cid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +124,12 @@ echo "proxy=$HTTPS_PROXY"
 echo "unlisted: $(ask other.example.com:443)"
 echo "private: $(ask localhost:80)"
 if wget -q -T 3 -O /dev/null http://1.1.1.1/ 2>/dev/null; then echo DIRECT-REACHED; else echo direct-refused; fi
-if [ -n "$AEH_TEST_EGRESS_NET" ]; then echo "allowed: $(ask example.com:443)"; fi
+if [ -n "$AEH_TEST_EGRESS_NET" ]; then
+  echo "allowed: $(ask example.com:443)"
+  # A tunnel still open when the agent exits.
+  (printf 'CONNECT example.com:443 HTTP/1.1\r\n\r\n'; sleep 60) | nc 127.0.0.1 3128 >/dev/null 2>&1 &
+  sleep 2
+fi
 ls /egress`
 	p := Profile{Command: []string{"sh", "-c", script}, Sandbox: &ProfileSandbox{Egress: []string{"example.com:443", "localhost:80"}}}
 	if os.Getenv("AEH_TEST_EGRESS_NET") != "" {
@@ -144,7 +150,13 @@ ls /egress`
 	if os.Getenv("AEH_TEST_EGRESS_NET") != "" && !strings.Contains(text, "allowed: HTTP/1.1 200") {
 		t.Errorf("declared pair not reached:\n%s", text)
 	}
-	log, err := os.ReadFile(filepath.Join(dir, "a.egress.log"))
+	if os.Getenv("AEH_TEST_EGRESS_NET") != "" {
+		// The tunnel left open when the agent exits is still recorded.
+		if l, _ := os.ReadFile(filepath.Join(dir, "a.egress.log")); strings.Count(string(l), `"verdict":"allow"`) != 2 {
+			t.Errorf("open tunnel not logged:\n%s", l)
+		}
+	}
+	log, err :=os.ReadFile(filepath.Join(dir, "a.egress.log"))
 	if err != nil || !strings.Contains(string(log), `"host":"other.example.com"`) || !strings.Contains(string(log), "not in the egress list") ||
 		!strings.Contains(string(log), "no public address") {
 		t.Fatalf("proxy log %v:\n%s", err, log)

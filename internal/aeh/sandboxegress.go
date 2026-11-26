@@ -81,7 +81,8 @@ func (s *sandbox) startEgress(ctx context.Context, id, kind string, pairs []stri
 	}
 	defer os.Remove(envFile)
 	args := append([]string{"create", "--pull=never"}, s.labels(id, kind, "egress")...)
-	args = append(args, "--network", "bridge", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+	// The stop signal is aeh's, not the image's: the proxy logs its open tunnels on SIGTERM.
+	args = append(args, "--stop-signal", "SIGTERM", "--network", "bridge", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
 		"--memory", egressMemory, "--memory-swap", egressMemory, "--cpus", egressCPUs, "--read-only", "--pids-limit", "128",
 		"--tmpfs", "/tmp:mode=1777", "--tmpfs", sandboxHome+":uid=10001,gid=10001,mode=0700",
 		"--user", sandboxUser, "--workdir", l.Workdir, "--env-file", envFile, "--entrypoint", l.Argv[0],
@@ -104,6 +105,9 @@ func (s *sandbox) startEgress(ctx context.Context, id, kind string, pairs []stri
 	}
 	if err := s.checkCreated(created, l, vols, want); err != nil {
 		return "", "", err
+	}
+	if created.Config.StopSignal != "SIGTERM" {
+		return "", "", fmt.Errorf("the proxy's stop signal is %q, not SIGTERM", created.Config.StopSignal)
 	}
 	if _, err := s.d.run(ctx, nil, nil, "start", cid); err != nil {
 		return "", "", err
@@ -135,6 +139,14 @@ func (s *sandbox) endEgress(cid string, w io.Writer) error {
 	}
 	if ierr == nil && !running {
 		errs = append(errs, fmt.Errorf("the proxy stopped during the launch (state %s, exit %d%s)", st.State.Status, st.State.ExitCode, stateError(st)))
+	} else if ierr == nil {
+		// A proxy that shut down by itself exits 0 after logging every tunnel; anything
+		// else (killed after the stop timeout) may have lost lines.
+		if after, err := s.inspect(cid); err != nil {
+			errs = append(errs, fmt.Errorf("inspect the stopped proxy: %w", err))
+		} else if after.State.Status != "exited" || after.State.ExitCode != 0 || after.State.OOMKilled {
+			errs = append(errs, fmt.Errorf("the proxy did not shut down cleanly (state %s, exit %d); its log may be incomplete", after.State.Status, after.State.ExitCode))
+		}
 	}
 	return errors.Join(errs...)
 }

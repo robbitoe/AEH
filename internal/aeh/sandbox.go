@@ -633,6 +633,7 @@ type containerState struct {
 		WorkingDir string   `json:"WorkingDir"`
 		Entrypoint []string `json:"Entrypoint"`
 		Cmd        []string `json:"Cmd"`
+		StopSignal string   `json:"StopSignal"`
 	} `json:"Config"`
 	HostConfig struct {
 		NetworkMode    string            `json:"NetworkMode"`
