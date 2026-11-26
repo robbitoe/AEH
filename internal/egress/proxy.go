@@ -273,23 +273,26 @@ func (p *Proxy) handle(c net.Conn) {
 		return
 	}
 	defer up.Close()
+	// From here on the connection was made: every path logs it once.
+	entry.Verdict = "allow"
+	defer func() { p.log(entry) }()
 	if !p.track(up) {
+		entry.Reason = "proxy shut down before the tunnel opened"
 		return
 	}
 	defer p.untrack(up)
 	_ = c.SetDeadline(time.Time{})
 	if _, err := io.WriteString(c, "HTTP/1.1 200 Connection established\r\n\r\n"); err != nil {
+		entry.Reason = "client gone before the tunnel opened"
 		return
 	}
 	// Bytes the client sent after the request are already buffered.
 	pending := make([]byte, br.Buffered())
 	_, _ = io.ReadFull(br, pending)
 	entry.Up, entry.Down = splice(c, up, pending, time.Duration(p.Policy.IdleSeconds)*time.Second, p.count)
-	entry.Verdict = "allow"
 	if p.bytes.Load() >= p.Policy.MaxBytes {
 		entry.Reason = "byte limit reached"
 	}
-	p.log(entry)
 }
 
 func (p *Proxy) resolve(ctx context.Context, host string) ([]netip.Addr, error) {

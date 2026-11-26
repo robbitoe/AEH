@@ -883,12 +883,27 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 		return infra(err)
 	}
 	var proxy string // the egress proxy's container
+	egressEnded := false
+	finishEgress := func() error {
+		if proxy == "" || egressEnded {
+			return nil
+		}
+		egressEnded = true
+		return s.endEgress(proxy, l.EgressLog)
+	}
 	if len(l.Egress) > 0 {
 		sock, cid, err := s.startEgress(ctx, in.ID, l.Kind, l.Egress)
 		if err != nil {
 			return infra(fmt.Errorf("egress proxy: %w", err))
 		}
 		proxy = cid
+		// Every exit from here on stops the proxy and keeps its log before release
+		// removes it; the paths below that check the proxy do so through finishEgress.
+		defer func() {
+			if ferr := finishEgress(); ferr != nil && res.Class != ClassProcess {
+				res.Reason += " (egress proxy: " + ferr.Error() + ")"
+			}
+		}()
 		vols = append(vols, sandboxVolume{Name: sock, Target: egressDir, ReadOnly: true})
 		l.Argv = append([]string{"aeh-egress", "launch", "--socket", egressSocket, "--listen", egressListen, "--"}, l.Argv...)
 	}
@@ -978,10 +993,8 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 			reason = fmt.Sprintf("timed out after %s", l.Timeout)
 		}
-		if proxy != "" {
-			if err := s.endEgress(proxy, l.EgressLog); err != nil {
-				reason += " (egress proxy: " + err.Error() + ")"
-			}
+		if err := finishEgress(); err != nil {
+			reason += " (egress proxy: " + err.Error() + ")"
 		}
 		return LaunchResult{Class: ClassTerminated, ExitCode: -1, Reason: reason}, nil
 	}
@@ -998,7 +1011,7 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 		// agent's failures unexplained. The launcher's own exit code says it could not
 		// run the program behind the forwarder.
 		var problem error
-		if err := s.endEgress(proxy, l.EgressLog); err != nil {
+		if err := finishEgress(); err != nil {
 			problem = fmt.Errorf("egress proxy: %w", err)
 		} else if res.Class == ClassProcess && res.ExitCode == egress.LauncherFailed {
 			problem = fmt.Errorf("the egress launcher failed (exit %d); its reason is in the launch's stderr", egress.LauncherFailed)
