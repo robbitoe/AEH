@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -18,38 +17,43 @@ import (
 // it as an infrastructure failure of an agent launch with egress.
 const LauncherFailed = 251
 
+const (
+	// forwardMax bounds the forwarder's open connections; the proxy's own limit is lower,
+	// so extra connections only ever get the proxy's refusal.
+	forwardMax = 256
+	// forwardIdle closes a relay with no traffic either way, beyond the proxy's idle time.
+	forwardIdle = 20 * time.Minute
+)
+
 // Forward accepts connections on l and relays each to the proxy's Unix socket. The proxy
-// applies every limit; the forwarder only joins the two sides.
+// applies the policy; the forwarder bounds its own connections and idle relays.
 func Forward(l net.Listener, socket string) error {
+	return forward(l, socket, forwardIdle)
+}
+
+func forward(l net.Listener, socket string, idle time.Duration) error {
+	slots := make(chan struct{}, forwardMax)
 	for {
 		c, err := l.Accept()
 		if err != nil {
 			return err
 		}
+		select {
+		case slots <- struct{}{}:
+		default:
+			_ = c.Close()
+			continue
+		}
 		go func() {
+			defer func() { <-slots }()
 			u, err := net.DialTimeout("unix", socket, 10*time.Second)
 			if err != nil {
 				_ = c.Close()
 				return
 			}
-			relay(c, u)
+			splice(c, u, nil, idle, nil)
 		}()
 	}
-}
-
-func relay(a, b net.Conn) {
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(b, a)
-		closeWrite(b)
-	}()
-	_, _ = io.Copy(a, b)
-	closeWrite(a)
-	wg.Wait()
-	_ = a.Close()
-	_ = b.Close()
 }
 
 // waitSocket waits until the proxy accepts connections on its socket.

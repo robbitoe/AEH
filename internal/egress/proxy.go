@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -33,11 +32,16 @@ type Proxy struct {
 	// Log receives one JSON line per request: host, port, bytes and verdict only.
 	Log io.Writer
 
-	allow  map[string]bool
-	slots  chan struct{}
-	bytes  atomic.Int64
-	logMu  sync.Mutex
-	logged int
+	allow    map[string]bool
+	slots    chan struct{}
+	bytes    atomic.Int64
+	logMu    sync.Mutex
+	logged   int
+	mu       sync.Mutex
+	open     map[net.Conn]bool
+	listener net.Listener
+	closing  bool
+	handlers sync.WaitGroup
 }
 
 // logEntry is one line of the proxy's log. It holds no path, header or content.
@@ -69,16 +73,25 @@ func (p *Proxy) log(e logEntry) {
 	_, _ = p.Log.Write(append(b, '\n'))
 }
 
-// Serve accepts connections until the listener fails.
+// Serve accepts connections until the listener fails or Shutdown closes it.
 func (p *Proxy) Serve(l net.Listener) error {
 	if err := p.Policy.Validate(); err != nil {
 		return err
 	}
+	p.mu.Lock()
 	p.allow = map[string]bool{}
 	for _, a := range p.Policy.Allow {
 		p.allow[a] = true
 	}
 	p.slots = make(chan struct{}, p.Policy.MaxConnections)
+	p.open = map[net.Conn]bool{}
+	p.listener = l
+	closing := p.closing
+	p.mu.Unlock()
+	if closing {
+		_ = l.Close()
+		return net.ErrClosed
+	}
 	for {
 		c, err := l.Accept()
 		if err != nil {
@@ -86,8 +99,16 @@ func (p *Proxy) Serve(l net.Listener) error {
 		}
 		select {
 		case p.slots <- struct{}{}:
+			if !p.track(c) {
+				<-p.slots
+				_ = c.Close()
+				continue
+			}
+			p.handlers.Add(1)
 			go func() {
+				defer p.handlers.Done()
 				defer func() { <-p.slots }()
+				defer p.untrack(c)
 				p.handle(c)
 			}()
 		default:
@@ -98,6 +119,47 @@ func (p *Proxy) Serve(l net.Listener) error {
 	}
 }
 
+// track registers an open connection so Shutdown can close it; it refuses once the
+// proxy is closing.
+func (p *Proxy) track(c net.Conn) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closing {
+		return false
+	}
+	p.open[c] = true
+	return true
+}
+
+func (p *Proxy) untrack(c net.Conn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.open, c)
+}
+
+// Shutdown stops accepting, closes every open connection and waits up to wait for the
+// handlers to write their final log lines, with the bytes each tunnel carried.
+func (p *Proxy) Shutdown(wait time.Duration) {
+	p.mu.Lock()
+	p.closing = true
+	if p.listener != nil {
+		_ = p.listener.Close()
+	}
+	for c := range p.open {
+		_ = c.Close()
+	}
+	p.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		p.handlers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(wait):
+	}
+}
+
 func reply(c net.Conn, code int) {
 	_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	_, _ = io.WriteString(c, "HTTP/1.1 "+strconv.Itoa(code)+" "+http.StatusText(code)+"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -105,8 +167,9 @@ func reply(c net.Conn, code int) {
 
 func (p *Proxy) handle(c net.Conn) {
 	defer c.Close()
-	connect := time.Duration(p.Policy.ConnectSeconds) * time.Second
-	_ = c.SetDeadline(time.Now().Add(connect))
+	// One deadline covers reading the request, resolving the name and connecting.
+	deadline := time.Now().Add(time.Duration(p.Policy.ConnectSeconds) * time.Second)
+	_ = c.SetDeadline(deadline)
 	br := bufio.NewReaderSize(io.LimitReader(c, requestLimit), 4096)
 	req, err := http.ReadRequest(br)
 	if err != nil {
@@ -121,6 +184,7 @@ func (p *Proxy) handle(c net.Conn) {
 	}
 	host, port, key, err := normalizeTarget(req.RequestURI)
 	if err != nil {
+		// Nothing of an invalid target is logged: it could carry anything.
 		p.log(logEntry{Verdict: "deny", Reason: "malformed target"})
 		reply(c, http.StatusBadRequest)
 		return
@@ -139,7 +203,7 @@ func (p *Proxy) handle(c net.Conn) {
 		deny(http.StatusForbidden, "byte limit reached")
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), connect)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	addrs, err := p.resolve(ctx, host)
 	if err != nil {
@@ -151,20 +215,22 @@ func (p *Proxy) handle(c net.Conn) {
 		allowed = Public
 	}
 	var up net.Conn
-	refused := false
+	refused, tried := false, false
 	for _, a := range addrs {
 		a = a.Unmap()
 		if !allowed(a) {
 			refused = true
 			continue
 		}
+		tried = true
 		var d net.Dialer
 		if up, err = d.DialContext(ctx, "tcp", netip.AddrPortFrom(a, port).String()); err == nil {
 			break
 		}
+		up = nil
 	}
 	if up == nil {
-		if refused && err == nil {
+		if refused && !tried {
 			deny(http.StatusForbidden, "no public address")
 		} else {
 			deny(http.StatusBadGateway, "connection failed")
@@ -172,6 +238,10 @@ func (p *Proxy) handle(c net.Conn) {
 		return
 	}
 	defer up.Close()
+	if !p.track(up) {
+		return
+	}
+	defer p.untrack(up)
 	_ = c.SetDeadline(time.Time{})
 	if _, err := io.WriteString(c, "HTTP/1.1 200 Connection established\r\n\r\n"); err != nil {
 		return
@@ -179,7 +249,7 @@ func (p *Proxy) handle(c net.Conn) {
 	// Bytes the client sent after the request are already buffered.
 	pending := make([]byte, br.Buffered())
 	_, _ = io.ReadFull(br, pending)
-	entry.Up, entry.Down = p.tunnel(c, up, pending)
+	entry.Up, entry.Down = splice(c, up, pending, time.Duration(p.Policy.IdleSeconds)*time.Second, p.count)
 	entry.Verdict = "allow"
 	if p.bytes.Load() >= p.Policy.MaxBytes {
 		entry.Reason = "byte limit reached"
@@ -197,77 +267,7 @@ func (p *Proxy) resolve(ctx context.Context, host string) ([]netip.Addr, error) 
 	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 }
 
-// tunnel copies both ways until both directions end, the tunnel is idle for the policy's
-// time or the launch's byte limit is reached.
-func (p *Proxy) tunnel(client, up net.Conn, pending []byte) (sent, received int64) {
-	idle := time.Duration(p.Policy.IdleSeconds) * time.Second
-	var last atomic.Int64
-	last.Store(time.Now().UnixNano())
-	var once sync.Once
-	closeBoth := func() { once.Do(func() { _ = client.Close(); _ = up.Close() }) }
-	if len(pending) > 0 {
-		if !p.count(int64(len(pending))) {
-			closeBoth()
-			return 0, 0
-		}
-		if _, err := up.Write(pending); err != nil {
-			closeBoth()
-			return 0, 0
-		}
-		sent = int64(len(pending))
-	}
-	pipe := func(dst, src net.Conn, n *int64) {
-		buf := make([]byte, 32<<10)
-		for {
-			_ = src.SetReadDeadline(time.Now().Add(idle))
-			k, err := src.Read(buf)
-			if k > 0 {
-				last.Store(time.Now().UnixNano())
-				if !p.count(int64(k)) {
-					closeBoth()
-					return
-				}
-				if _, werr := dst.Write(buf[:k]); werr != nil {
-					closeBoth()
-					return
-				}
-				*n += int64(k)
-			}
-			if err != nil {
-				var ne net.Error
-				if errors.As(err, &ne) && ne.Timeout() && time.Since(time.Unix(0, last.Load())) < idle {
-					continue // the other direction is active
-				}
-				if errors.Is(err, io.EOF) {
-					closeWrite(dst)
-					return
-				}
-				closeBoth()
-				return
-			}
-		}
-	}
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		pipe(client, up, &received)
-	}()
-	pipe(up, client, &sent)
-	wg.Wait()
-	closeBoth()
-	return sent, received
-}
-
 // count adds n bytes to the launch's total and reports whether it stays within the limit.
 func (p *Proxy) count(n int64) bool {
 	return p.bytes.Add(n) <= p.Policy.MaxBytes
-}
-
-func closeWrite(c net.Conn) {
-	if cw, ok := c.(interface{ CloseWrite() error }); ok {
-		_ = cw.CloseWrite()
-		return
-	}
-	_ = c.Close()
 }

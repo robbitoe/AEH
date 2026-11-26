@@ -323,3 +323,77 @@ func TestLaunch(t *testing.T) {
 		t.Fatalf("missing program: exit %d", code)
 	}
 }
+
+// A target with anything besides a host and a port is refused, and the log names no host.
+func TestMalformedTargetsStayOutOfTheLog(t *testing.T) {
+	target := echoServer(t)
+	_, port, _ := net.SplitHostPort(target)
+	socket, logs := startProxy(t, DefaultPolicy([]string{"api.example.com:" + port}), target)
+	for _, tgt := range []string{"api.example.com/path?token=secret:443", "user:secret@api.example.com:443", "[fe80::1%eth0]:443",
+		strings.Repeat("a", 280) + ".com:443"} {
+		if _, _, code := connect(t, socket, "CONNECT "+tgt+" HTTP/1.1\r\n\r\n"); code != 400 {
+			t.Errorf("%.40s: %d", tgt, code)
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+	if log := logs.String(); strings.Contains(log, "secret") || strings.Contains(log, `"host"`) {
+		t.Fatalf("log:\n%s", log)
+	}
+}
+
+// A peer that stops reading cannot hold a relay open: the watchdog ends it, blocked
+// writes included.
+func TestSpliceEndsWhenNobodyReads(t *testing.T) {
+	a1, a2 := net.Pipe()
+	b1, b2 := net.Pipe()
+	defer a1.Close()
+	defer b1.Close()
+	go func() {
+		for {
+			if _, err := b1.Write(make([]byte, 1024)); err != nil {
+				return
+			}
+		}
+	}()
+	done := make(chan struct{})
+	go func() {
+		splice(a2, b2, nil, 300*time.Millisecond, nil)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the relay outlived its idle time")
+	}
+}
+
+// Shutdown closes open tunnels and each still writes its log line.
+func TestShutdownLogsOpenTunnels(t *testing.T) {
+	target := echoServer(t)
+	_, port, _ := net.SplitHostPort(target)
+	tap := netip.MustParseAddrPort(target)
+	dir, _ := os.MkdirTemp("", "egr")
+	defer os.RemoveAll(dir)
+	socket := filepath.Join(dir, "p.sock")
+	l, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Skipf("no Unix sockets here: %v", err)
+	}
+	logs := &syncBuffer{}
+	p := &Proxy{Policy: DefaultPolicy([]string{"api.example.com:" + port}), Log: logs,
+		Resolve: func(context.Context, string) ([]netip.Addr, error) { return []netip.Addr{tap.Addr()}, nil },
+		Allowed: func(a netip.Addr) bool { return a == tap.Addr() }}
+	go p.Serve(l)
+	c, br, code := connect(t, socket, "CONNECT api.example.com:"+port+" HTTP/1.1\r\n\r\nping\n")
+	if code != 200 {
+		t.Fatal(code)
+	}
+	if line, _ := br.ReadString('\n'); line != "PING\n" {
+		t.Fatalf("%q", line)
+	}
+	p.Shutdown(5 * time.Second)
+	_ = c
+	if log := logs.String(); !strings.Contains(log, `"verdict":"allow"`) || !strings.Contains(log, `"up":5`) {
+		t.Fatalf("log after shutdown:\n%s", log)
+	}
+}

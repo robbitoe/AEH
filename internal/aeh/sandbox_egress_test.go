@@ -158,9 +158,17 @@ func TestDockerEgressFailuresAreInfrastructure(t *testing.T) {
 	s, _ := dockerSandbox(t, SandboxConfig{})
 	s.agent = egressTestImage(t, s)
 	p := Profile{Command: []string{"/no/such/program"}, Sandbox: &ProfileSandbox{Egress: []string{"example.com:443"}}}
-	_, res, err := s.runAgent(context.Background(), agentLaunch{Kind: "review", Profile: p, Prompt: "x", RunDir: t.TempDir(), LogName: "a"})
+	dir := t.TempDir()
+	_, res, err := s.runAgent(context.Background(), agentLaunch{Kind: "review", Profile: p, Prompt: "x", RunDir: dir, LogName: "a"})
 	if err != nil || res.Class != ClassInfrastructure || !strings.Contains(res.Reason, "egress launcher failed") {
 		t.Fatalf("missing program: %+v %v", res, err)
+	}
+	// The launcher's reason is kept, and no launch file stays behind.
+	if stderr, _ := os.ReadFile(filepath.Join(dir, "a.err")); !strings.Contains(string(stderr), "aeh-egress: start /no/such/program") {
+		t.Fatalf("launcher stderr %q", stderr)
+	}
+	if left, _ := os.ReadDir(filepath.Join(s.dir, "env")); len(left) != 0 {
+		t.Fatalf("environment files left: %v", left)
 	}
 	assertNoLeftovers(t, s)
 

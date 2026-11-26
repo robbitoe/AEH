@@ -117,7 +117,8 @@ func (s *sandbox) endEgress(ctx context.Context, cid string, w io.Writer) error 
 		return err
 	}
 	running := st.State.Status == "running"
-	if _, err := s.d.admin("kill", cid); err != nil && running {
+	// A stop sends SIGTERM first: the proxy closes its tunnels and logs each one's bytes.
+	if _, err := s.d.admin("stop", "--time", "10", cid); err != nil && running {
 		return err
 	}
 	if w != nil {

@@ -17,6 +17,8 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/robbitoe/aeh/internal/egress"
@@ -89,7 +91,19 @@ func proxy(socket, policyFile string) error {
 	if err != nil {
 		return err
 	}
-	return (&egress.Proxy{Policy: p, Log: os.Stdout}).Serve(l)
+	// SIGTERM (docker stop) closes every tunnel and lets each write its final log line.
+	px := &egress.Proxy{Policy: p, Log: os.Stdout}
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM, os.Interrupt)
+	served := make(chan error, 1)
+	go func() { served <- px.Serve(l) }()
+	select {
+	case <-sigs:
+		px.Shutdown(5 * time.Second)
+		return nil
+	case err := <-served:
+		return err
+	}
 }
 
 func usage() {

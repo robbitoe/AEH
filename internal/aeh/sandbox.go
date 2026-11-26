@@ -515,8 +515,10 @@ func (s *sandbox) release(id string) error {
 		return fmt.Errorf("sandbox cleanup %s: removal not confirmed; Docker objects labeled aeh.launch=%s remain: %v", id, id, err)
 	}
 	// Launch-local files go with the Docker objects; the intent is the last to go.
-	if err := os.Remove(filepath.Join(s.dir, "env", id+".env")); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("sandbox cleanup %s: %w", id, err)
+	for _, name := range []string{id + ".env", id + "-egress.env"} {
+		if err := os.Remove(filepath.Join(s.dir, "env", name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("sandbox cleanup %s: %w", id, err)
+		}
 	}
 	if err := os.Remove(filepath.Join(s.intentDir(), id+".json")); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("sandbox cleanup %s: %w", id, err)
@@ -993,11 +995,18 @@ func (s *sandbox) run(ctx context.Context, l sandboxLaunch, after func(container
 		// The proxy must have served the whole launch: one that stopped leaves the
 		// agent's failures unexplained. The launcher's own exit code says it could not
 		// run the program behind the forwarder.
+		var problem error
 		if err := s.endEgress(ctx, proxy, l.EgressLog); err != nil {
-			return infra(fmt.Errorf("egress proxy: %w", err))
+			problem = fmt.Errorf("egress proxy: %w", err)
+		} else if res.Class == ClassProcess && res.ExitCode == egress.LauncherFailed {
+			problem = fmt.Errorf("the egress launcher failed (exit %d); its reason is in the launch's stderr", egress.LauncherFailed)
 		}
-		if res.Class == ClassProcess && res.ExitCode == egress.LauncherFailed {
-			return infra(fmt.Errorf("the egress launcher failed (exit %d); its reason is in the launch's stderr", egress.LauncherFailed))
+		if problem != nil {
+			// The output still explains what happened; the result stays infrastructure.
+			if l.Output != nil {
+				_ = s.logs(ctx, cid, l.Output, l.Stderr)
+			}
+			return infra(problem)
 		}
 	}
 	if l.SaveSession != nil && res.Class == ClassProcess {

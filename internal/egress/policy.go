@@ -119,8 +119,13 @@ func checkName(host string) error {
 	return nil
 }
 
-// normalizeTarget turns a CONNECT target into the form pairs are written in.
+// normalizeTarget turns a CONNECT target into the form pairs are written in. A target
+// whose host is neither a valid name nor an address is refused, so nothing else (a path,
+// user information, a long string) ever reaches the log.
 func normalizeTarget(target string) (host string, port uint16, key string, err error) {
+	if len(target) > 300 {
+		return "", 0, "", errors.New("target too long")
+	}
 	h, p, err := net.SplitHostPort(target)
 	if err != nil {
 		return "", 0, "", err
@@ -131,7 +136,12 @@ func normalizeTarget(target string) (host string, port uint16, key string, err e
 	}
 	h = strings.TrimSuffix(strings.ToLower(h), ".")
 	if a, err := netip.ParseAddr(h); err == nil {
+		if a.Zone() != "" {
+			return "", 0, "", errors.New("zoned address")
+		}
 		h = a.String()
+	} else if err := checkName(h); err != nil {
+		return "", 0, "", err
 	}
 	return h, uint16(n), net.JoinHostPort(h, strconv.Itoa(n)), nil
 }
