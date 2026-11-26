@@ -499,3 +499,32 @@ func TestShutdownFailsWhenALineIsStuck(t *testing.T) {
 		t.Fatal("a stuck log line was not reported")
 	}
 }
+
+// A connection that closes before sending anything (the launcher's readiness probe) is
+// not logged; one that sends any byte is, including lines that end in io.EOF because they
+// fill the read buffer or reach the request limit.
+func TestEmptyConnectionIsNotLogged(t *testing.T) {
+	target := echoServer(t)
+	_, port, _ := net.SplitHostPort(target)
+	socket, logs := startProxy(t, DefaultPolicy([]string{"api.example.com:" + port}), target)
+	sends := []string{"", "CONN", strings.Repeat("A", 4096), strings.Repeat("A", requestLimit+100), ""}
+	for _, s := range sends {
+		c, err := net.Dial("unix", socket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = c.Write([]byte(s))
+		_ = c.(*net.UnixConn).CloseWrite()
+		_, _ = io.Copy(io.Discard, c) // the proxy's answer, if any, then its close
+		c.Close()
+	}
+	want := 3 // every send but the two empty ones
+	deadline := time.Now().Add(2 * time.Second)
+	for strings.Count(logs.String(), "malformed request") < want && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := strings.Count(logs.String(), "\n"); n != want || strings.Count(logs.String(), "malformed request") != want {
+		t.Fatalf("want %d malformed requests logged:\n%s", want, logs.String())
+	}
+}

@@ -103,10 +103,10 @@ Each agent launch gets only what its step needs:
 - **Network.** An agent container has no network. A profile's `sandbox.egress` pairs are reachable only through a proxy started for that launch (see [Network](#network)). Gates keep no network.
 - **Sign-in.** A CLI authenticates through variables in `sandbox.pass_env` (for example an API key) or through a session kept by aeh (below).
 - **Sealed tests you approved by hand** (`aeh tests approve`) must be committed exactly as approved: every sealed file tracked, no untracked file under the acceptance paths, and the same bytes in the commit (line endings converted by `core.autocrlf` are accepted). Containers run the committed bytes, so a test Git ignores or a filter rewrites would otherwise not be the one that runs.
-- **Codex profiles** need `--skip-git-repo-check`, because `/work` is not a Git repository.
+- **Codex profiles** need `--skip-git-repo-check`, because `/work` is not a Git repository, and `--sandbox danger-full-access`: Codex's own sandbox needs bubblewrap and user namespaces, which the container refuses, so with `workspace-write` or `read-only` the agent has no shell and cannot write files. The container is the sandbox. Keep the original mode for any profile that runs on the host.
 - **Failures.** If Docker or the image fails during a launch, the step blocks with the reason without consuming a ladder attempt. A triage that cannot finish for such a reason is not replaced by the default route: the command stops and triages again next time.
 
-`aeh sandbox check` also runs a throwaway container from the agent image and warns about every profile whose program the image lacks, about `aeh-egress` when a profile declares egress, and about every profile without `sandbox.egress`. Each launch writes `<log>.launch.json` beside its output, with the class, exit code, image, network, the commit at `/work`, the memory commit and the captured candidate. The contracts of runs and plans pin policy 3, the agent image and every profile's `sandbox.pass_env`, `sandbox.session` and `sandbox.egress`; a run or plan started under policy 2 (agents on Docker's default network) does not resume and needs a new outcome or plan. Discovery sessions and adoption areas do not pin them: their outputs are documents you review, and each command uses the current configuration.
+`aeh sandbox check` also runs a throwaway container from the agent image and warns about every profile whose program the image lacks, about `aeh-egress` when a profile declares egress, and about every profile without `sandbox.egress`, and about every Codex profile that asks for its own sandbox. Each launch writes `<log>.launch.json` beside its output, with the class, exit code, image, network, the commit at `/work`, the memory commit and the captured candidate. The contracts of runs and plans pin policy 3, the agent image and every profile's `sandbox.pass_env`, `sandbox.session` and `sandbox.egress`; a run or plan started under policy 2 (agents on Docker's default network) does not resume and needs a new outcome or plan. Discovery sessions and adoption areas do not pin them: their outputs are documents you review, and each command uses the current configuration.
 
 ### Network
 
@@ -116,7 +116,7 @@ An agent container never has a network of its own: Docker's `none` mode leaves o
 profiles:
   medio:
     provider: openai
-    command: [codex, exec, --skip-git-repo-check, "{{prompt}}"]
+    command: [codex, exec, --skip-git-repo-check, --sandbox, danger-full-access, "{{prompt}}"]
     sandbox:
       egress: [api.openai.com:443, chatgpt.com:443, auth.openai.com:443]
 ```
@@ -130,7 +130,14 @@ For each launch of a profile with egress, aeh starts a second container from the
 - **Failures.** A proxy that stops during the launch, or a launcher that cannot reach it or start the CLI (exit code 251), blocks the step as an infrastructure failure, without consuming a ladder attempt.
 - **A profile without `sandbox.egress`** has no network at all; `aeh sandbox check` warns about it. Local HTTP providers on the host (LM Studio) are not supported inside the sandbox.
 
-`aeh-egress` is built into the agent image from this repository (see `docs/sandbox/Dockerfile.agents`). The exact pairs a CLI needs depend on its version and sign-in method; the proxy log shows what it tried to reach.
+`aeh-egress` is built into the agent image from this repository (see `docs/sandbox/Dockerfile.agents`). The exact pairs a CLI needs depend on its version and sign-in method; the proxy log shows what it tried to reach. Measured on 2026-11-26:
+
+| CLI | Sign-in | Pairs used |
+| --- | --- | --- |
+| Claude Code 2.1.322, with `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"` in the profile's `env` | `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) in `sandbox.pass_env` | `api.anthropic.com:443` |
+| Codex 0.167.2 | ChatGPT session (`aeh sandbox login`) | `chatgpt.com:443`, plus `auth.openai.com:443` for the login |
+
+Codex also tries `*.oaiusercontent.com` and `ab.chatgpt.com`; refusing them did not affect its work.
 
 ### Sessions
 
@@ -140,7 +147,7 @@ A profile that signs in with a subscription instead of an API key declares the f
 profiles:
   medio:
     provider: openai
-    command: [codex, exec, --skip-git-repo-check, "{{prompt}}"]
+    command: [codex, exec, --skip-git-repo-check, --sandbox, danger-full-access, "{{prompt}}"]
     sandbox:
       session: [.codex/auth.json]
       login: [codex, login, --device-auth]
