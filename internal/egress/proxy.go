@@ -34,6 +34,7 @@ type Proxy struct {
 
 	allow    map[string]bool
 	slots    chan struct{}
+	refusals chan struct{}
 	bytes    atomic.Int64
 	logMu    sync.Mutex
 	logged   int
@@ -86,6 +87,7 @@ func (p *Proxy) Serve(l net.Listener) error {
 		p.allow[a] = true
 	}
 	p.slots = make(chan struct{}, p.Policy.MaxConnections)
+	p.refusals = make(chan struct{}, 16)
 	p.open = map[net.Conn]bool{}
 	p.listener = l
 	if p.ctx == nil {
@@ -117,8 +119,21 @@ func (p *Proxy) Serve(l net.Listener) error {
 			}()
 		default:
 			p.log(logEntry{Verdict: "deny", Reason: "too many connections"})
-			reply(c, http.StatusServiceUnavailable)
-			_ = c.Close()
+			select {
+			case p.refusals <- struct{}{}:
+				// The request is read before the refusal: closing a socket with unread
+				// input resets it on some systems, and the client would never see the
+				// answer. A few refusals run at a time; beyond that the socket just closes.
+				go func() {
+					defer func() { <-p.refusals }()
+					_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+					_, _ = http.ReadRequest(bufio.NewReader(io.LimitReader(c, requestLimit)))
+					reply(c, http.StatusServiceUnavailable)
+					_ = c.Close()
+				}()
+			default:
+				_ = c.Close()
+			}
 		}
 	}
 }
