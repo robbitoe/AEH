@@ -25,6 +25,9 @@ type Profile struct {
 	Stdin          bool              `yaml:"stdin"`
 	TimeoutMinutes int               `yaml:"timeout_minutes"`
 	QuotaExitCodes []int             `yaml:"quota_exit_codes"`
+	// QuotaMessages are phrases the CLI prints when the provider's usage limit is hit.
+	// Omitted from JSON when empty, so digests of existing plans do not change.
+	QuotaMessages []string `yaml:"quota_messages" json:",omitempty"`
 	// Sandbox holds what the profile needs inside an agent container (stage 6, S2). It
 	// is a pointer omitted from JSON when unset, so digests of existing plans that
 	// serialize whole profiles do not change.
@@ -441,6 +444,9 @@ func (c Config) checkProfile(name string) error {
 		if code <= 0 || code > 255 {
 			return fmt.Errorf("config: profile %q has invalid quota exit code %d", name, code)
 		}
+	}
+	if err := checkQuotaMessages(p.QuotaMessages); err != nil {
+		return fmt.Errorf("config: profile %q: %w", name, err)
 	}
 	return nil
 }

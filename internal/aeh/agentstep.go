@@ -2,6 +2,7 @@ package aeh
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -139,6 +140,13 @@ func (s *sandbox) agentStep(ctx context.Context, root string, cfg Config, st age
 		return r, err
 	}
 	r.AgentErr = agentError(p, res)
+	// A normal nonzero exit with no aeh reason (capture, output limit) may be the
+	// provider's usage limit, named by the profile's quota_messages.
+	if r.AgentErr != nil && !errors.Is(r.AgentErr, errProviderQuota) && res.Class == ClassProcess && res.Reason == "" && res.ExitCode > 0 {
+		if q := quotaSignal(p, res.ExitCode, out); q != nil {
+			r.AgentErr = fmt.Errorf("%w: %w", q, r.AgentErr)
+		}
+	}
 	if r.AgentErr != nil {
 		r.Candidate = ""
 	}

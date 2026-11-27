@@ -592,6 +592,10 @@ func (ru *runner) runTask(ctx context.Context, t Task, ts *TaskState) (bool, str
 			ru.state.RestartRequired = true
 			return false, res.Requirements, nil
 		}
+		if res.Uncertain && res.Quota != "" {
+			ts.Status = StatusBlocked
+			return false, fmt.Sprintf("Task %s stopped at %s: %s, then %s. See the attempt artifacts.", t.ID, res.FailedGate, res.Quota, ru.retryHint()), nil
+		}
 		if res.Uncertain {
 			ts.Status = StatusBlocked
 			if ru.sb.agents() {
@@ -613,6 +617,7 @@ type attemptResult struct {
 	Attempt
 	Feedback     string
 	Uncertain    bool
+	Quota        string // with Uncertain: the provider's limit, worded for the owner
 	Requirements string
 }
 
@@ -703,11 +708,11 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 		if runErr != nil {
 			err := runErr
 			res.FailedGate, res.Feedback = "agent", err.Error()
-			res.Uncertain = uncertainExit(err)
+			res.Uncertain, res.Quota = uncertainExit(err), quotaNote(ru.cfg, profile, err)
 			if res.Uncertain && !sandboxed {
 				res.Worktree = wt
 			}
-			check(GateResult{Name: res.FailedGate, Output: res.Feedback, Uncertain: res.Uncertain, Sandboxed: sandboxed})
+			check(GateResult{Name: res.FailedGate, Output: res.Feedback, Uncertain: res.Uncertain, Quota: res.Quota, Sandboxed: sandboxed})
 			return res, record()
 		}
 		out, err := os.ReadFile(outPath)
@@ -881,7 +886,7 @@ func (ru *runner) attempt(ctx context.Context, t Task, n int, profile string, ma
 	if !passed {
 		failed := gates[len(gates)-1]
 		res.FailedGate, res.Feedback = failed.Name, failed.Output
-		res.Uncertain = failed.Uncertain
+		res.Uncertain, res.Quota = failed.Uncertain, failed.Quota
 		if res.Uncertain {
 			res.Worktree = verified
 		}
@@ -962,7 +967,13 @@ func (ru *runner) review(ctx context.Context, t Task, role, author, commit, wt, 
 	}
 	g.Seconds = time.Since(start).Seconds()
 	if err != nil {
-		g.Output, g.Uncertain = err.Error(), uncertainExit(err)
+		if checkoutErr != nil && errors.Is(err, errProviderQuota) {
+			// The reviewer exited normally and changed its checkout: that is proven, and
+			// it is the result, whatever the output says.
+			g.Output = checkoutErr.Error()
+			return g, v, nil
+		}
+		g.Output, g.Uncertain, g.Quota = err.Error(), uncertainExit(err), quotaNote(ru.cfg, profile, err)
 		if checkoutErr != nil {
 			g.Output += "\n" + checkoutErr.Error()
 		}
@@ -1147,6 +1158,8 @@ func (ru *runner) completeTaskReviews(ctx context.Context, t Task, a *Attempt, m
 					c.First = t.Start
 				}
 				a.SpecQuestion, ru.state.Cursor = c, c
+			case g.Uncertain && g.Quota != "":
+				question = fmt.Sprintf("Task %s required %s review stopped on its accepted SHA %s: %s, then %s.", t.ID, role, a.Commit, g.Quota, ru.retryHint())
 			case g.Uncertain:
 				question += "Confirm all processes stopped and review possible effects before answering to retry. See the attempt artifacts."
 			case verdict.Verdict == "REJECT":
@@ -1302,6 +1315,15 @@ func (ru *runner) finalCheck(ctx context.Context) (_ bool, _ string, err error) 
 	return true, "", nil
 }
 
+// retryHint says how a run blocked on a provider's limit continues: an answer, or for
+// aeh do (which resumes only a SPEC-QUESTION) the command again.
+func (ru *runner) retryHint() string {
+	if strings.HasPrefix(ru.outcome.ID, "DO-") {
+		return "run `aeh do` again"
+	}
+	return "answer to retry"
+}
+
 func (ru *runner) block(question string) error {
 	ru.state.Status = StatusBlocked
 	ru.state.Question = question
@@ -1443,6 +1465,9 @@ func (ru *runner) triage(ctx context.Context) error {
 		if err := saveState(ru.repo, s); err != nil {
 			return errors.Join(cause, err)
 		}
+		if note := quotaNote(ru.cfg, ru.cfg.Triage.Profile, cause); note != "" {
+			return fmt.Errorf("triage stopped: %s, then run the command again: %w", note, cause)
+		}
 		return fmt.Errorf("triage could not run in the sandbox; fix the cause (for example start Docker) and run the command again: %w", cause)
 	}
 	s.InitialRoute, s.TriageSource = o.Route, "declared"
@@ -1485,7 +1510,7 @@ func (ru *runner) triage(ctx context.Context) error {
 		if err != nil {
 			return rollback(err)
 		}
-		if triageRetry(step.Launch) {
+		if triageRetry(step.Launch) || errors.Is(step.AgentErr, errProviderQuota) {
 			return rollback(step.AgentErr)
 		}
 		outPath, runErr = step.OutPath, step.AgentErr
@@ -1510,6 +1535,10 @@ func (ru *runner) triage(ctx context.Context) error {
 	s.TriageOutput = string(out)
 	if !sandboxed {
 		checkoutErr = verifyCheckout(wt, base)
+	}
+	if errors.Is(runErr, errProviderQuota) && checkoutErr == nil {
+		// The model was not reached: triage again next time, never the fallback route.
+		return rollback(runErr)
 	}
 	parsed := parseRoute(string(out))
 	if runErr == nil && readErr == nil && checkoutErr == nil && parsed != "" {

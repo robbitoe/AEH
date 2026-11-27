@@ -1155,6 +1155,7 @@ func TestLaterTaskPolicyCompletesEarlierReviews(t *testing.T) {
 		{"invalid", "echo no-verdict", "INVALID", false},
 		{"mutated", "echo changed > src/fees.txt; " + reviewOK, "INVALID", false},
 		{"timeout", "echo ready > \"$AEH_SECURITY_STARTED\"; sleep 30", "INVALID", false},
+		{"quota", agentQuota, "INVALID", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// The timeout case cancels the run exactly when T1's security review starts. A wall
@@ -1178,6 +1179,9 @@ func TestLaterTaskPolicyCompletesEarlierReviews(t *testing.T) {
 			// qa-default against T1's original author, never the latest author.
 			cfg := strings.ReplaceAll(readFile(t, f.repo.ConfigPath()), "provider: later", "provider: qa-default")
 			write(t, f.dir, "aeh/config.yaml", cfg)
+			if tc.name == "quota" {
+				addQuota(t, f.repo, "qa-default", "qa-default")
+			}
 			for _, role := range roleOrder {
 				write(t, f.dir, "aeh/prompts/review-"+role+".md", "role "+role+" task {{.Task.ID}}\n{{.Diff}}")
 			}
@@ -1262,6 +1266,9 @@ case "$1" in *"role security"*) `+tc.security+` ;; *) `+reviewOK+` ;; esac`)
 					guidance = "Fix the feedback and create an outcome with another ID"
 				case "invalid":
 					failure = "reviewer gave no verdict"
+				case "quota":
+					failure = `provider quota reached for profile "qa-default"`
+					guidance = "then answer to retry"
 				case "timeout":
 					failure = "context canceled" // the run is cancelled while the review sleeps
 					guidance = "Confirm all processes stopped and review possible effects before answering to retry"

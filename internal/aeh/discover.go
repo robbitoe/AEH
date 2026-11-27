@@ -762,6 +762,9 @@ func (d *discoverySession) attempt(ctx context.Context, a *DiscoveryAttempt, rou
 		}
 		if uncertainExit(err) {
 			a.Result, a.Feedback = "failed", discoveryDiagnostic(err.Error())
+			if note := quotaNote(d.cfg, a.Profile, err); note != "" {
+				return nil, fmt.Sprintf("The discovery agent stopped: %s, then run again: aeh discover run %s", note, d.state.Slug), nil
+			}
 			if sb != nil {
 				return nil, fmt.Sprintf("The discovery agent %q stopped without a result:\n%s\nFix the cause (for example start Docker), then run again: aeh discover run %s", a.Profile, discoveryDiagnostic(tail(err.Error(), 1500)), d.state.Slug), nil
 			}

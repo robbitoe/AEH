@@ -715,10 +715,13 @@ func (a *adoptSession) inspectAttempt(ctx context.Context, n int, base, profile 
 	outPath, runErr := runAgentWithOutput(ctx, cfg.Profiles[profile], cfg.PassEnv, w.dir, outDir, prompt,
 		a.repo.RunDir(a.runName(), fmt.Sprintf("a%d", n)), "adopt")
 	if err := w.integrity(false); err != nil {
-		if uncertainExit(runErr) {
+		if uncertainExit(runErr) && !errors.Is(runErr, errProviderQuota) {
 			return frozenOutput{}, info, true, fmt.Errorf("agent wrote into the code; execution was interrupted: %w", runErr)
 		}
 		return frozenOutput{}, info, true, fmt.Errorf("agent wrote into the code: %w", err)
+	}
+	if note := quotaNote(cfg, profile, runErr); note != "" {
+		return frozenOutput{}, info, false, fmt.Errorf("%s, then run the command again: %w", note, runErr)
 	}
 	if runErr != nil {
 		return frozenOutput{}, info, false, runErr
@@ -791,6 +794,9 @@ func (a *adoptSession) inspectSandboxed(ctx context.Context, n int, base, profil
 		// Unknown outcomes (the runtime failed, the launch stopped) block like an
 		// interrupted host inspection; a failed agent is feedback for the next one. A
 		// read-only view cannot be written, so the code is never changed.
+		if note := quotaNote(cfg, profile, step.AgentErr); note != "" {
+			return frozenOutput{}, info, false, fmt.Errorf("%s, then run the command again: %w", note, step.AgentErr)
+		}
 		return frozenOutput{}, info, false, step.AgentErr
 	}
 	output, err := os.ReadFile(step.OutPath)

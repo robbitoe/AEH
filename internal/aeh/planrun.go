@@ -1168,6 +1168,9 @@ func (p *planner) attempt(ctx context.Context, a *PlanAttempt, feedback string) 
 			outPath, captured, err = step.OutPath, step.Candidate, step.AgentErr
 			if err != nil && uncertainExit(err) {
 				a.FailedStep, a.Feedback = "author", err.Error()
+				if note := quotaNote(p.cfg, a.Profile, err); note != "" {
+					return p.blockNow(fmt.Sprintf("The plan author stopped: %s, then answer to retry.", note)), nil
+				}
 				return p.blockNow(fmt.Sprintf("The plan author %q stopped without a result:\n%s\nFix the cause (for example start Docker), then answer to retry.", a.Profile, tail(err.Error(), 1500))), nil
 			}
 			if err != nil {
@@ -1179,6 +1182,11 @@ func (p *planner) attempt(ctx context.Context, a *PlanAttempt, feedback string) 
 			}
 			outPath, err = runAgent(ctx, p.cfg.Profiles[a.Profile], p.cfg.PassEnv, wt, prompt, runDir, "plan")
 			if err != nil {
+				if note := quotaNote(p.cfg, a.Profile, err); note != "" {
+					keep = true
+					a.FailedStep, a.Feedback = "author", err.Error()
+					return p.blockNow(fmt.Sprintf("The plan author stopped: %s, then answer to retry (worktree kept at %s).", note, wt)), nil
+				}
 				if uncertainExit(err) {
 					keep = true
 					a.FailedStep, a.Feedback = "author", err.Error()
@@ -1375,6 +1383,10 @@ func (p *planner) verifyFrozen(ctx context.Context, a *PlanAttempt) (string, err
 		a.Reviews = append(a.Reviews, v)
 		question := ""
 		switch {
+		case g.Uncertain && g.Quota != "":
+			keep = !sandboxed
+			a.FailedStep, a.Feedback = "review", g.Output
+			question = p.blockNow(fmt.Sprintf("The %s review of the plan stopped: %s, then answer to retry.", role, g.Quota))
 		case g.Uncertain:
 			keep = !sandboxed
 			a.FailedStep, a.Feedback = "review", g.Output
@@ -1863,7 +1875,12 @@ func (p *planner) review(ctx context.Context, role, author, commit, mapped, wt, 
 	}
 	g.Seconds = time.Since(start).Seconds()
 	if err != nil {
-		g.Output, g.Uncertain = err.Error(), uncertainExit(err)
+		if checkoutErr != nil && errors.Is(err, errProviderQuota) {
+			// The reviewer exited normally and changed its checkout: that is the result.
+			g.Output = checkoutErr.Error()
+			return v, g, nil
+		}
+		g.Output, g.Uncertain, g.Quota = err.Error(), uncertainExit(err), quotaNote(p.cfg, profile, err)
 		if checkoutErr != nil {
 			g.Output += "\n" + checkoutErr.Error()
 		}
