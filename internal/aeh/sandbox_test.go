@@ -199,7 +199,7 @@ func TestHostGateCommandClass(t *testing.T) {
 
 func TestCheckCreated(t *testing.T) {
 	s := &sandbox{image: sandboxImage{ID: "sha256:img", Env: []string{"PATH=/bin", "LANG=C"}}}
-	own, want, err := s.launchEnv([]string{"A=1"})
+	own, want, err := s.launchEnv(s.image, []string{"A=1"}, false)
 	if err != nil || len(own) != 13 {
 		t.Fatalf("env %v %v", own, err)
 	}
@@ -462,6 +462,31 @@ func TestCommandProgramsHonorsQuotes(t *testing.T) {
 	for line, want := range cases {
 		if got := strings.Join(commandPrograms(line), " "); got != want {
 			t.Errorf("%q: got %q, want %q", line, got, want)
+		}
+	}
+}
+
+func TestCodexOwnSandbox(t *testing.T) {
+	for _, c := range []struct {
+		cmd  []string
+		want string
+	}{
+		{[]string{"codex", "exec", "--sandbox", "workspace-write", "-"}, "--sandbox workspace-write"},
+		{[]string{"codex", "exec", "-s", "read-only", "-"}, "--sandbox read-only"},
+		{[]string{"codex", "exec", "--sandbox=read-only"}, "--sandbox read-only"},
+		{[]string{"codex", "exec", "-sworkspace-write", "-"}, "--sandbox workspace-write"},
+		{[]string{"codex", "exec", "-s=read-only", "-"}, "--sandbox read-only"},
+		{[]string{"codex", "exec", "-s", "danger-full-access", "--", "--sandbox=read-only"}, ""},
+		{[]string{"codex", "exec", "--", "--full-auto"}, ""},
+		{[]string{"/usr/local/bin/codex", "exec", "--full-auto"}, "--full-auto"},
+		{[]string{`C:\tools\Codex.exe`, "exec", "--sandbox", "workspace-write"}, "--sandbox workspace-write"},
+		{[]string{"codex", "exec", "--sandbox", "danger-full-access", "-"}, ""},
+		{[]string{"codex", "exec", "-"}, ""},
+		{[]string{"claude", "-p", "--sandbox", "workspace-write"}, ""},
+		{nil, ""},
+	} {
+		if got := codexOwnSandbox(c.cmd); got != c.want {
+			t.Errorf("%q: %q, want %q", c.cmd, got, c.want)
 		}
 	}
 }

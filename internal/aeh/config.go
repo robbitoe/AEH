@@ -8,6 +8,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/robbitoe/aeh/internal/egress"
 	"gopkg.in/yaml.v3"
 )
 
@@ -24,6 +25,62 @@ type Profile struct {
 	Stdin          bool              `yaml:"stdin"`
 	TimeoutMinutes int               `yaml:"timeout_minutes"`
 	QuotaExitCodes []int             `yaml:"quota_exit_codes"`
+	// Sandbox holds what the profile needs inside an agent container (stage 6, S2). It
+	// is a pointer omitted from JSON when unset, so digests of existing plans that
+	// serialize whole profiles do not change.
+	Sandbox *ProfileSandbox `yaml:"sandbox" json:",omitempty"`
+}
+
+// sandboxPassEnv is the profile's sandbox.pass_env, or none.
+func (p Profile) sandboxPassEnv() []string {
+	if p.Sandbox == nil {
+		return nil
+	}
+	return p.Sandbox.PassEnv
+}
+
+// sandboxEgress is the profile's sandbox.egress, or none.
+func (p Profile) sandboxEgress() []string {
+	if p.Sandbox == nil {
+		return nil
+	}
+	return p.Sandbox.Egress
+}
+
+// sandboxSession is the profile's sandbox.session, or none.
+func (p Profile) sandboxSession() []string {
+	if p.Sandbox == nil {
+		return nil
+	}
+	return p.Sandbox.Session
+}
+
+// ProfileSandbox lists the host variables a sandboxed agent receives. The project's
+// pass_env is never forwarded into a container: each profile names its own. Session
+// lists the files, relative to HOME, its CLI needs to authenticate: aeh keeps them
+// between launches (stage 6, section 6). Login is the command `aeh sandbox login` runs.
+// Egress lists the host:port pairs its CLI may reach through the launch's proxy (S3);
+// without it, the agent has no network. The new fields are omitted from JSON when unset,
+// so plan digests do not change.
+type ProfileSandbox struct {
+	PassEnv []string `yaml:"pass_env"`
+	Session []string `yaml:"session" json:",omitempty"`
+	Login   []string `yaml:"login" json:",omitempty"`
+	Egress  []string `yaml:"egress" json:",omitempty"`
+}
+
+// UnmarshalYAML rejects misspelled profile sandbox settings.
+func (s *ProfileSandbox) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind != yaml.MappingNode {
+		return errors.New("profile sandbox must be a mapping of pass_env, session, login and egress")
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if k := n.Content[i].Value; k != "pass_env" && k != "session" && k != "login" && k != "egress" {
+			return fmt.Errorf("profile sandbox: unknown key %q", k)
+		}
+	}
+	type plain ProfileSandbox
+	return n.Decode((*plain)(s))
 }
 
 // Config is the project's constitution: commands, limits, protected paths and agent profiles.
@@ -247,6 +304,29 @@ func (c *Config) validate() error {
 	if c.Sandbox != nil {
 		if err := c.Sandbox.validate(); err != nil {
 			return err
+		}
+	}
+	for name, p := range c.Profiles {
+		for _, v := range p.sandboxPassEnv() {
+			if err := checkAgentEnvName(v); err != nil {
+				return fmt.Errorf("config: profile %q: sandbox.pass_env: %w", name, err)
+			}
+		}
+		if p.Sandbox != nil {
+			if err := checkSessionPaths(p.Sandbox.Session); err != nil {
+				return fmt.Errorf("config: profile %q: sandbox.session: %w", name, err)
+			}
+			for _, a := range p.Sandbox.Login {
+				if a == "" || strings.ContainsRune(a, 0) {
+					return fmt.Errorf("config: profile %q: sandbox.login: empty or invalid argument", name)
+				}
+			}
+			if len(p.Sandbox.Login) > 0 && len(p.Sandbox.Session) == 0 {
+				return fmt.Errorf("config: profile %q: sandbox.login needs sandbox.session: the files to keep after the login", name)
+			}
+			if err := egress.CheckPairs(p.Sandbox.Egress); err != nil {
+				return fmt.Errorf("config: profile %q: sandbox.%w", name, err)
+			}
 		}
 	}
 	if err := c.validateDiscoveryConfig(); err != nil {

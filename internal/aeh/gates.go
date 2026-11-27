@@ -428,8 +428,11 @@ func runShell(ctx context.Context, dir, command string, timeout time.Duration, p
 	return buf.String(), err
 }
 
+// uncertainExit reports an agent or command whose outcome is unknown: it was stopped, or
+// the sandbox could not carry it out. Such a result blocks without spending a ladder step.
 func uncertainExit(err error) bool {
-	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || errors.Is(err, exec.ErrWaitDelay)
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || errors.Is(err, exec.ErrWaitDelay) ||
+		errors.Is(err, errSandboxInfrastructure)
 }
 
 // tail keeps the last n bytes of command or agent output. It redacts recognized secrets in the

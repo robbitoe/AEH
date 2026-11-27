@@ -3,6 +3,7 @@ package aeh
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -12,7 +13,6 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -148,16 +148,14 @@ func (e *commitExport) source() tarSource {
 }
 
 // ignoreChecker evaluates the commit's own .gitignore files for paths that exist only
-// in a volume. It runs git check-ignore --no-index in a runner-private repository that
-// holds nothing but those files: no work tree of the product is read, and no user
+// in a volume. Every .gitignore is translated into one excludes file with patterns
+// anchored at the file's directory, and git check-ignore --no-index runs against an
+// empty work tree with a separate Git directory. No rule file and no queried path
+// exists on the host, so the host file system (case folding, NTFS short names, trailing
+// dots) can never make Git read one directory's rules through another name, and no user
 // excludes, templates or attributes take part.
 type ignoreChecker struct {
-	dir string
-	// created holds the exact paths aeh wrote: each .gitignore and its directories. Any
-	// other path the host resolves inside the private repository is an alias (another
-	// case, an NTFS short name such as LONGDI~1, a trailing dot): Git would read rules
-	// through it that Linux would not.
-	created map[string]bool
+	dir string // runner-private: git/ (Git directory), wt/ (empty work tree), excludes
 }
 
 func newIgnoreChecker(root, commit string, files []exportFile) (*ignoreChecker, error) {
@@ -166,111 +164,163 @@ func newIgnoreChecker(root, commit string, files []exportFile) (*ignoreChecker, 
 		return nil, fmt.Errorf("ignore rules: %w", err)
 	}
 	c := &ignoreChecker{dir: dir}
-	if _, err := git(dir, "init", "-q", "--template=", "."); err != nil {
+	if _, err := git(dir, "init", "-q", "--bare", "--template=", "git"); err != nil {
 		c.Close()
 		return nil, fmt.Errorf("ignore rules: %w", err)
 	}
-	var rules []string
-	c.created = map[string]bool{}
+	if err := os.Mkdir(filepath.Join(dir, "wt"), 0o700); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("ignore rules: %w", err)
+	}
+	var rules []exportFile
 	for _, f := range files {
 		if path.Base(f.Path) == ".gitignore" {
-			rules = append(rules, f.Path)
-			c.created[f.Path] = true
-			for d := path.Dir(f.Path); d != "."; d = path.Dir(d) {
-				c.created[d] = true
-			}
+			rules = append(rules, f)
 		}
 	}
-	// The ignore files and their directories are written to the host, so every path must
-	// stay distinct there: on Windows or macOS A/ and a/ would be one directory, and the
-	// rules of one would be read through the other.
-	written := make([]string, 0, len(c.created))
-	for p := range c.created {
-		written = append(written, p)
-	}
-	sort.Strings(written)
-	if err := checkHostPaths(written); err != nil {
+	// Shallower files first: a deeper .gitignore overrides its ancestors, and in one
+	// excludes file the last matching pattern decides.
+	sort.Slice(rules, func(i, j int) bool {
+		di, dj := strings.Count(rules[i].Path, "/"), strings.Count(rules[j].Path, "/")
+		if di != dj {
+			return di < dj
+		}
+		return rules[i].Path < rules[j].Path
+	})
+	if err := c.writeExcludes(root, commit, rules); err != nil {
 		c.Close()
-		return nil, fmt.Errorf("ignore rules: %w", err)
-	}
-	for _, f := range files {
-		if path.Base(f.Path) != ".gitignore" {
-			continue
-		}
-		b, ok := gitBlob(root, commit, f.Path)
-		if !ok {
-			c.Close()
-			return nil, fmt.Errorf("ignore rules: read %s at %s", f.Path, short(commit))
-		}
-		dst := filepath.Join(dir, filepath.FromSlash(f.Path))
-		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-			c.Close()
-			return nil, fmt.Errorf("ignore rules: %w", err)
-		}
-		if err := os.WriteFile(dst, []byte(b), 0o600); err != nil {
-			c.Close()
-			return nil, fmt.Errorf("ignore rules: %w", err)
-		}
-	}
-	if err := os.WriteFile(filepath.Join(dir, ".git", "empty-excludes"), nil, 0o600); err != nil {
-		c.Close()
-		return nil, fmt.Errorf("ignore rules: %w", err)
-	}
-	if err := c.checkExactNames(); err != nil {
-		c.Close()
-		return nil, fmt.Errorf("ignore rules: %w", err)
+		return nil, err
 	}
 	return c, nil
 }
 
-// checkExactNames confirms that every path aeh wrote exists under exactly that name. A
-// host alias (another case, an NTFS short name such as LONGDI~1, a trailing dot) makes
-// two repository paths one host entry; listing the parent shows the real name only.
-func (c *ignoreChecker) checkExactNames() error {
-	for p := range c.created {
-		parent, base := path.Split(p)
-		entries, err := os.ReadDir(filepath.Join(c.dir, filepath.FromSlash(parent)))
+// maxIgnoreRules caps the translated rules of one commit, so a large .gitignore deep in
+// the tree cannot make the runner write, or Git read, without bound.
+const maxIgnoreRules = int64(64) << 20
+
+// maxIgnoreFile caps one .gitignore read into memory.
+const maxIgnoreFile = int64(8) << 20
+
+// utf8BOM is the byte order mark Git skips at the start of a .gitignore.
+const utf8BOM = "\xef\xbb\xbf"
+
+// writeExcludes translates the .gitignore files, streaming, into the excludes file.
+func (c *ignoreChecker) writeExcludes(root, commit string, rules []exportFile) error {
+	f, err := os.OpenFile(filepath.Join(c.dir, "excludes"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("ignore rules: %w", err)
+	}
+	defer f.Close()
+	w := bufio.NewWriter(f)
+	var size int64
+	for _, rule := range rules {
+		if rule.Size > maxIgnoreFile {
+			return fmt.Errorf("ignore rules: %s has %d bytes; the sandbox reads .gitignore files up to %d MiB", rule.Path, rule.Size, maxIgnoreFile>>20)
+		}
+		// By object ID: a path argument would be re-encoded on Windows (arguments are
+		// UTF-16 there), so a name that is not valid UTF-8 could not be read by path.
+		b, err := gitRaw(root, "cat-file", "blob", rule.Blob)
 		if err != nil {
-			return err
+			return fmt.Errorf("ignore rules: read %s at %s: %w", rule.Path, short(commit), err)
 		}
-		found := false
-		for _, e := range entries {
-			if e.Name() == base {
-				found = true
-				break
+		// As Git reads a .gitignore: a UTF-8 byte order mark at the start is skipped, each
+		// line loses one trailing carriage return, and a pattern ends at its first NUL (Git
+		// handles it as a C string). Lines are walked in place, with no slice of all of them.
+		b = strings.TrimPrefix(b, utf8BOM)
+		dir := path.Dir(rule.Path)
+		for len(b) > 0 {
+			line := b
+			if i := strings.IndexByte(b, '\n'); i >= 0 {
+				line, b = b[:i], b[i+1:]
+			} else {
+				b = ""
 			}
+			line = strings.TrimSuffix(line, "\r")
+			if i := strings.IndexByte(line, 0); i >= 0 {
+				line = line[:i]
+			}
+			out := anchorIgnoreLine(dir, line)
+			if size += int64(len(out)) + 1; size > maxIgnoreRules {
+				return fmt.Errorf("ignore rules: the .gitignore files of %s exceed %d MiB once anchored at their directories", short(commit), maxIgnoreRules>>20)
+			}
+			w.WriteString(out)
+			w.WriteByte('\n')
 		}
-		if !found {
-			return fmt.Errorf("%s is the same file on this host as another path of the commit", p)
-		}
+	}
+	if err := w.Flush(); err != nil {
+		return fmt.Errorf("ignore rules: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("ignore rules: %w", err)
 	}
 	return nil
 }
 
+// anchorIgnoreLine rewrites one line of the .gitignore in directory dir as a pattern of a
+// root-level excludes file with the same meaning (gitignore(5)): a pattern with a slash
+// other than a trailing one is relative to dir; any other pattern matches at any depth
+// below dir. Comments, blank lines and the root's own lines stay as they are.
+func anchorIgnoreLine(dir, line string) string {
+	if line == "" || strings.HasPrefix(line, "#") {
+		return line
+	}
+	neg, pat := "", line
+	if strings.HasPrefix(pat, "!") {
+		neg, pat = "!", pat[1:]
+	}
+	body := strings.TrimRight(strings.TrimRight(pat, " "), "/")
+	if body == "" {
+		// A line of only spaces, "!", "/" or "!/" leaves an empty pattern. It has no
+		// effect on git add -A, but git check-ignore matches it against a directory asked
+		// as "name/" (an empty base name), at any level. It is dropped everywhere.
+		return ""
+	}
+	if dir == "." {
+		return line
+	}
+	prefix := escapeIgnoreDir(dir)
+	if strings.Contains(body, "/") {
+		return neg + prefix + "/" + strings.TrimPrefix(pat, "/")
+	}
+	return neg + prefix + "/**/" + pat
+}
+
+// escapeIgnoreDir escapes glob characters of a directory name, and a leading # or !, so
+// the directory is matched literally.
+func escapeIgnoreDir(dir string) string {
+	// Byte by byte: a name need not be valid UTF-8, and Git matches bytes.
+	var b strings.Builder
+	for i := 0; i < len(dir); i++ {
+		c := dir[i]
+		if strings.IndexByte(`*?[\`, c) >= 0 || (i == 0 && (c == '#' || c == '!')) {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
 func (c *ignoreChecker) Close() { _ = os.RemoveAll(c.dir) }
+
+// checkIgnoreCmd runs git check-ignore against the commit's rules only. Matching is
+// case-sensitive, as in the Linux volume.
+func (c *ignoreChecker) checkIgnoreCmd(ctx context.Context, extra ...string) *exec.Cmd {
+	args := append(append([]string{}, gitSafety...), "--git-dir="+filepath.Join(c.dir, "git"), "--work-tree="+filepath.Join(c.dir, "wt"),
+		"-c", "core.excludesFile="+filepath.Join(c.dir, "excludes"), "-c", "core.ignorecase=false",
+		"check-ignore", "--no-index", "--stdin", "-z")
+	cmd := exec.CommandContext(ctx, "git", append(args, extra...)...)
+	cmd.Dir = filepath.Join(c.dir, "wt")
+	cmd.Env = append(commandEnv(nil), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_FLUSH=1")
+	return cmd
+}
 
 // ignored returns the subset of paths the commit's ignore rules ignore.
 func (c *ignoreChecker) ignored(paths []string) (map[string]bool, error) {
 	out := map[string]bool{}
-	// A path under a directory that matches a rules directory only when case is folded
-	// cannot be evaluated faithfully on this host: it counts as not ignored (the safe side).
-	var query []string
-	for _, p := range paths {
-		if !c.hostAlias(p) {
-			query = append(query, p)
-		}
-	}
-	paths = query
 	if len(paths) == 0 {
 		return out, nil
 	}
-	// Matching is case-sensitive, as in the Linux volume; git init would otherwise turn
-	// core.ignorecase on for a case-insensitive host file system.
-	args := append(append([]string{}, gitSafety...), "-c", "core.excludesFile="+filepath.Join(c.dir, ".git", "empty-excludes"),
-		"-c", "core.ignorecase=false", "check-ignore", "--no-index", "--stdin", "-z")
-	cmd := exec.Command("git", args...)
-	cmd.Dir = c.dir
-	cmd.Env = append(commandEnv(nil), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
+	cmd := c.checkIgnoreCmd(context.Background())
 	cmd.Stdin = strings.NewReader(strings.Join(paths, "\x00") + "\x00")
 	var stdout, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &errb
@@ -285,6 +335,60 @@ func (c *ignoreChecker) ignored(paths []string) (map[string]bool, error) {
 		}
 	}
 	return out, nil
+}
+
+// ignoreSession answers one path at a time from a single git check-ignore process, so a
+// tree with many new entries costs one process, not one per entry.
+type ignoreSession struct {
+	cmd  *exec.Cmd
+	in   io.WriteCloser
+	out  *bufio.Reader
+	errb bytes.Buffer
+}
+
+func (c *ignoreChecker) session(ctx context.Context) (*ignoreSession, error) {
+	s := &ignoreSession{cmd: c.checkIgnoreCmd(ctx, "--verbose", "--non-matching")}
+	s.cmd.Stderr = &s.errb
+	var err error
+	if s.in, err = s.cmd.StdinPipe(); err != nil {
+		return nil, err
+	}
+	stdout, err := s.cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	s.out = bufio.NewReader(stdout)
+	if err := s.cmd.Start(); err != nil {
+		return nil, fmt.Errorf("ignore rules: %w", err)
+	}
+	return s, nil
+}
+
+// ignored asks about one path. With --verbose --non-matching every path gets one record
+// of four NUL-terminated fields: source, line, pattern and path. A path is ignored when a
+// rule matched and the rule is not a negation.
+func (s *ignoreSession) ignored(p string) (bool, error) {
+	if _, err := io.WriteString(s.in, p+"\x00"); err != nil {
+		return false, fmt.Errorf("ignore rules: %w: %s", err, strings.TrimSpace(s.errb.String()))
+	}
+	var fields [4]string
+	for i := range fields {
+		f, err := s.out.ReadString(0)
+		if err != nil {
+			return false, fmt.Errorf("ignore rules: git check-ignore: %w: %s", err, strings.TrimSpace(s.errb.String()))
+		}
+		fields[i] = strings.TrimSuffix(f, "\x00")
+	}
+	if fields[3] != p {
+		return false, fmt.Errorf("ignore rules: git check-ignore answered for %q, asked %q", fields[3], p)
+	}
+	return fields[0] != "" && !strings.HasPrefix(fields[2], "!"), nil
+}
+
+// Close ends the process; exit status 1 only means nothing matched.
+func (s *ignoreSession) Close() {
+	_ = s.in.Close()
+	_ = s.cmd.Wait()
 }
 
 // checkExport compares a volume read back after a command with the exported tree.
@@ -346,65 +450,4 @@ func checkExport(e *commitExport, back map[string]treeEntry, rules *ignoreChecke
 		return fmt.Errorf("verification changed the checkout:\n%s", strings.Join(problems, "\n"))
 	}
 	return nil
-}
-
-// windowsReserved are device names Windows maps regardless of extension.
-var windowsReserved = map[string]bool{"con": true, "prn": true, "aux": true, "nul": true,
-	"com1": true, "com2": true, "com3": true, "com4": true, "com5": true, "com6": true, "com7": true, "com8": true, "com9": true,
-	"lpt1": true, "lpt2": true, "lpt3": true, "lpt4": true, "lpt5": true, "lpt6": true, "lpt7": true, "lpt8": true, "lpt9": true}
-
-// hostPathKey is how the host file system identifies a repository path, or an error when
-// the host cannot represent it faithfully.
-func hostPathKey(p string) (string, error) {
-	switch runtime.GOOS {
-	case "windows":
-		for _, part := range strings.Split(p, "/") {
-			base := strings.ToLower(part)
-			if i := strings.IndexByte(base, '.'); i >= 0 {
-				base = base[:i]
-			}
-			if strings.HasSuffix(part, ".") || strings.HasSuffix(part, " ") || windowsReserved[base] ||
-				strings.ContainsFunc(part, func(r rune) bool { return r < 32 || strings.ContainsRune(`<>:"|?*`, r) }) {
-				return "", fmt.Errorf("%s cannot be represented on Windows", p)
-			}
-		}
-		return strings.ToLower(p), nil
-	case "darwin":
-		return strings.ToLower(p), nil
-	}
-	return p, nil
-}
-
-// checkHostPaths refuses paths the host would merge or alter.
-func checkHostPaths(paths []string) error {
-	seen := map[string]string{}
-	for _, p := range paths {
-		key, err := hostPathKey(p)
-		if err != nil {
-			return err
-		}
-		if other, ok := seen[key]; ok {
-			return fmt.Errorf("%s and %s are the same file on this host", other, p)
-		}
-		seen[key] = p
-	}
-	return nil
-}
-
-// hostAlias reports a path that the host resolves, through a prefix aeh did not create
-// with that exact name, to something in the private repository. Such a path cannot be
-// evaluated faithfully here and counts as not ignored (the safe side).
-func (c *ignoreChecker) hostAlias(p string) bool {
-	parts := strings.Split(p, "/")
-	for i := range parts {
-		q := strings.Join(parts[:i+1], "/")
-		if c.created[q] {
-			continue
-		}
-		if _, err := os.Lstat(filepath.Join(c.dir, filepath.FromSlash(q))); err == nil {
-			return true
-		}
-		return false // nothing there: no rule can be read below it
-	}
-	return false
 }

@@ -10,25 +10,45 @@ import (
 	"time"
 )
 
-// SandboxPolicy is the sandbox policy version a flow pins: 0 runs everything on the host;
-// 1 runs gate commands in containers (stage 6, S1).
-const sandboxPolicyGates = 1
+// The sandbox policy version a flow pins: 0 runs everything on the host; 1 runs gate
+// commands in containers (stage 6, S1); 2 also ran every agent in a container on
+// Docker's default network (S2); 3 runs agents with no network but their profile's
+// egress pairs, through a proxy per launch (S3). Agents always run under 3 now.
+const (
+	sandboxPolicyGates  = 1
+	sandboxPolicyAgents = 2
+	sandboxPolicyEgress = 3
+)
 
 // sandboxContract is what a resumable flow pins about isolation. It is nil without a
-// sandbox, so contracts of flows created before stage 6 do not change.
+// sandbox, so contracts of flows created before stage 6 do not change; the agent fields
+// are empty under policy 1, so its contracts do not change either.
 func sandboxContract(sb *sandbox) any {
 	if sb == nil {
 		return nil
 	}
-	return struct {
-		Policy  int
-		Engine  string
-		Image   string
-		Memory  string
-		CPUs    string
-		GateEnv map[string]string
-	}{sandboxPolicyGates, sb.engine.ID, sb.image.ID, sb.cfg.Memory, sb.cfg.CPUs, sb.cfg.GateEnv}
+	c := struct {
+		Policy       int
+		Engine       string
+		Image        string
+		Memory       string
+		CPUs         string
+		GateEnv      map[string]string
+		AgentImage   string              `json:",omitempty"`
+		AgentNetwork string              `json:",omitempty"`
+		AgentEnv     map[string][]string `json:",omitempty"`
+		AgentSession map[string][]string `json:",omitempty"`
+		AgentEgress  map[string][]string `json:",omitempty"`
+	}{Policy: sandboxPolicyGates, Engine: sb.engine.ID, Image: sb.image.ID, Memory: sb.cfg.Memory, CPUs: sb.cfg.CPUs, GateEnv: sb.cfg.GateEnv}
+	if sb.agents() {
+		c.Policy, c.AgentImage, c.AgentNetwork, c.AgentEnv = sandboxPolicyEgress, sb.agent.ID, "none", sb.agentEnv
+		c.AgentSession, c.AgentEgress = sb.agentSession, sb.agentEgress
+	}
+	return c
 }
+
+// agents reports whether agents run in containers (policy 3).
+func (s *sandbox) agents() bool { return s != nil && s.agent.ID != "" }
 
 // openFlowSandbox opens the project's sandbox for one flow, or returns nil when the
 // configuration has none. A configured sandbox that cannot open stops the flow: a
@@ -37,7 +57,25 @@ func openFlowSandbox(r Repo, cfg Config, flow string) (*sandbox, error) {
 	if cfg.Sandbox == nil {
 		return nil, nil
 	}
-	return openSandbox(r, *cfg.Sandbox, flow)
+	sb, err := openSandbox(r, *cfg.Sandbox, flow)
+	if err != nil {
+		return nil, err
+	}
+	if sb.agents() {
+		sb.agentEnv, sb.agentSession, sb.agentEgress = map[string][]string{}, map[string][]string{}, map[string][]string{}
+		for name, p := range cfg.Profiles {
+			if env := p.sandboxPassEnv(); len(env) > 0 {
+				sb.agentEnv[name] = append([]string(nil), env...)
+			}
+			if files := p.sandboxSession(); len(files) > 0 {
+				sb.agentSession[name] = append([]string(nil), files...)
+			}
+			if pairs := p.sandboxEgress(); len(pairs) > 0 {
+				sb.agentEgress[name] = append([]string(nil), pairs...)
+			}
+		}
+	}
+	return sb, nil
 }
 
 // verification runs the ordered commands of one verification sequence on one commit:

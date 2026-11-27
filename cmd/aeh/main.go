@@ -17,7 +17,7 @@ import (
 )
 
 // version is set at release time with -ldflags "-X main.version=<tag>".
-var version = "1.0.0"
+var version = "1.1.0"
 
 var usage = `aeh — Autonomous Engineering Harness ` + version + `
 
@@ -80,8 +80,9 @@ Memory (local, private: .aeh/memory/ of the main checkout, never published by ae
   aeh memory lint                   check memory and its privacy settings
   aeh memory record <ID>            retry a pending memory record of an accepted outcome
 
-Sandbox (optional: gate commands in containers)
+Sandbox (optional: gates and agents in containers)
   aeh sandbox check                 check the engine, the image and the container limits
+  aeh sandbox login <profile>       log a profile's CLI in inside the agent image and keep its session
 
 Tracking
   aeh status                        progress of every outcome
@@ -215,8 +216,18 @@ func dispatch(ctx context.Context, args []string) (int, error) {
 		return 0, printStatus(repo)
 
 	case "sandbox":
+		badArgs := errors.New("usage: aeh sandbox check | aeh sandbox login <profile>")
+		if len(args) > 1 && args[1] != "check" {
+			if len(args) != 3 || args[1] != "login" {
+				return 2, badArgs
+			}
+			if err := aeh.SandboxLogin(ctx, repo, args[2], os.Stdin, os.Stdout, os.Stderr); err != nil {
+				return 1, err
+			}
+			return 0, nil
+		}
 		if len(args) != 2 || args[1] != "check" {
-			return 2, errors.New("usage: aeh sandbox check")
+			return 2, badArgs
 		}
 		if err := aeh.SandboxCheck(ctx, repo, os.Stdout); err != nil {
 			return 1, err

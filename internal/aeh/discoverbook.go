@@ -363,23 +363,64 @@ func (d *discoverySession) reviewBook(ctx context.Context, p *pendingBook, files
 		v.Status, v.Feedback = "invalid", discoveryDiagnostic(err.Error())
 		return nil
 	}
-	outDir := d.repo.WorktreePath(fmt.Sprintf("discover-%s-review-%d", d.state.Slug, p.Round))
-	if err := os.RemoveAll(outDir); err != nil {
-		v.Status, v.Feedback = "invalid", discoveryDiagnostic(err.Error())
-		return nil
-	}
-	root, err := openOutputDir(outDir)
+	sb, err := d.agentSandbox()
 	if err != nil {
-		v.Status, v.Feedback = "invalid", discoveryDiagnostic(err.Error())
-		return nil
+		return err
 	}
-	defer func() { root.Close(); _ = os.RemoveAll(outDir) }()
+	var root *os.Root // the host output directory; nil under the sandbox
+	outDir := d.repo.WorktreePath(fmt.Sprintf("discover-%s-review-%d", d.state.Slug, p.Round))
+	if sb == nil {
+		if err := os.RemoveAll(outDir); err != nil {
+			v.Status, v.Feedback = "invalid", discoveryDiagnostic(err.Error())
+			return nil
+		}
+		if root, err = openOutputDir(outDir); err != nil {
+			v.Status, v.Feedback = "invalid", discoveryDiagnostic(err.Error())
+			return nil
+		}
+		defer func() { root.Close(); _ = os.RemoveAll(outDir) }()
+		if err := d.cfg.hostAgents("discovery"); err != nil {
+			return err
+		}
+	}
 	p.Running = true
 	if err := d.save(); err != nil {
 		return err
 	}
 	runDir := d.repo.RunDir("discover-"+d.state.Slug, fmt.Sprintf("review%d", p.Round))
-	outPath, runErr := runAgent(ctx, d.cfg.Profiles[profile], d.cfg.PassEnv, outDir, prompt, runDir, "review-book")
+	var outPath string
+	var runErr error
+	var back agentOutput
+	if sb != nil {
+		// The book is at /work, read-only, as well as in the prompt; findings go to /out.
+		book := map[string][]byte{}
+		for rel, b := range files {
+			book[strings.TrimPrefix(rel, d.memRel("drafts/"))] = b
+		}
+		limit := bookReviewManifest()
+		step, serr := sb.agentStep(ctx, d.repo.Root, d.cfg, agentStep{Kind: "book-review", Profile: profile, Prompt: prompt,
+			RunDir: runDir, LogName: "review-book", WorkTree: treeFiles(book, nil), WorkLabel: "book", Out: true,
+			ReadOut: func(r io.Reader) (err error) {
+				back, err = readAgentOutput(r, limit.MaxFiles, limit.MaxTotal)
+				return err
+			}})
+		cause := serr
+		if cause == nil && errors.Is(step.AgentErr, errSandboxInfrastructure) {
+			cause = step.AgentErr
+		}
+		if cause != nil {
+			// Nothing is known about the review: it stays not run, so the book is never
+			// imported unreviewed because Docker was unavailable.
+			p.Running, v.Status, v.Feedback = false, "not_run", ""
+			if err := d.save(); err != nil {
+				return errors.Join(cause, err)
+			}
+			return fmt.Errorf("the book review could not run in the sandbox; fix the cause (for example start Docker), then run again: aeh discover run %s: %w", d.state.Slug, cause)
+		}
+		outPath, runErr = step.OutPath, step.AgentErr
+	} else {
+		outPath, runErr = runAgent(ctx, d.cfg.Profiles[profile], d.cfg.PassEnv, outDir, prompt, runDir, "review-book")
+	}
 	p.Running = false
 	if runErr != nil {
 		v.Status, v.Feedback = "invalid", discoveryDiagnostic(runErr.Error())
@@ -394,7 +435,12 @@ func (d *discoverySession) reviewBook(ctx context.Context, p *pendingBook, files
 		}
 		return nil
 	}
-	frozen, err := freezeOutput(root, bookReviewManifest())
+	var frozen frozenOutput
+	if root != nil {
+		frozen, err = freezeOutput(root, bookReviewManifest())
+	} else {
+		frozen, err = back.freeze(bookReviewManifest())
+	}
 	if err != nil {
 		v.Status, v.Feedback = "invalid", discoveryDiagnostic(err.Error())
 		return nil

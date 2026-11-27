@@ -216,6 +216,123 @@ func SandboxCheck(ctx context.Context, r Repo, w io.Writer) error {
 			fmt.Fprintf(w, "warning   commands.%s calls git; sandboxed gates see no Git repository\n", name)
 		}
 	}
+	if s.agents() {
+		if err := checkAgentImage(ctx, s, cfg, w); err != nil {
+			return err
+		}
+	}
 	fmt.Fprintln(w, "sandbox ready")
 	return nil
+}
+
+// checkAgentImage runs one throwaway agent container: the agent image runs as user 10001
+// with no network, and has the program of every profile's command, and aeh-egress when a
+// profile declares egress.
+func checkAgentImage(ctx context.Context, s *sandbox, cfg Config, w io.Writer) error {
+	fmt.Fprintf(w, "agents    %s\n          %s\n", s.cfg.AgentImage, s.agent.ID)
+	names := make([]string, 0, len(cfg.Profiles))
+	for name := range cfg.Profiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	programs := map[string][]string{}
+	var argv []string
+	for _, name := range names {
+		if c := cfg.Profiles[name].Command; len(c) > 0 {
+			if programs[c[0]] == nil {
+				argv = append(argv, c[0])
+			}
+			programs[c[0]] = append(programs[c[0]], name)
+		}
+		if len(cfg.Profiles[name].sandboxEgress()) > 0 {
+			if programs["aeh-egress"] == nil {
+				argv = append(argv, "aeh-egress")
+			}
+			programs["aeh-egress"] = append(programs["aeh-egress"], name)
+		}
+	}
+	script := `test "$(id -u)" = 10001 || { echo "not user 10001"; exit 1; }
+for p; do command -v "$p" >/dev/null 2>&1 || echo "MISSING-PROGRAM: $p"; done
+echo AGENT-OK`
+	var out bytes.Buffer
+	res, err := s.run(ctx, sandboxLaunch{Kind: "preflight", Argv: append([]string{"sh", "-c", script, "preflight"}, argv...),
+		Workdir: "/tmp", Timeout: 2 * time.Minute, Output: &out, Agent: true}, nil)
+	if err != nil {
+		return err
+	}
+	text := strings.TrimSpace(out.String())
+	if res.Class != ClassProcess || res.ExitCode != 0 || !strings.HasSuffix(text, "AGENT-OK") {
+		return fmt.Errorf("agent preflight failed (%s, exit %d %s):\n%s", res.Class, res.ExitCode, res.Reason, tail(text, 2000))
+	}
+	fmt.Fprintf(w, "preflight agent image: user 10001, read-only root\n")
+	for _, line := range strings.Split(text, "\n") {
+		if p, ok := strings.CutPrefix(strings.TrimSpace(line), "MISSING-PROGRAM: "); ok {
+			fmt.Fprintf(w, "warning   %s (profiles %s) was not found in the agent image\n", p, strings.Join(programs[p], ", "))
+		}
+	}
+	for _, name := range names {
+		if len(cfg.Profiles[name].sandboxEgress()) == 0 {
+			fmt.Fprintf(w, "warning   profile %s declares no sandbox.egress: its agent has no network and cannot reach its provider\n", name)
+		}
+		if mode := codexOwnSandbox(cfg.Profiles[name].Command); mode != "" {
+			fmt.Fprintf(w, "warning   profile %s: codex %s needs user namespaces, which the agent container does not allow; use --sandbox danger-full-access there (the container is the sandbox)\n", name, mode)
+		}
+	}
+	// Sessions live in the main checkout, also when aeh runs from a linked worktree.
+	main, merr := MainCheckout(Repo{Root: s.root()})
+	for _, name := range names {
+		paths := cfg.Profiles[name].sandboxSession()
+		if len(paths) > 0 && merr != nil {
+			fmt.Fprintf(w, "warning   profile %s: %v\n", name, merr)
+			continue
+		}
+		if len(paths) == 0 {
+			continue
+		}
+		store, err := sessionStore(main, name, false)
+		var files map[string][]byte
+		if err == nil {
+			files, err = loadSession(store, paths)
+		}
+		if err != nil {
+			fmt.Fprintf(w, "warning   profile %s: %v\n", name, err)
+		} else if len(files) == 0 {
+			fmt.Fprintf(w, "warning   profile %s has no saved session; run: aeh sandbox login %s\n", name, name)
+		}
+	}
+	return nil
+}
+
+// codexOwnSandbox reports the Codex sandbox mode a command asks for when it is not
+// danger-full-access: Codex's own sandbox needs bubblewrap and user namespaces, which an
+// agent container refuses, so the agent would have no shell and could not write files.
+func codexOwnSandbox(command []string) string {
+	if len(command) == 0 {
+		return ""
+	}
+	prog := strings.ToLower(command[0][strings.LastIndexAny(command[0], `/\`)+1:])
+	if strings.TrimSuffix(prog, ".exe") != "codex" {
+		return ""
+	}
+	for i, a := range command[1:] {
+		mode := ""
+		switch {
+		case a == "--":
+			return "" // the rest is the prompt
+		case a == "--full-auto":
+			return "--full-auto"
+		case a == "--sandbox" || a == "-s":
+			if i+2 < len(command) {
+				mode = command[i+2]
+			}
+		case strings.HasPrefix(a, "--sandbox="):
+			mode = strings.TrimPrefix(a, "--sandbox=")
+		case strings.HasPrefix(a, "-s") && !strings.HasPrefix(a, "--"):
+			mode = strings.TrimPrefix(strings.TrimPrefix(a, "-s"), "=") // -sMODE or -s=MODE
+		}
+		if mode != "" && mode != "danger-full-access" {
+			return "--sandbox " + mode
+		}
+	}
+	return ""
 }
